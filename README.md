@@ -2,11 +2,6 @@
 ReLUplex Implementation in Python
 📌 Overview
 
-이 프로젝트는 ReLU 활성화 함수를 포함한 신경망 검증 알고리즘(ReLUplex) 을 Python으로 구현한 코드입니다.
-
-ReLUplex는 선형 제약을 해결하는 Simplex 알고리즘을 기반으로 하여, ReLU 제약을 처리하기 위해 분기(case-splitting) 전략을 추가한 확장 알고리즘입니다.
-
-또한, 논리식을 CNF로 변환하기 위한 Tseitin Transformation 모듈도 포함되어 있습니다.
 
 📂 Project Structure
 .
@@ -52,7 +47,9 @@ Reluplex의 기반 solver로 동작합니다.
 
 논리식을 CNF(Conjunctive Normal Form) 형태로 변환하는 Tseitin Transformation 구현 파일입니다.
 
-Boolean 식을 CNF로 변환
+Boolean 식을 표현할 Prop 클래스 정의
+
+Prop 클래스로 표현한 Boolean 식을 CNF로 변환
 
 보조 변수 도입
 
@@ -60,35 +57,16 @@ SAT solver 입력 형식 생성
 
 논리 기반 제약을 SAT 문제로 변환할 때 사용됩니다.
 
-⚙️ Requirements
-
-Python 3.x
-
-(추가 라이브러리가 있다면 여기에 작성)
 
 🚀 How to Run
 
-예시:
+### Tseitin_Transformation.py
+main 함수의 phi 변수에 Prop클래스로 표현된 식을 할당 후 실행 시키면 출력으로
+cnf형식으로 바꾼 식, 입력식, nnf형식으로 바꾼 식, 임시 변수에 할당된 값 매핑 정보, cnf 절들의 정보
+순서로 알려줍니다.
 
-python Reluplex.py
+예시: phi = NotProp( AndProp( VarProp( "p" ), VarProp( "q" ) ) )
+
+python Tseitin_Transformation.py
 
 
-또는 별도의 메인 실행 파일이 있다면:
-
-python main.py
-
-🧠 Background
-
-ReLU 기반 신경망 검증 알고리즘: ReLUplex
-
-기반 알고리즘: Simplex
-
-논리식 변환 기법: Tseitin Transformation
-
-📝 Notes
-
-ReLU 제약은 active/inactive 분기를 통해 처리됩니다.
-
-무한 루프 방지를 위한 branching 전략이 포함될 수 있습니다.
-
-Bound tightening 및 feasibility 검사 로직이 포함되어 있습니다.

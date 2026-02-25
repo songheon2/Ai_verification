@@ -12,6 +12,8 @@ ReLUplex Implementation in Python
 
         ├── Tseitin_Transformation.py
 
+        ├── PropClassDPLL.py
+
         └── README.md
 
 📄 File Descriptions
@@ -61,6 +63,18 @@ Prop 클래스로 표현한 Boolean 식을 CNF로 변환
 SAT solver 입력 형식 생성
 
 논리 기반 제약을 SAT 문제로 변환할 때 사용됩니다.
+
+🔹 PropClassDPLL.py
+
+SAT 문제 해결을 위한 백트래킹 기반 탐색 알고리즘
+
+Unit Propagation 수행
+
+Pure Literal Elimination 처리
+
+충돌 발생 시 backtracking 수행
+
+CNF(Conjunctive Normal Form) 입력 처리
 
 
 🚀 How to Run

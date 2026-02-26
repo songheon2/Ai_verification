@@ -33,17 +33,7 @@ def reluplex(
     local_repair_max_iter: int = 10,
     branch_tau: int = 5,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
-    """
-    간단화된 Reluplex 솔버.
 
-    수정 사항:
-        1) ReLU 수리 방향을 양방향(y←relu(x) 또는 x←y)으로 시도
-        2) 로컬 수리 실패 시 UNSAT 조기 반환 제거 → 케이스 분기로 넘어감
-        3) 위반 선택에 시도 횟수(tau) 카운터 적용하여 루프 방지
-        4) 케이스 분기 결과를 명시적으로 체크
-    """
-
-    # [수정 3] 각 위반 노드(x,y)에 대한 수리 시도 횟수 카운터
     repair_count: Dict[Tuple[str, str], int] = {}
 
     def _try_repair(
@@ -53,103 +43,99 @@ def reluplex(
         direction: int,
     ) -> Tuple[Optional[Dict[str, float]], bool]:
         import copy
-        # 원본 tableau를 복사해서 수정 (원본 보존)
         t = copy.deepcopy(tableau)
 
         x_val = t.assign.get(x, 0.0)
         y_val = t.assign.get(y, 0.0)
+
         target_var = y if direction == 0 else x
         target_val = relu(x_val) if direction == 0 else y_val
 
+        # bounds 범위 확인
         lo = t.bounds[target_var].lower
         hi = t.bounds[target_var].upper
         if target_val < lo - 1e-9 or target_val > hi + 1e-9:
             return None, False
 
-        print(t.assign.get(x), t.assign.get(y, 0.0), direction)
-        # 피벗
-        if target_var not in t.basic_vars:
-            pivot_row = None
-            for row in t.rows:
-                if target_var in row.coeffs and abs(row.coeffs[target_var]) > 1e-9:
-                    pivot_row = row
-                    break
-            if pivot_row is None:
-                return None, False
-            _pivot(t, target_var, pivot_row.basic_var)
+        # [수정된 부분] target_var가 '기저변수'라면 피벗해서 '비기저변수'로 빼내야 함
+        if target_var in t.basic_vars:
+            pivot_row = next((r for r in t.rows if r.basic_var == target_var), None)
+            if pivot_row is not None:
+                pivot_col = None
+                for nv, c in pivot_row.coeffs.items():
+                    if abs(c) > 1e-9:
+                        pivot_col = nv
+                        break
+                if pivot_col is None:
+                    return None, False
+                _pivot(t, pivot_col, target_var)
 
-        # 값 직접 수정 후, 수정된 tableau로 Simplex를 재실행하여
-        # 선형 제약(등식·범위)이 유지되는 일관된 해를 얻는다.
+        # 값 설정 후 simplex
         t.assign[target_var] = target_val
         for row in t.rows:
-            if row.basic_var != target_var:
-                t.assign[row.basic_var] = _compute_basic(t, row)
+            # 예외 없이 모든 기저변수를 수식에 맞게 다시 계산!
+            t.assign[row.basic_var] = _compute_basic(t, row)
 
-        
-        # 수정된 tableau로 Simplex 실행
-        sol_simplex, sat_simplex = simplex(t, max_iter=simplex_max_iter)
-        if not sat_simplex:
-            return None, False
-        return sol_simplex, True
-    
-    def _select_violation(
-        violations: List[Tuple[str, str]]
-    ) -> Tuple[str, str]:
-        """
-        [수정 3] tau 카운터 기반 위반 선택.
-        시도 횟수가 가장 적은 위반을 먼저 선택 → 특정 노드 집중 방지.
-        """
+        return simplex(t, max_iter=simplex_max_iter)
+
+    def _select_violation(violations: List[Tuple[str, str]]) -> Tuple[str, str]:
         return min(violations, key=lambda p: repair_count.get(p, 0))
 
-    def _rec(bounds_now: Dict[str, Tuple[float, float]], depth: int) -> Tuple[Optional[Dict[str, float]], bool]:
+    def _rec(
+        bounds_now: Dict[str, Tuple[float, float]], 
+        depth: int, 
+        current_row_defs: Optional[List[Tuple[str, Dict[str, float]]]] = None
+    ) -> Tuple[Optional[Dict[str, float]], bool]:
+        
+        if current_row_defs is None:
+            current_row_defs = row_defs
+            
         if depth > max_recursion:
             return None, False
 
-        # ReLU 출력 변수 y는 반드시 y >= 0 (relu 출력은 항상 비음수)
         bounds_now = dict(bounds_now)
         for _, y in relus:
             lo, hi = bounds_now.get(y, (float('-inf'), float('inf')))
-            bounds_now[y] = (max(0.0, lo), hi)
+            new_lo = max(0.0, lo)
+            
+            # [수정된 부분] 모순된 제약(하한이 상한보다 큼) 발생 시 즉시 UNSAT 처리
+            if new_lo > hi + 1e-9:
+                return None, False
+                
+            bounds_now[y] = (new_lo, hi)
 
-
-        tableau = build_tableau(row_defs, bounds_now)
+        tableau = build_tableau(current_row_defs, bounds_now)
         sol, sat = simplex(tableau, max_iter=simplex_max_iter)
+        
         if not sat:
-            # F' 자체가 UNSAT → 진짜 UNSAT
             return None, False
 
         assign = sol
         violations = _check_relu_violations(assign, relus)
         if not violations:
             return assign, True
+
         for _ in range(local_repair_max_iter):
-            # [수정 3] 시도 횟수 기반으로 위반 선택
             x, y = _select_violation(violations)
             pair = (x, y)
             repair_count[pair] = repair_count.get(pair, 0) + 1
 
-            # [수정 1] 양방향 수리 시도
             best_assign = None
             directions = [0, 1]
-            # 수리 방향을 무작위로 섞어서 시도 (편향 방지)
             random.shuffle(directions)
             for direction in directions:
                 sol2, sat2 = _try_repair(tableau, x, y, direction)
-                # [수정 2] sat2=False는 이 방향이 막힌 것 → 다음 방향 시도
                 if not sat2:
                     continue
 
                 violations2 = _check_relu_violations(sol2, relus)
                 if not violations2:
-                    # 완전히 해결
                     return sol2, True
 
-                # 위반이 줄었으면 더 나은 후보로 기억
                 if best_assign is None or len(violations2) < len(_check_relu_violations(best_assign, relus)):
                     best_assign = sol2
 
             if best_assign is None:
-                # 양방향 모두 Simplex 실패 → 케이스 분기로 넘어감
                 break
 
             assign = best_assign
@@ -157,12 +143,10 @@ def reluplex(
             if not violations:
                 return assign, True
 
-            # [수정 3] tau 초과 시 케이스 분기 강제
             if repair_count.get(_select_violation(violations), 0) >= branch_tau:
                 break
 
-        # 케이스 분기
-        # [수정 3] 분기 변수: 수리 시도가 tau를 초과한 변수 중 범위가 0을 포함하는 것
+        # [누락되었던 부분 복구] 분기 변수(branch_x) 선택 로직!
         branch_x = None
         for pair in sorted(repair_count, key=lambda p: -repair_count[p]):
             px, _ = pair
@@ -171,7 +155,6 @@ def reluplex(
                 branch_x = px
                 break
 
-        # 분기 변수에 대응하는 relu y 찾기
         relu_y = None
         for px, py in relus:
             if px == branch_x:
@@ -181,24 +164,26 @@ def reluplex(
         if branch_x is not None and depth < max_recursion:
             lo, hi = bounds_now.get(branch_x, (float('-inf'), float('inf')))
 
-            # x >= 0 분기 → y = x 제약 추가
+            # 1. x >= 0 분기
             bounds1 = dict(bounds_now)
             bounds1[branch_x] = (max(0.0, lo), hi)
-            row_defs1 = list(row_defs)
+            row_defs1 = list(current_row_defs)
             if relu_y is not None:
-                slack_name = f"relu_slack_{branch_x}_pos"
-                row_defs1 = row_defs + [(slack_name, {relu_y: 1.0, branch_x: -1.0})]
-                bounds1[slack_name] = (0.0, 0.0)  # y - x = 0
+                slack_name = f"relu_slack_{branch_x}_pos_{depth}" 
+                row_defs1.append((slack_name, {relu_y: 1.0, branch_x: -1.0}))
+                bounds1[slack_name] = (0.0, 0.0) 
+            
             r1, sat1 = _rec(bounds1, depth + 1, row_defs1)
             if sat1:
                 return r1, True
 
-            # x <= 0 분기 → y = 0 제약 추가
+            # 2. x <= 0 분기
             bounds2 = dict(bounds_now)
             bounds2[branch_x] = (lo, min(0.0, hi))
-            row_defs2 = list(row_defs)
+            row_defs2 = list(current_row_defs)
             if relu_y is not None:
-                bounds2[relu_y] = (0.0, 0.0)  # y = 0으로 고정
+                bounds2[relu_y] = (0.0, 0.0)
+            
             r2, sat2 = _rec(bounds2, depth + 1, row_defs2)
             if sat2:
                 return r2, True
@@ -207,7 +192,8 @@ def reluplex(
 
         return None, False
 
-    return _rec(dict(bounds), 0)
+    # [누락되었던 부분 복구] reluplex 함수의 마지막 반환문!
+    return _rec(dict(bounds), 0, row_defs)
 
 
 # ─────────────────────────────────────────────

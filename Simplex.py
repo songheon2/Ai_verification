@@ -53,6 +53,33 @@ class SimplexTableau:
         basic = set(self.basic_vars)
         return [v for v in self.assign if v not in basic]
 
+    def print(self) -> None:
+        def fmt_num(x: float) -> str:
+            if x == float('inf'):
+                return "inf"
+            if x == float('-inf'):
+                return "-inf"
+            return f"{x:.6g}"
+
+        print("[Rows]")
+        for row in self.rows:
+            if row.coeffs:
+                expr = " + ".join(f"{c:.6g}*{v}" for v, c in row.coeffs.items())
+            else:
+                expr = "0"
+            print(f"  {row.basic_var} = {expr}")
+
+        print("[Bounds]")
+        for var in sorted(self.bounds.keys()):
+            b = self.bounds[var]
+            print(f"  {var}: [{fmt_num(b.lower)}, {fmt_num(b.upper)}]")
+
+        print("[Assignment]")
+        for var in sorted(self.assign.keys()):
+            print(f"  {var} = {fmt_num(self.assign[var])}")
+
+        print()
+
 
 # ─────────────────────────────────────────────
 #  Tableau 구성
@@ -191,7 +218,7 @@ def _update_assign(tableau: SimplexTableau, xj: str, new_val: float) -> None:
 #  (Dutertre & de Moura, "A Fast Linear-Arithmetic Solver for DPLL(T)")
 # ─────────────────────────────────────────────
 
-def simplex(tableau: SimplexTableau, max_iter: int = 10000) -> Tuple[Optional[Dict[str, float]], bool]:
+def simplex(tableau: SimplexTableau, max_iter: int = 10000, debug: bool = False) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     Simplex 알고리즘 (Algorithm 3 스타일).
 
@@ -214,6 +241,8 @@ def simplex(tableau: SimplexTableau, max_iter: int = 10000) -> Tuple[Optional[Di
     EPS = 1e-9
 
     for iteration in range(max_iter):
+        if debug:
+            tableau.print()
 
         # ── 범위 위반 기저변수 찾기 ──
         violated_row = None
@@ -264,6 +293,12 @@ def simplex(tableau: SimplexTableau, max_iter: int = 10000) -> Tuple[Optional[Di
             # 피벗 가능한 변수 없음 → UNSAT
             return (None, False)
 
+        if debug:
+            print(f"Violated {xj} = {val:.6g}")
+            print(f"(bounds [{b_xj.lower:.6g}, {b_xj.upper:.6g}])")
+            print(f"pivoting with {pivot_xi}")
+            print()
+
         # ── 피벗 수행 ──
         # 먼저 xj를 경계로 이동시키는 delta 계산
         a = violated_row.coeffs[pivot_xi]
@@ -291,9 +326,9 @@ def simplex(tableau: SimplexTableau, max_iter: int = 10000) -> Tuple[Optional[Di
 #  테스트
 # ─────────────────────────────────────────────
 
-def main() -> None:
+def test1(debug:bool=False) -> None:
     print("=" * 55)
-    print("  사진 예시")
+    print("  테스트 1: 사진 예시")
     print("  s1 = x + y,   s1 >= 0")
     print("  s2 = -2x + y, s2 >= 2")
     print("  s3 = -10x + y, s3 >= -5"   )
@@ -313,25 +348,13 @@ def main() -> None:
     }
 
     tableau = build_tableau(row_defs, bounds)
-    result, sat = simplex(tableau)
+    result, sat = simplex(tableau, debug=debug)
 
-    if sat:
-        print(f"SAT: {result}")
-        # 검증
-        x, y = result['x'], result['y']
-        s1 = x + y
-        s2 = -2*x + y
-        s3 = -10*x + y
-        print(f"\n검증:")
-        print(f"  s1 = {x:.4f} + {y:.4f} = {s1:.4f} >= 0  → {'✅' if s1 >= 0 else '❌'}")
-        print(f"  s2 = -2*{x:.4f} + {y:.4f} = {s2:.4f} >= 2  → {'✅' if s2 >= 2 else '❌'}")
-        print(f"  s3 = -10*{x:.4f} + {y:.4f} = {s3:.4f} >= -5 → {'✅' if s3 >= -5 else '❌'}")
-    else:
-        print("UNSAT")
+    print(f"결과: {'SAT: ' + str(result) if sat else 'UNSAT'}")
 
-    # ─── 추가 테스트 ───
 
-    print("\n" + "=" * 55)
+def test2(debug:bool=False) -> None:
+    print("=" * 55)
     print("  테스트 2: UNSAT 케이스")
     print("  s1 = x,  s1 >= 5")
     print("  s2 = -x, s2 >= -3   (즉 x <= 3)")
@@ -348,10 +371,11 @@ def main() -> None:
         "x":  (0.0, float('inf')),
     }
     tableau2 = build_tableau(row_defs2, bounds2)
-    result2, sat2 = simplex(tableau2)
-    print(f"결과: {'SAT: ' + str(result2) if sat2 else 'UNSAT ✅'}")
+    result2, sat2 = simplex(tableau2, debug=debug)
+    print(f"결과: {'SAT: ' + str(result2) if sat2 else 'UNSAT'}")
 
-    print("\n" + "=" * 55)
+def test3(debug:bool=False) -> None:
+    print("=" * 55)
     print("  테스트 3: 다변수 연립")
     print("  s1 = x + y,   s1 >= 10")
     print("  s2 = x - y,   s2 >= 0  (x >= y)")
@@ -371,16 +395,14 @@ def main() -> None:
         "y":  (0.0,  float('inf')),
     }
     tableau3 = build_tableau(row_defs3, bounds3)
-    result3, sat3 = simplex(tableau3)
-    if sat3:
-        print(f"SAT: {result3}")
-        x, y = result3['x'], result3['y']
-        EPS = 1e-9
-        print(f"  s1={x+y:.3f} >= 10 {'✅' if x+y >= 10-EPS else '❌'}")
-        print(f"  s2={x-y:.3f} >= 0  {'✅' if x-y >= 0-EPS else '❌'}")
-        print(f"  s3={-x+2*y:.3f} >= 3  {'✅' if -x+2*y >= 3-EPS else '❌'}")
-    else:
-        print("UNSAT")
+    result3, sat3 = simplex(tableau3, debug=debug)
+    print(f"결과: {'SAT: ' + str(result3) if sat3 else 'UNSAT'}")
+
+def test4(debug:bool=False) -> None:
+    print("=" * 55)
+    print("  테스트 4: ")
+    print("  s1 = x + y,   s1 >= 5")
+    print("=" * 55)
 
     row_defs4 = [
         ("s1", {"x": 1.0, "y": 1.0})
@@ -391,7 +413,22 @@ def main() -> None:
         "y": (-float('inf'), float('inf')),
     }
     tableau4 = build_tableau(row_defs4, bounds4)
-    result4, sat4 = simplex(tableau4)
-    print(f"테스트 4 결과: {'SAT: ' + str(result4) if sat4 else 'UNSAT'}")
+    result4, sat4 = simplex(tableau4, debug=debug)
+    print(f"결과: {'SAT: ' + str(result4) if sat4 else 'UNSAT'}")
+
+def main() -> None:
+    debug = True
+    test1(debug)
+    print()
+
+    test2(debug)
+    print()
+
+    test3(debug)
+    print()
+
+    test4(debug)
+    print()
+
 if __name__ == "__main__":
     main()

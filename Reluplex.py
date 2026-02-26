@@ -43,6 +43,12 @@ def reluplex(
         4) 케이스 분기 결과를 명시적으로 체크
     """
 
+    # bounds 합법성 검사: lower > upper인 변수 있으면 즉시 UNSAT
+    for var, (lo, hi) in bounds.items():
+        if lo > hi:
+            # print(f"[Reluplex] 변수 '{var}'의 bounds가 불가능: [{lo}, {hi}]")
+            return None, False
+
     # [수정 3] 각 위반 노드(x,y)에 대한 수리 시도 횟수 카운터
     repair_count: Dict[Tuple[str, str], int] = {}
 
@@ -101,7 +107,11 @@ def reluplex(
         """
         return min(violations, key=lambda p: repair_count.get(p, 0))
 
-    def _rec(bounds_now: Dict[str, Tuple[float, float]], depth: int) -> Tuple[Optional[Dict[str, float]], bool]:
+    def _rec(
+        bounds_now: Dict[str, Tuple[float, float]],
+        depth: int,
+        row_defs_now: List[Tuple[str, Dict[str, float]]],
+    ) -> Tuple[Optional[Dict[str, float]], bool]:
         if depth > max_recursion:
             return None, False
 
@@ -110,9 +120,12 @@ def reluplex(
         for _, y in relus:
             lo, hi = bounds_now.get(y, (float('-inf'), float('inf')))
             bounds_now[y] = (max(0.0, lo), hi)
+            if max(0.0, lo) > hi:
+            # print(f"[Reluplex] 변수 '{var}'의 bounds가 불가능: [{lo}, {hi}]")
+                return None, False
 
 
-        tableau = build_tableau(row_defs, bounds_now)
+        tableau = build_tableau(row_defs_now, bounds_now)
         sol, sat = simplex(tableau, max_iter=simplex_max_iter)
         if not sat:
             # F' 자체가 UNSAT → 진짜 UNSAT
@@ -184,10 +197,10 @@ def reluplex(
             # x >= 0 분기 → y = x 제약 추가
             bounds1 = dict(bounds_now)
             bounds1[branch_x] = (max(0.0, lo), hi)
-            row_defs1 = list(row_defs)
+            row_defs1 = list(row_defs_now)
             if relu_y is not None:
                 slack_name = f"relu_slack_{branch_x}_pos"
-                row_defs1 = row_defs + [(slack_name, {relu_y: 1.0, branch_x: -1.0})]
+                row_defs1 = row_defs_now + [(slack_name, {relu_y: 1.0, branch_x: -1.0})]
                 bounds1[slack_name] = (0.0, 0.0)  # y - x = 0
             r1, sat1 = _rec(bounds1, depth + 1, row_defs1)
             if sat1:
@@ -196,7 +209,7 @@ def reluplex(
             # x <= 0 분기 → y = 0 제약 추가
             bounds2 = dict(bounds_now)
             bounds2[branch_x] = (lo, min(0.0, hi))
-            row_defs2 = list(row_defs)
+            row_defs2 = list(row_defs_now)
             if relu_y is not None:
                 bounds2[relu_y] = (0.0, 0.0)  # y = 0으로 고정
             r2, sat2 = _rec(bounds2, depth + 1, row_defs2)
@@ -207,7 +220,7 @@ def reluplex(
 
         return None, False
 
-    return _rec(dict(bounds), 0)
+    return _rec(dict(bounds), 0, list(row_defs))
 
 
 # ─────────────────────────────────────────────

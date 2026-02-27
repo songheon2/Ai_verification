@@ -76,6 +76,18 @@ Pure Literal Elimination 처리
 
 CNF(Conjunctive Normal Form) 입력 처리
 
+🔹 DPLL(T).py
+
+DPLL(T) 메인 루프를 구현한 파일입니다. 
+
+이 모듈은 Boolean 추상화(tseitin CNF)를 SAT로 해결한 뒤,
+
+
+활성화된 이론(Theory) 원자들을 `Reluplex.reluplex` 이론 솔버에 전달하여 실수(또는 ReLU) 제약의 유효성을 검사합니다. 
+
+이 과정에서 이론 충돌이 발생하면 해당 불리언 할당을 차단하는 clause를 CNF에 추가하고 반복합니다.
+
+Relu 관련 원자(`relu(x,y)`)와 선형 부등식(`ineq(...)`)이 지원됩니다.
 
 🚀 How to Run
 
@@ -87,5 +99,28 @@ cnf형식으로 바꾼 식, 입력식, nnf형식으로 바꾼 식, 임시 변수
 예시: phi = NotProp( AndProp( VarProp( "p" ), VarProp( "q" ) ) )
 
 python Tseitin_Transformation.py
+
+
+
+### DPLL(T).py
+간단한 사용 예:
+
+```bash
+# 데모 실행 (예: x + y >= 5 그리고 y = relu(x) 제약)
+python "DPLL(T).py"
+
+# 또는 파이썬에서 직접 호출
+python -c "from DPLL import parse_prop; from DPLL(T) import dpll_t; p = parse_prop('ineq(1,x,1,y,5) and relu(x,y)'); print(dpll_t(p))"
+```
+
+입력 문법(간단):
+main 함수의 prob 변수를 다음과 같은 형식으로 dpll(t)에 넣을 제약식들을 표현
+
+- `ineq(c1,x1,c2,x2,...,b)` : c1*x1 + c2*x2 + ... >= b
+- `relu(x,y)` : y = relu(x)
+- `a and b` : a ^ b
+
+참고: `DPLL(T).py`는 내부에서 `tseitin_cnf`/`dpll` (파일: `DPLL.py`)와
+`reluplex` (파일: `Reluplex.py`)를 사용하므로 두 모듈이 함께 존재해야 합니다.
 
 

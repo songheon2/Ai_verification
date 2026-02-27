@@ -3,8 +3,9 @@ ReLUplex Implementation in Python
 📌 Overview
 
 
+
+
 📂 Project Structure
-.
 
         ├── Reluplex.py
 
@@ -13,8 +14,11 @@ ReLUplex Implementation in Python
         ├── Tseitin_Transformation.py
 
         ├── PropClassDPLL.py
+        
+        ├──  DPLL(T).py
 
         └── README.md
+        
 
 📄 File Descriptions
 
@@ -64,7 +68,7 @@ SAT solver 입력 형식 생성
 
 논리 기반 제약을 SAT 문제로 변환할 때 사용됩니다.
 
-🔹 PropClassDPLL.py
+🔹 DPLL.py
 
 SAT 문제 해결을 위한 백트래킹 기반 탐색 알고리즘
 
@@ -112,17 +116,21 @@ python "DPLL(T).py"
 # 또는 파이썬에서 직접 호출
 python -c "from DPLL import parse_prop; from DPLL(T) import dpll_t; p = parse_prop('ineq(1,x,1,y,5) and relu(x,y)'); print(dpll_t(p))"
 
-# 상수 사용 예시 (EPS가 1e-6으로 치환됨)
-python -c "from DPLL import parse_prop; from DPLL(T) import dpll_t; p = parse_prop('ineq(1,x,0) and relu(x,y) and ineq(-1,y,EPS)', consts={'EPS':1e-6}); print(dpll_t(p))"
+# 상수 사용 예시
+python -c "from DPLL import parse_prop; from DPLL(T) import dpll_t; p = parse_prop('ineq(1,x,0) and relu(x,y) and ineq(-1,y,1e-6)'); print(dpll_t(p))"
 ```
 
-입력 문법(간단):
-main 함수의 prob 변수를 다음과 같은 형식으로 dpll(t)에 넣을 제약식들을 표현
+입력 문법 : DPLL(T) 알고리즘은 제약식을 PropClass 객체 형태로 전달받습니다.
 
+parse_prop() 함수는 특정 문법 형식으로 작성된 논리식을 파싱하여, 내부에서 사용할 수 있는 PropClass 인스턴스들로 변환합니다.
+
+parse_prop()는 다음과 같은 특정 형식으로 표현된 식을 PropClass들로 만들어줍니다.
 - `ineq(c1,x1,c2,x2,...,b)` : c1*x1 + c2*x2 + ... >= b
 - `relu(x,y)` : y = relu(x)
 - `a and b` : a ^ b
 - `ineq(-1,y,1e-6)` : y < 0
+
+ex) parse_prop(`p and q`) =>  AndProp( VarProp( "p" ), VarProp( "q" ) )
 
 참고: `DPLL(T).py`는 내부에서 `tseitin_cnf`/`dpll` (파일: `DPLL.py`)와
 `reluplex` (파일: `Reluplex.py`)를 사용하므로 두 모듈이 함께 존재해야 합니다.

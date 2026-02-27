@@ -456,11 +456,21 @@ def tokenize(s: str) -> List[Token]:
             i += 1
             continue
 
-        # number (for ineq)
+        # epsilon 표현방식 : 숫자 앞에 'e' 또는 'E'가 오면 지수 표기로 인식 (예: 1e-9)
+        # number (for ineq) including scientific notation
         if ch.isdigit() or (ch == "-" and i+1 < len(s) and s[i+1].isdigit()):
             j = i+1
+            # integer / decimal part
             while j < len(s) and (s[j].isdigit() or s[j] == "."):
                 j += 1
+            # optional exponent part
+            if j < len(s) and s[j] in "eE":
+                j += 1
+                if j < len(s) and s[j] in "+-":
+                    j += 1
+                # digits in exponent
+                while j < len(s) and s[j].isdigit():
+                    j += 1
             out.append(("NUM", s[i:j]))
             i = j
             continue
@@ -667,6 +677,7 @@ def run_pipeline(formula: Prop) -> None:
 if __name__ == "__main__":
     print("=== Spec 입력 (종료: quit / exit) ===")
     print("문법: and, or, not(or ~), ->, 괄호(), true/false, ineq(c1,x1,c2,x2,...,b)")
+    print("숫자는 소수나 지수 표기(예: 1e-9)도 사용 가능")
     print("예: (p and q) or not r")
     print("예: not (p -> q)")
     print("예: ineq(1,x,0) or p")

@@ -32,7 +32,7 @@ def inequ_list_to_reluplex(ineqs: List, start_idx: int = 0) -> Tuple[List[Tuple[
     return row_defs, bounds
 
 
-def dpll_t(formula, max_rounds: int = 1000) -> Tuple[Optional[Dict[str, float]], bool]:
+def dpll_t(formula, max_rounds: int = 1000, debug: bool = False) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     DPLL(T) main loop.
 
@@ -41,6 +41,12 @@ def dpll_t(formula, max_rounds: int = 1000) -> Tuple[Optional[Dict[str, float]],
             else obtain Boolean model, collect active theory atoms, ask theory solver.
             if theory-sat -> return theory model
             else add blocking clause (negation of the active atoms) and repeat
+
+    Args:
+        formula: propositional formula with theory atoms
+        max_rounds: limit on Boolean search iterations
+        debug: if True, pass debug=True to the underlying simplex calls via
+               reluplex (useful for tracing the theory-solving steps)
     """
     cnf, atom_map = tseitin_cnf(formula)
 
@@ -82,7 +88,8 @@ def dpll_t(formula, max_rounds: int = 1000) -> Tuple[Optional[Dict[str, float]],
             if y not in bounds:
                 bounds[y] = (float('-inf'), float('inf'))
 
-        th_model, th_sat = reluplex(row_defs, bounds, active_relus)
+        # forward debug flag to reluplex so that simplex prints
+        th_model, th_sat = reluplex(row_defs, bounds, active_relus, debug=debug)
         if th_sat:
             return th_model, True
 
@@ -102,11 +109,19 @@ def main() -> None:
     print("DPLL(T) demo")
     # simple example: x >= 0
     prop = parse_prop('ineq(1,x,1,y,5) and relu(x,y)')
-    th_model, sat = dpll_t(prop)
+    th_model, sat = dpll_t(prop, debug=False)
+    
     print('Result:', 'SAT' if sat else 'UNSAT')
     if sat:
         print('Theory model:', th_model)
 
+    # UNSAT example: x >= 0 and y = relu(x) and y < 0
+    prop_unsat = parse_prop('ineq(1,x,0) and relu(x,y) and ineq(-1,y,1e-6)')
+    th_model_unsat, sat_unsat = dpll_t(prop_unsat, debug=False)
+    
+    print('Result:', 'SAT' if sat_unsat else 'UNSAT')
+    if sat_unsat:
+        print('Theory model:', th_model_unsat)
 
 if __name__ == '__main__':
     main()

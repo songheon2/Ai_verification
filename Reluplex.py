@@ -31,8 +31,7 @@ def reluplex(
     max_recursion: int = 50,
     simplex_max_iter: int = 10000,
     local_repair_max_iter: int = 10,
-    branch_tau: int = 5,
-) -> Tuple[Optional[Dict[str, float]], bool]:
+    branch_tau: int = 5,    debug: bool = False,) -> Tuple[Optional[Dict[str, float]], bool]:
 
     repair_count: Dict[Tuple[str, str], int] = {}
 
@@ -76,7 +75,7 @@ def reluplex(
             # 예외 없이 모든 기저변수를 수식에 맞게 다시 계산!
             t.assign[row.basic_var] = _compute_basic(t, row)
 
-        return simplex(t, max_iter=simplex_max_iter)
+        return simplex(t, max_iter=simplex_max_iter, debug=debug)
 
     def _select_violation(violations: List[Tuple[str, str]]) -> Tuple[str, str]:
         return min(violations, key=lambda p: repair_count.get(p, 0))
@@ -105,7 +104,7 @@ def reluplex(
             bounds_now[y] = (new_lo, hi)
 
         tableau = build_tableau(current_row_defs, bounds_now)
-        sol, sat = simplex(tableau, max_iter=simplex_max_iter)
+        sol, sat = simplex(tableau, max_iter=simplex_max_iter, debug=debug)
         
         if not sat:
             return None, False

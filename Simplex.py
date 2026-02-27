@@ -385,14 +385,15 @@ def main() -> None:
     if sat:
         print(f"SAT: {result}")
         # 검증
+        EPS = 1e-9
         x, y = result['x'], result['y']
         s1 = x + y
         s2 = -2*x + y
         s3 = -10*x + y
         print(f"\n검증:")
-        print(f"  s1 = {x:.4f} + {y:.4f} = {s1:.4f} >= 0  → {'✅' if s1 >= 0 else '❌'}")
-        print(f"  s2 = -2*{x:.4f} + {y:.4f} = {s2:.4f} >= 2  → {'✅' if s2 >= 2 else '❌'}")
-        print(f"  s3 = -10*{x:.4f} + {y:.4f} = {s3:.4f} >= -5 → {'✅' if s3 >= -5 else '❌'}")
+        print(f"  s1 = {x:.4f} + {y:.4f} = {s1:.4f} >= 0  → {'✅' if s1 >= -EPS else '❌'}")
+        print(f"  s2 = -2*{x:.4f} + {y:.4f} = {s2:.4f} >= 2  → {'✅' if s2 >= 2 - EPS else '❌'}")
+        print(f"  s3 = -10*{x:.4f} + {y:.4f} = {s3:.4f} >= -5 → {'✅' if s3 >= -5 - EPS else '❌'}")
     else:
         print("UNSAT")
 

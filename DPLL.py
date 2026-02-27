@@ -39,6 +39,13 @@ class InequProp(Prop):
         """coeffs를 dict 형태로 반환"""
         return dict(self.coeffs)
 
+
+@dataclass(frozen=True)
+class ReLUProp(Prop):
+    # relu(x,y) represents y = relu(x)
+    x: str
+    y: str
+
 @dataclass(frozen=True)
 class AndProp(Prop):
     p: Prop
@@ -80,6 +87,8 @@ def show(prop: Prop) -> str:
                 terms.append(f"{coeff}*{var}")
         expr = " + ".join(terms).replace("+ -", "- ")
         return f"({expr} >= {prop.b})"
+    if isinstance(prop, ReLUProp):
+        return f"relu({prop.x},{prop.y})"
     if isinstance(prop, NotProp): return f"¬{show(prop.p)}"
     if isinstance(prop, AndProp): return f"({show(prop.p)} ∧ {show(prop.q)})"
     if isinstance(prop, OrProp):  return f"({show(prop.p)} ∨ {show(prop.q)})"
@@ -92,7 +101,7 @@ def show(prop: Prop) -> str:
 # ============================================================
 
 def simplify(p: Prop) -> Prop:
-    if isinstance(p, (VarProp, InequProp, TrueProp, FalseProp)):
+    if isinstance(p, (VarProp, InequProp, ReLUProp, TrueProp, FalseProp)):
         return p
 
     if isinstance(p, NotProp):
@@ -124,7 +133,7 @@ def simplify(p: Prop) -> Prop:
 
 def elim_impl(p: Prop) -> Prop:
     """(p -> q) == (~p or q) 로 바꿔 ImplProp 제거"""
-    if isinstance(p, (VarProp, InequProp, TrueProp, FalseProp)):
+    if isinstance(p, (VarProp, InequProp, ReLUProp, TrueProp, FalseProp)):
         return p
     if isinstance(p, NotProp):
         return NotProp(elim_impl(p.p))
@@ -144,7 +153,7 @@ def to_nnf(p: Prop) -> Prop:
     def nnf(x: Prop) -> Prop:
         x = simplify(x)
 
-        if isinstance(x, (VarProp, InequProp, TrueProp, FalseProp)):
+        if isinstance(x, (VarProp, InequProp, ReLUProp, TrueProp, FalseProp)):
             return x
 
         if isinstance(x, AndProp):
@@ -156,7 +165,7 @@ def to_nnf(p: Prop) -> Prop:
         if isinstance(x, NotProp):
             a = simplify(x.p)
 
-            if isinstance(a, (VarProp, InequProp)):
+            if isinstance(a, (VarProp, InequProp, ReLUProp)):
                 return NotProp(a)
 
             if isinstance(a, TrueProp):  return FalseProp()
@@ -188,7 +197,7 @@ CNF     = List[Clause]
 def neg(lit: Literal) -> Literal:
     return lit[1:] if lit.startswith("~") else "~" + lit
 
-def tseitin_cnf(formula: Prop) -> Tuple[CNF, Dict[InequProp, str]]:
+def tseitin_cnf(formula: Prop) -> Tuple[CNF, Dict[Prop, str]]:
     f = to_nnf(formula)
 
     cnf: CNF = []
@@ -200,24 +209,24 @@ def tseitin_cnf(formula: Prop) -> Tuple[CNF, Dict[InequProp, str]]:
         t_counter += 1
         return f"t{t_counter}"
 
-    ineq_map: Dict[InequProp, str] = {}
+    atom_map: Dict[Prop, str] = {}
     a_counter = 0
-    def atom_of_ineq(ineq: InequProp) -> str:
+    def atom_of_theory(atom: Prop) -> str:
         nonlocal a_counter
-        if ineq not in ineq_map:
+        if atom not in atom_map:
             a_counter += 1
-            ineq_map[ineq] = f"a{a_counter}"
-        return ineq_map[ineq]
+            atom_map[atom] = f"a{a_counter}"
+        return atom_map[atom]
 
     def lit_of_atom(x: Prop) -> Literal:
         if isinstance(x, VarProp):
             return x.name
-        if isinstance(x, InequProp):
-            return atom_of_ineq(x)
+        if isinstance(x, (InequProp, ReLUProp)):
+            return atom_of_theory(x)
         if isinstance(x, NotProp) and isinstance(x.p, VarProp):
             return "~" + x.p.name
-        if isinstance(x, NotProp) and isinstance(x.p, InequProp):
-            return "~" + atom_of_ineq(x.p)
+        if isinstance(x, NotProp) and isinstance(x.p, (InequProp, ReLUProp)):
+            return "~" + atom_of_theory(x.p)
         raise ValueError(f"원자 리터럴이 아님: {x}")
 
     def add_equiv_and(t: str, a: Literal, b: Literal):
@@ -242,7 +251,7 @@ def tseitin_cnf(formula: Prop) -> Tuple[CNF, Dict[InequProp, str]]:
             cnf.append([neg(t)])
             return t
 
-        if isinstance(x, (VarProp, InequProp)) or (isinstance(x, NotProp) and isinstance(x.p, (VarProp, InequProp))):
+        if isinstance(x, (VarProp, InequProp, ReLUProp)) or (isinstance(x, NotProp) and isinstance(x.p, (VarProp, InequProp, ReLUProp))):
             return lit_of_atom(x)
 
         if x in memo:
@@ -268,7 +277,7 @@ def tseitin_cnf(formula: Prop) -> Tuple[CNF, Dict[InequProp, str]]:
 
     top = encode(f)
     cnf.append([top])
-    return cnf, ineq_map
+    return cnf, atom_map
 
 def show_cnf(cnf: CNF) -> str:
     return " ∧ ".join("(" + " ∨ ".join(cl) + ")" for cl in cnf)
@@ -562,6 +571,14 @@ class Parser:
 
         if t[0] == "ID":
             name = self.eat("ID")[1]
+            # relu(x,y) 함수 형태를 원자(atom)로 취급
+            if name.lower() == "relu":
+                self.eat("(")
+                x = self.eat("ID")[1]
+                self.eat(",")
+                y = self.eat("ID")[1]
+                self.eat(")")
+                return ReLUProp(x, y)
             return VarProp(name)
 
         if t[0] == "INEQ":
@@ -633,7 +650,7 @@ def run_pipeline(formula: Prop) -> None:
     print_cnf_clauses(cnf, max_clauses=200)
 
     if ineq_map:
-        print("Inequ 추상화 매핑(InequProp -> a_k):")
+        print("Theory 추상화 매핑(원자 -> a_k):")
         for k, v in ineq_map.items():
             print(f"  {v} := {show(k)}")
 
@@ -655,6 +672,7 @@ if __name__ == "__main__":
     print("예: ineq(1,x,0) or p")
     print("예: ineq(1,x,1,y,2,z,-5) (x+y+2z >= -5)")
     print("예: (ineq(1,x,1,y,-0.1) and ineq(-1,x,-1,y,0.1)) -> same_class")
+    print("예: ineq(1,x,0) or relu(x,y)")
     print()
 
     while True:

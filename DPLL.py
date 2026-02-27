@@ -27,12 +27,17 @@ class FalseProp(Prop):
 class VarProp(Prop):
     name: str
 
+# 예: (x+y+2z >= -5) => coeffs=frozenset([("x", 1), ("y", 1), ("z", 2)]), b=-5
 @dataclass(frozen=True)
 class InequProp(Prop):
-    # c*x >= b
-    c: float
-    x: str
+    # c1*x1 + c2*x2 + ... >= b
+    coeffs: frozenset  # frozenset of (variable_name, coefficient) tuples
     b: float
+    
+    @property
+    def coeffs_dict(self) -> Dict[str, float]:
+        """coeffs를 dict 형태로 반환"""
+        return dict(self.coeffs)
 
 @dataclass(frozen=True)
 class AndProp(Prop):
@@ -62,7 +67,19 @@ def show(prop: Prop) -> str:
     if isinstance(prop, TrueProp): return "⊤"
     if isinstance(prop, FalseProp): return "⊥"
     if isinstance(prop, VarProp): return prop.name
-    if isinstance(prop, InequProp): return f"({prop.c}*{prop.x} >= {prop.b})"
+    if isinstance(prop, InequProp):
+        terms = []
+        coeffs_dict = dict(prop.coeffs)
+        for var in sorted(coeffs_dict.keys()):
+            coeff = coeffs_dict[var]
+            if coeff == 1.0:
+                terms.append(var)
+            elif coeff == -1.0:
+                terms.append(f"-{var}")
+            else:
+                terms.append(f"{coeff}*{var}")
+        expr = " + ".join(terms).replace("+ -", "- ")
+        return f"({expr} >= {prop.b})"
     if isinstance(prop, NotProp): return f"¬{show(prop.p)}"
     if isinstance(prop, AndProp): return f"({show(prop.p)} ∧ {show(prop.q)})"
     if isinstance(prop, OrProp):  return f"({show(prop.p)} ∨ {show(prop.q)})"
@@ -420,7 +437,7 @@ def tokenize(s: str) -> List[Token]:
             i += 2
             continue
 
-        if ch in "() ,":
+        if ch in "() ,*+":
             out.append((ch, ch))
             i += 1
             continue
@@ -550,13 +567,30 @@ class Parser:
         if t[0] == "INEQ":
             self.eat("INEQ")
             self.eat("(")
-            c = float(self.eat("NUM")[1])
-            self.eat(",")
-            x = self.eat("ID")[1]
-            self.eat(",")
-            b = float(self.eat("NUM")[1])
+            values: List[Union[float, str]] = []
+            
+            # ineq(c1,x1,c2,x2,...,b) 형태로 모든 값을 읽음
+            while self.peek()[0] != ")":
+                if self.peek()[0] == ",":
+                    self.eat(",")
+                
+                if self.peek()[0] == "NUM":
+                    values.append(float(self.eat("NUM")[1]))
+                elif self.peek()[0] == "ID":
+                    values.append(self.eat("ID")[1])
+            
             self.eat(")")
-            return InequProp(c, x, b)
+            
+            # 마지막 값은 b, 나머지는 (c, x) 쌍
+            b = float(values[-1])
+            coeffs_list: List[Tuple[str, float]] = []
+            
+            for i in range(0, len(values) - 2, 2):
+                c = float(values[i])
+                x = str(values[i+1])
+                coeffs_list.append((x, c))
+            
+            return InequProp(frozenset(coeffs_list), b)
 
         raise ValueError(f"Unexpected token: {t}")
 
@@ -615,11 +649,12 @@ def run_pipeline(formula: Prop) -> None:
 
 if __name__ == "__main__":
     print("=== Spec 입력 (종료: quit / exit) ===")
-    print("문법: and, or, not(or ~), ->, 괄호(), true/false, ineq(c,x,b)")
+    print("문법: and, or, not(or ~), ->, 괄호(), true/false, ineq(c1,x1,c2,x2,...,b)")
     print("예: (p and q) or not r")
     print("예: not (p -> q)")
-    print("예: ineq(1, x, 0) or p")
-    print("예: (ineq(1,x,-0.1) and ineq(-1,x,0.1)) -> same_class")
+    print("예: ineq(1,x,0) or p")
+    print("예: ineq(1,x,1,y,2,z,-5) (x+y+2z >= -5)")
+    print("예: (ineq(1,x,1,y,-0.1) and ineq(-1,x,-1,y,0.1)) -> same_class")
     print()
 
     while True:

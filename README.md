@@ -111,6 +111,9 @@ python "DPLL(T).py"
 
 # 또는 파이썬에서 직접 호출
 python -c "from DPLL import parse_prop; from DPLL(T) import dpll_t; p = parse_prop('ineq(1,x,1,y,5) and relu(x,y)'); print(dpll_t(p))"
+
+# 상수 사용 예시 (EPS가 1e-6으로 치환됨)
+python -c "from DPLL import parse_prop; from DPLL(T) import dpll_t; p = parse_prop('ineq(1,x,0) and relu(x,y) and ineq(-1,y,EPS)', consts={'EPS':1e-6}); print(dpll_t(p))"
 ```
 
 입력 문법(간단):

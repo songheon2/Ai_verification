@@ -107,7 +107,18 @@ def dpll_t(formula, max_rounds: int = 1000, debug: bool = False) -> Tuple[Option
 
 def main() -> None:
     print("DPLL(T) demo")
-    # simple example: x >= 0
+
+    print("\n" + "=" * 55)
+    print("  간단 예제 (SAT) : y = ReLU(x) and x ≥ -3 and and x <= 2 and y ≥ 1")
+    prop = parse_prop('relu(x,y) and ineq(1,x,-3) and ineq(-1,x,-2) and ineq(1,y,1)')
+    th_model, sat = dpll_t(prop, debug=False)
+    
+    print('Result:', 'SAT' if sat else 'UNSAT')
+    if sat:
+        print('Theory model:', th_model)
+    
+    print("\n" + "=" * 55)
+    print("  이론솔버에서 제약을 추가하여 푸는 경우 (SAT) : x + y >= 5, y = relu(x)")
     prop = parse_prop('ineq(1,x,1,y,5) and relu(x,y)')
     th_model, sat = dpll_t(prop, debug=False)
     
@@ -115,13 +126,23 @@ def main() -> None:
     if sat:
         print('Theory model:', th_model)
 
-    # UNSAT example: x >= 0 and y = relu(x) and y < 0
+    print("\n" + "=" * 55)
+    print("  DPLL에선 SAT, 이론솔버에선 UNSAT인 예제 : x >= 0, y = relu(x), y < 0")
     prop_unsat = parse_prop('ineq(1,x,0) and relu(x,y) and ineq(-1,y,1e-6)')
     th_model_unsat, sat_unsat = dpll_t(prop_unsat, debug=False)
     
     print('Result:', 'SAT' if sat_unsat else 'UNSAT')
     if sat_unsat:
         print('Theory model:', th_model_unsat)
+
+    print("\n" + "=" * 55)
+    print(" 이론솔버에서 추가 제약 생성을 생성해서 푸는 경우 (UNSAT) : y = ReLU(x) and x ≤ -3 and y ≥ 1")
+    prop_unsat2 = parse_prop('relu(x,y) and ineq(-1,x,3) and ineq(1,y,1)')
+    th_model_unsat2, sat_unsat2 = dpll_t(prop_unsat2, debug=False)
+
+    print('Result:', 'SAT' if sat_unsat2 else 'UNSAT')
+    if sat_unsat2:
+        print('Theory model:', th_model_unsat2)
 
 if __name__ == '__main__':
     main()

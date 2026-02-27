@@ -506,9 +506,10 @@ def tokenize(s: str) -> List[Token]:
 
 
 class Parser:
-    def __init__(self, tokens: List[Token]):
+    def __init__(self, tokens: List[Token], consts: Optional[Dict[str, float]] = None):
         self.toks = tokens
         self.k = 0
+        self.consts = consts or {}
 
     def peek(self) -> Token:
         return self.toks[self.k]
@@ -604,7 +605,12 @@ class Parser:
                 if self.peek()[0] == "NUM":
                     values.append(float(self.eat("NUM")[1]))
                 elif self.peek()[0] == "ID":
-                    values.append(self.eat("ID")[1])
+                    name = self.eat("ID")[1]
+                    # 상수 맵에 있으면 숫자로 대체
+                    if name in self.consts:
+                        values.append(self.consts[name])
+                    else:
+                        values.append(name)
             
             self.eat(")")
             
@@ -622,8 +628,20 @@ class Parser:
         raise ValueError(f"Unexpected token: {t}")
 
 
-def parse_prop(s: str) -> Prop:
-    return Parser(tokenize(s)).parse()
+# 글로벌 기본 상수 매핑 (이름 -> 값)
+# 사용자가 원하는 다른 상수는 parse_prop 호출 시 전달 가능
+CONSTS: Dict[str, float] = {"EPS": 1e-9}
+
+def parse_prop(s: str, consts: Optional[Dict[str, float]] = None) -> Prop:
+    """문자열을 Prop AST로 파싱.
+
+    Args:
+        s: 파싱할 식
+        consts: 이름을 숫자로 치환할 딕셔너리. 기본값은 `CONSTS`.
+    """
+    if consts is None:
+        consts = CONSTS
+    return Parser(tokenize(s), consts).parse()
 
 def show_clause(cl: Clause) -> str:
     """절(OR들의 묶음)을 보기 좋게 문자열로"""

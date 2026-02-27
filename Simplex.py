@@ -187,11 +187,71 @@ def _update_assign(tableau: SimplexTableau, xj: str, new_val: float) -> None:
 
 
 # ─────────────────────────────────────────────
+#  Tableau 출력 (디버깅)
+# ─────────────────────────────────────────────
+
+def _print_tableau(tableau: SimplexTableau, iteration: int) -> None:
+    """
+    Tableau의 현재 상태를 출력합니다.
+    
+    Args:
+        tableau : SimplexTableau 객체
+        iteration : 반복 번호
+    """
+    print(f"\n[Iteration {iteration}]")
+    print("─" * 70)
+    
+    # 기저변수와 비기저변수 표시
+    basic_vars = set(tableau.basic_vars)
+    all_vars = set(tableau.assign.keys())
+    nonbasic_vars = all_vars - basic_vars
+    
+    print(f"기저변수: {sorted(basic_vars)}")
+    print(f"비기저변수: {sorted(nonbasic_vars)}")
+    print()
+    
+    # 각 row 출력
+    for row in tableau.rows:
+        xj = row.basic_var
+        val = tableau.assign[xj]
+        bounds = tableau.bounds[xj]
+        
+        # row 식 표현
+        terms = []
+        for var in sorted(row.coeffs.keys()):
+            coeff = row.coeffs[var]
+            if coeff > 0:
+                terms.append(f"+ {coeff:.3f}*{var}")
+            else:
+                terms.append(f"- {abs(coeff):.3f}*{var}")
+        
+        expr = " ".join(terms) if terms else "0"
+        if expr.startswith("+ "):
+            expr = expr[2:]
+        
+        bounds_str = f"[{bounds.lower:.3f}, {bounds.upper:.3f}]" if bounds.upper != float('inf') else f"[{bounds.lower:.3f}, ∞)"
+        in_bounds = "✓" if (bounds.lower <= val + 1e-9 and val <= bounds.upper + 1e-9) else "✗"
+        
+        print(f"{xj:4s} = {expr:30s}  | 값: {val:8.3f} | 범위: {bounds_str:20s} {in_bounds}")
+    
+    print()
+    print("변수값:")
+    for var in sorted(tableau.assign.keys()):
+        val = tableau.assign[var]
+        bounds = tableau.bounds[var]
+        bounds_str = f"[{bounds.lower:.3f}, {bounds.upper:.3f}]" if bounds.upper != float('inf') else f"[{bounds.lower:.3f}, ∞)"
+        in_bounds = "✓" if (bounds.lower <= val + 1e-9 and val <= bounds.upper + 1e-9) else "✗"
+        print(f"  {var:4s} = {val:8.3f} (범위: {bounds_str:20s}) {in_bounds}")
+    
+    print("─" * 70)
+
+
+# ─────────────────────────────────────────────
 #  Simplex 메인 알고리즘
 #  (Dutertre & de Moura, "A Fast Linear-Arithmetic Solver for DPLL(T)")
 # ─────────────────────────────────────────────
 
-def simplex(tableau: SimplexTableau, max_iter: int = 10000) -> Tuple[Optional[Dict[str, float]], bool]:
+def simplex(tableau: SimplexTableau, max_iter: int = 10000, debug: bool = False) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     Simplex 알고리즘 (Algorithm 3 스타일).
 
@@ -207,6 +267,11 @@ def simplex(tableau: SimplexTableau, max_iter: int = 10000) -> Tuple[Optional[Di
             - xj > uj: 반대 조건
         3. xi를 찾으면 피벗, 못 찾으면 UNSAT.
 
+    Args:
+        tableau : SimplexTableau 객체
+        max_iter : 최대 반복 횟수 (기본값: 10000)
+        debug : True일 때 각 반복 단계마다 tableau를 출력 (기본값: False)
+
     Returns:
         (assignment, True)  — SAT
         (None, False)       — UNSAT
@@ -214,6 +279,8 @@ def simplex(tableau: SimplexTableau, max_iter: int = 10000) -> Tuple[Optional[Di
     EPS = 1e-9
 
     for iteration in range(max_iter):
+        if debug:
+            _print_tableau(tableau, iteration)
 
         # ── 범위 위반 기저변수 찾기 ──
         violated_row = None
@@ -313,7 +380,7 @@ def main() -> None:
     }
 
     tableau = build_tableau(row_defs, bounds)
-    result, sat = simplex(tableau)
+    result, sat = simplex(tableau, debug=True)
 
     if sat:
         print(f"SAT: {result}")

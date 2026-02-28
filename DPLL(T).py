@@ -1,8 +1,8 @@
 from typing import List, Dict, Tuple, Optional
-from DPLL import parse_prop, tseitin_cnf, dpll, neg
+from DPLL import parse_prop, to_nnf, tseitin_cnf, dpll, neg
 from DPLL import Literal, CNF
 from Reluplex import reluplex
-
+from DPLL import InequProp, ReLUProp, AndProp, NotProp
 
 def inequ_list_to_reluplex(ineqs: List, start_idx: int = 0) -> Tuple[List[Tuple[str, Dict[str, float]]], Dict[str, Tuple[float, float]]]:
     """
@@ -68,11 +68,26 @@ def dpll_t(formula, max_rounds: int = 1000, debug: bool = False) -> Tuple[Option
                 # classify theory atom
                 # Inequalities -> to be converted to row_defs/bounds
                 # ReLU atoms -> relus list for Reluplex
-                from DPLL import InequProp, ReLUProp
                 if isinstance(th, InequProp):
                     active_ineqs.append(th)
                 elif isinstance(th, ReLUProp):
                     active_relus.append((th.x, th.y))
+            elif atom in model and model[atom] is False:
+                # handle negated theory atoms by adding their negation to the active set
+                if atom in atom_to_theory:
+                    th = atom_to_theory[atom]
+                    if isinstance(th, InequProp):
+                        # add negation of inequality: sum(-coeffs[var]*var) >= -b
+                        coeffs_dict = dict(th.coeffs)
+
+                        neg_coeffs = {v: -c for v, c in coeffs_dict.items()}
+                        neg_ineq = InequProp(coeffs=frozenset(neg_coeffs.items()), b=-th.b+1e-6)  # c * x < b
+                        active_ineqs.append(neg_ineq)
+                    elif isinstance(th, ReLUProp):
+                        # add negation of ReLU: y != relu(x) -> (y < 0 and x >= 0) or (y >= 0 and x < 0)
+                        # for simplicity, we can encode this as two separate cases in the theory solver
+                        active_relus.append((th.x, th.y))  # original ReLU constraint
+                        active_relus.append((f"not_{th.x}", f"not_{th.y}"))  # negated case
 
         # if no theory atoms are active, theory trivially sat
         if not active_ineqs and not active_relus:
@@ -89,6 +104,7 @@ def dpll_t(formula, max_rounds: int = 1000, debug: bool = False) -> Tuple[Option
                 bounds[y] = (float('-inf'), float('inf'))
 
         # forward debug flag to reluplex so that simplex prints
+        print(row_defs, bounds)
         th_model, th_sat = reluplex(row_defs, bounds, active_relus, debug=debug)
         if th_sat:
             return th_model, True
@@ -143,6 +159,15 @@ def main() -> None:
     print('Result:', 'SAT' if sat_unsat2 else 'UNSAT')
     if sat_unsat2:
         print('Theory model:', th_model_unsat2)
+
+    print("\n" + "=" * 55)
+    print(" not IneqProp 을 반영하는지 (SAT) : x >= 0 and not (-x >= 0)")
+    prop_unsat3 = parse_prop('ineq(1,x,0) and not ineq(-1,x,0)')
+    th_model_unsat3, sat_unsat3 = dpll_t(prop_unsat3, debug=False)
+
+    print('Result:', 'SAT' if sat_unsat3 else 'UNSAT')
+    if sat_unsat3:
+        print('Theory model:', th_model_unsat3)
 
 if __name__ == '__main__':
     main()

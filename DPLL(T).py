@@ -161,9 +161,10 @@ def main() -> None:
         print('Theory model:', th_model_unsat2)
 
     print("\n" + "=" * 55)
-    print(" not IneqProp 을 반영하는지 (SAT) : x >= 0 and not (-x >= 0)")
+    print(" not IneqProp 을 반영하는지 (SAT) : x >= 0 and not (-x >= 0) ==> x>=0 and not (x<=0) => x>=0 and x>0")
+    print(" 예상 모델 : x>0 => x=1e-6")
     prop_unsat3 = parse_prop('ineq(1,x,0) and not ineq(-1,x,0)')
-    th_model_unsat3, sat_unsat3 = dpll_t(prop_unsat3, debug=False)
+    th_model_unsat3, sat_unsat3 = dpll_t(prop_unsat3, debug=True)
 
     print('Result:', 'SAT' if sat_unsat3 else 'UNSAT')
     if sat_unsat3:

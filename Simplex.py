@@ -221,15 +221,15 @@ def _print_tableau(tableau: SimplexTableau, iteration: int) -> None:
         for var in sorted(row.coeffs.keys()):
             coeff = row.coeffs[var]
             if coeff > 0:
-                terms.append(f"+ {coeff:.3f}*{var}")
+                terms.append(f"+ {coeff:.5f}*{var}")
             else:
-                terms.append(f"- {abs(coeff):.3f}*{var}")
+                terms.append(f"- {abs(coeff):.5f}*{var}")
         
         expr = " ".join(terms) if terms else "0"
         if expr.startswith("+ "):
             expr = expr[2:]
         
-        bounds_str = f"[{bounds.lower:.3f}, {bounds.upper:.3f}]" if bounds.upper != float('inf') else f"[{bounds.lower:.3f}, ∞)"
+        bounds_str = f"[{bounds.lower:.3f}, {bounds.upper:.3f}]" if bounds.upper != float('inf') else f"[{bounds.lower:.6f}, ∞)"
         in_bounds = "✓" if (bounds.lower <= val + 1e-9 and val <= bounds.upper + 1e-9) else "✗"
         
         print(f"{xj:4s} = {expr:30s}  | 값: {val:8.3f} | 범위: {bounds_str:20s} {in_bounds}")
@@ -239,7 +239,7 @@ def _print_tableau(tableau: SimplexTableau, iteration: int) -> None:
     for var in sorted(tableau.assign.keys()):
         val = tableau.assign[var]
         bounds = tableau.bounds[var]
-        bounds_str = f"[{bounds.lower:.3f}, {bounds.upper:.3f}]" if bounds.upper != float('inf') else f"[{bounds.lower:.3f}, ∞)"
+        bounds_str = f"[{bounds.lower:.3f}, {bounds.upper:.3f}]" if bounds.upper != float('inf') else f"[{bounds.lower:.6f}, ∞)"
         in_bounds = "✓" if (bounds.lower <= val + 1e-9 and val <= bounds.upper + 1e-9) else "✗"
         print(f"  {var:4s} = {val:8.3f} (범위: {bounds_str:20s}) {in_bounds}")
     

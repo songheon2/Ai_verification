@@ -104,7 +104,6 @@ def dpll_t(formula, max_rounds: int = 1000, debug: bool = False) -> Tuple[Option
                 bounds[y] = (float('-inf'), float('inf'))
 
         # forward debug flag to reluplex so that simplex prints
-        print(row_defs, bounds)
         th_model, th_sat = reluplex(row_defs, bounds, active_relus, debug=debug)
         if th_sat:
             return th_model, True

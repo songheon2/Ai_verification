@@ -1,3 +1,5 @@
+from pyexpat import model
+
 from DPLL import Prop, TrueProp, FalseProp, VarProp, InequProp, ReLUProp, AndProp, OrProp, NotProp, ImplProp
 from typing import Dict, Tuple, List
 from DPLL_T import dpll_t
@@ -5,7 +7,7 @@ from DPLL_T import dpll_t
 import re
 from math import isfinite
 
-from XORIncoding import NN, FreshGen
+from XOREncoding import NN, FreshGen
 
 
 def make_precondition_linf_box(
@@ -74,15 +76,19 @@ def build_spec(
 
 # --- pretty printing utils ---
 
-def _fmt(v, nd=6):
-    """float-ish pretty formatter"""
+def _fmt(v, nd=6, sci_thresh=1e-4):
     try:
         fv = float(v)
         if not isfinite(fv):
             return str(v)
-        # -0.000000 방지
-        if abs(fv) < 0.5 * (10 ** -nd):
+
+        # 진짜 -0.0만 0.0으로 정리 (값을 죽이지 않음)
+        if fv == 0.0:
             fv = 0.0
+
+        # 작은 값은 sci로 보여주기 (값 정보 보존)
+        if 0.0 < abs(fv) < sci_thresh:
+            return f"{fv:.{nd}e}"
         return f"{fv:.{nd}f}"
     except Exception:
         return str(v)
@@ -139,7 +145,11 @@ def print_cex(center, sat, model, nd=6):
     if g["logits"]:
         # 보기 좋게 key 정렬: s_c 먼저, s_x 다음
         for name in sorted(g["logits"].keys(), key=lambda k: (0 if k.startswith("s_c") else 1, k)):
-            print(f"  {name}: {_fmt(g['logits'][name], nd)}")
+            val = g["logits"][name]
+            fv = float(val)
+            # pretty + raw 동시 출력
+            print(f"  {name}: {_fmt(val, nd)}   (raw={fv:+.18e})")
+            #print(f"  {name}: {_fmt(g['logits'][name], nd)}")
 
         # 가능하면 sign flip 여부도 같이 표시 (key가 1개씩이라는 가정)
         s_c_keys = [k for k in g["logits"] if k.startswith("s_c")]
@@ -148,7 +158,8 @@ def print_cex(center, sat, model, nd=6):
             sc = float(g["logits"][s_c_keys[0]])
             sx = float(g["logits"][s_x_keys[0]])
             same = (sc >= 0) == (sx >= 0)
-            print(f"  same_class?(sc>=0 <-> sx>=0): {same}")
+            print(f"  same_class?(sc>=0 <-> sx>=0): {same}   "
+              f"(sc>=0={sc>=0}, sx>=0={sx>=0})")
 
     # hidden은 너무 길 수 있으니 옵션: 상위 몇 개만
     if g["hidden"]:
@@ -183,9 +194,32 @@ if __name__ == "__main__":
         (1.0, 1.0),
     ]
 
+    # 고정된  c가 있을 때 (이때 c는  (0,0), (0,1), (1,0), (1,1) 중 하나) 
+    # epsilon 값만큼의 차이가있는  x (x0, x1) 를 c와 같은 분류를 해낼 수 있는가
+
+    # 수정해야할 사항
+
+    # make_precondition_linf_box 함수에서 eps=0.3으로 했을 때
+    # c = (0,0)  또는 (1,1) 에 대해 검증할 때 
+    # x의 class는 0이어야 하는데 
+
+    # 실제 값은 음수( class : 0 )인 엄청 작은 값이 출력노드 값으로 나옴  
+    # <= 표기 제한으로 0.00, 즉 양수( class :  1)로 고려 
+    # <= 반례 판정
+
+
+    # 현재 class 판단 방식 y >= 0 => class 1
+    #                 y <= 0 => class 2
+
+    # 생각해본 대안 :                    y > eps => class 1
+    #                 y < -eps => class 0
+
+    # 대안으로 변경시 |y| <= eps 에 있는 건 고려 안함
+    # => 검증이 안된 미정 영역이 생김 => 100% 검증했다고 볼 수 없음
+
     for c in centers:
         # 예: XOR 중심 c=(1,1), eps=0.05, 입력변수 x0,x1
-        pre = make_precondition_linf_box(("x0", "x1"), c, 0.05, clamp_01=True)
+        pre = make_precondition_linf_box(("x0", "x1"), c, eps = 0.02, clamp_01=True)
 
         # center마다 fresh generator를 새로 만들어야 변수 충돌 없이 깔끔
         fg = FreshGen(prefix=f"c{int(c[0])}{int(c[1])}_")
@@ -203,6 +237,5 @@ if __name__ == "__main__":
 
         dpll_model, sat = dpll_t(Neg_spec, debug=False)
         print_cex(c, sat, dpll_model, nd=6)
-
 
     

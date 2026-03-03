@@ -7,7 +7,7 @@ from DPLL_T import dpll_t
 import re
 from math import isfinite
 
-from XOREncoding import NN, FreshGen
+from XOREncoding import FreshGen, NN_dual
 
 
 def make_precondition_linf_box(
@@ -225,7 +225,7 @@ if __name__ == "__main__":
         fg = FreshGen(prefix=f"c{int(c[0])}{int(c[1])}_")
 
         # 1) 만약 NN이 (x_vars, c, fresh) 받으면:
-        NN_prop, s_x_sym, s_c_sym, aux = NN(x=x_vars, c=c, gen=fg)
+        NN_prop, s_x_sym, s_c_sym, aux = NN_dual(x=x_vars, c=c, gen=fg)
 
         # NN이 만들어낸 최종 로짓 변수명이 예: "s_x", "s_c" 라고 가정
         post = make_postcondition_same_class_by_logit(s_x_sym, s_c_sym)
@@ -237,5 +237,7 @@ if __name__ == "__main__":
 
         dpll_model, sat = dpll_t(Neg_spec, debug=False)
         print_cex(c, sat, dpll_model, nd=6)
+
+    print(Neg_spec)
 
     

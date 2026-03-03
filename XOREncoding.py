@@ -59,7 +59,7 @@ class FreshGen:
 #  - x = (x0_name, x1_name), c = (c0_name, c1_name)
 #  - returns: (phi_nn, sx_name, sc_name, aux_vars)
 # ============================================================
-def NN(x: Tuple[str, str], c: Tuple[str, str], gen: FreshGen | None = None):
+def NN_dual(x: Tuple[str, str], c: Tuple[str, str], gen: FreshGen | None = None):
     """
     XOR NN with given trained weights:
       hidden1: w=[ 2.1247,  2.1267], b=-2.1259
@@ -149,6 +149,69 @@ def NN(x: Tuple[str, str], c: Tuple[str, str], gen: FreshGen | None = None):
     }
     return phi_nn, sx, sc, aux
 
+# =============================================================================
+# Single-input-path XOR NN encoding: NN(x, gen=...)
+# =============================================================================
+def NN_single(x: Tuple[str, str], gen: FreshGen | None = None):
+    """
+    XOR NN for a single input node pair x=(x0,x1), returning constraints up to logit s.
+
+    Trained weights:
+      hidden1: w=[ 2.1247,  2.1267], b=-2.1259
+      hidden2: w=[-2.1237, -2.1235], b= 2.1234
+      out    : w=[-3.6788, -3.6766], b= 3.5451
+    Activation: ReLU on hidden. Output is logit s (pre-sigmoid).
+    Decision threshold 0.5 after sigmoid corresponds to s > 0.
+
+    Parameters
+    ----------
+    x : (x0, x1) variable names
+    gen : fresh name generator
+
+    Returns
+    -------
+    phi : Prop
+        conjunction of all constraints for x path
+    s : str
+        variable name of output logit for x input
+    aux : Dict[str, List[str]]
+        intermediate variable names (debug/inspection)
+    """
+    if gen is None:
+        gen = FreshGen("nn")
+
+    x0, x1 = x
+
+    # ----- allocate intermediates -----
+    z1 = gen.fresh("z1")   # preact hidden1
+    z2 = gen.fresh("z2")   # preact hidden2
+    h1 = gen.fresh("h1")   # relu(z1)
+    h2 = gen.fresh("h2")   # relu(z2)
+    s  = gen.fresh("s")    # logit
+
+    # ----- affine hidden pre-activations -----
+    # z1 = 2.1247*x0 + 2.1267*x1 - 2.1259
+    # bring to eq_lin form: z1 - 2.1247*x0 - 2.1267*x1 == -2.1259
+    phi_z1 = eq_lin({z1: 1.0, x0: -2.1247, x1: -2.1267}, -2.1259)
+
+    # z2 = -2.1237*x0 - 2.1235*x1 + 2.1234
+    # z2 + 2.1237*x0 + 2.1235*x1 == 2.1234
+    phi_z2 = eq_lin({z2: 1.0, x0: 2.1237, x1: 2.1235}, 2.1234)
+
+    # ----- ReLUs -----
+    phi_relu1 = ReLUProp(x=z1, y=h1)
+    phi_relu2 = ReLUProp(x=z2, y=h2)
+
+    # ----- output logit -----
+    # s = -3.6788*h1 - 3.6766*h2 + 3.5451
+    # s + 3.6788*h1 + 3.6766*h2 == 3.5451
+    phi_s = eq_lin({s: 1.0, h1: 3.6788, h2: 3.6766}, 3.5451)
+
+    phi = conj([phi_z1, phi_z2, phi_relu1, phi_relu2, phi_s])
+
+    aux = {"path": [z1, z2, h1, h2, s]}
+    return phi, s, aux
+
 # ============================================================
 # 테스트
 # ============================================================
@@ -172,22 +235,26 @@ def main():
         # center마다 fresh generator를 새로 만들어야 변수 충돌 없이 깔끔
         fg = FreshGen(prefix=f"c{int(c[0])}{int(c[1])}_")
 
-        # --- 여기만 네 NN 시그니처에 맞게 고치면 됨 ---
         # 1) 만약 NN이 (x_vars, c, fresh) 받으면:
-        nn_prop = NN(x=x_vars, c=c, gen=fg)
+        nn_dual_prop = NN_dual(x=x_vars, c=c, gen=fg)
 
         # 2) 만약 NN이 (x, c)만 받으면:
         # nn_prop = NN(x_vars, c)
         # ------------------------------------------------
 
-        print(nn_prop)
+        print(nn_dual_prop)
 
         # fresh 카운터 같은 게 있으면 함께 확인
         if hasattr(fg, "counter"):
             print("Fresh counter:", fg.counter)
 
     print("=" * 80)
-    print("Done.")
+    print("single-path NN constraints:")
+
+    NN_single_prop, s_var, aux_vars = NN_single(x=x_vars)
+    print("NN_single constraints:")
+    print(NN_single_prop)
+    print("Output logit variable:", s_var)
 
 if __name__ == "__main__":
     main()

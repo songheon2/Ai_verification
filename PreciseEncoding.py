@@ -6,15 +6,34 @@
 #  - print_input_class_eval / print_cex: eps 인자 없음
 # =========================
 
-# 수정할 사항 
+# y = xor(x1, x2)
 
-# 케이스 하나씩 검증하기
+# case 00
 
-# 시간 측정해보기
-# 1e-8
+# (PRE and NN) => POST
 
-# UNSAT일 때 
-# 포함안된 범위에서는 랜덤하게 선택해서 실제 신경망을 돌려보고
+# PRE: zero(x1) and zero(x2)
+#        s = xor(x1, x2)의 출력층 활성화 함수를 넣기전 logit
+# POST:(s < 0)   시그모이드 함수의 단조성에 의해 sigmoid(s) < 0.5
+
+# dpll(t) 에 넣을 최종 식
+# 반례 찾기 형식으로 (PRE and and NN and not POST)
+
+
+# zero(i) : (0 <= i) ^ (i < 0.5)
+# one(i) : (0.5 <= i) ^ (i <= 1)
+
+# 증명할 4개의 명제를 or 시킨 명제 1개
+# case 00 or case 01 or case 10 or case 11
+
+# 문제점 
+# 너무 계산에 너무 오래걸리고(평균적으로 3분 소요) 제대로 된 반례를 찾지 못해서
+
+# case를 하나만 고려하면서 디버깅 중에 있습니다.
+
+# UNSAT일 때 진짜 반례가 없는지 확인을 위해 
+# x 범위에서 랜덤하게 샘플링하고 
+# 해당 x(x1, x2)를 실제 신경망을 돌려서
 # 일치하는지 확인해서 경험적으로 UNSAT 판단 (1만번)
 
 
@@ -113,7 +132,7 @@ def out_one_logit_margin(s: str, margin: float) -> Prop:
 # -------------------------
 # counterexample formula builders (no eps)
 # -------------------------
-eps = 1e-1
+eps = 0.2
 
 def cex_case(
     x1: str, x2: str,
@@ -143,15 +162,20 @@ def cex_case(
     #     InequProp(frozenset([(x2, -1.0)]), -0.4), # x2 <= 0.4
     # )
 
-    # x0, x1 >= 0 + eps and x0, x1 <= 0.5-eps 
+    # case 00
+    # x1, x2 >= 0 and x1, x2 <= 0.5-eps 
+
+    # eps = 1e-1
+    # x1, x2 >= 0.1 and x1, x2 <= 0.4
+
     pre = AND(
         cls_x1(x1),
         cls_x2(x2),
         NNprop,
         InequProp(frozenset([(x1, -1.0)]), -0.5 + eps), # x1 <= 0.5 - eps
-        InequProp(frozenset([(x1, 1.0)]), 0.0 + eps),   # x1 >= 0.0 + eps
+        InequProp(frozenset([(x1, 1.0)]), 0.0 ),   # x1 >= 0.0 + eps
         InequProp(frozenset([(x2, -1.0)]), -0.5 + eps), # x2 <= 0.5 - eps
-        InequProp(frozenset([(x2, 1.0)]), 0.0 + eps),   # x2 >= 0.0 + eps
+        InequProp(frozenset([(x2, 1.0)]), 0.0 ),   # x2 >= 0.0 + eps
 
         # InequProp(frozenset([(x1, -1.0)]), -1.0 + eps), # x1 <= 1.0 - eps
         # InequProp(frozenset([(x2, -1.0)]), -1.0 + eps), # x2 <= 1.0 - eps
@@ -406,7 +430,7 @@ def xor_nn_sx(x1: float, x2: float) -> float:
     """
     Compute sx (logit) for the given (x1, x2) using the provided XOR NN params.
 
-    Network:
+    Network: ReLu + Sigmoid
       zx1 = 2.1247*x1 + 2.1267*x2 - 2.1259
       zx2 = -2.1237*x1 - 2.1235*x2 + 2.1234
       hx1 = relu(zx1)
@@ -455,7 +479,7 @@ def check_xor_on_zero_zero_region(
     random.seed(seed)
 
     # x1, x2의 lo, hi를 받아와야 한다.
-    lo, hi = 0.0 + eps, 0.5 - eps
+    lo, hi = 0.0 , 0.5 - eps
     if not (lo <= hi):
         raise ValueError(f"Invalid eps={eps}: interval [{lo},{hi}] is empty.")
 
@@ -494,9 +518,15 @@ def check_xor_on_zero_zero_region(
 # main usage
 # -------------------------
 if __name__ == "__main__":
-    phi = cex_xor_all_cases(x1="x1", x2="x2")
 
+    # 4가지 케이스 모두에서 반례가 존재하는지 검증하는 공식
+    # phi = cex_xor_all_cases(x1="x1", x2="x2")
+
+    # 1가지 케이스만 확인 case 00
+    fg = FreshGen(prefix="x00_")
+    phi = cex_case("x1", "x2", zero, zero, out_zero_logit, gen=fg)
     print("==== XOR CEX query ====")
+
     # print("formula =", phi)
 
     dpllModel, sat = dpll_t(phi)
@@ -504,14 +534,15 @@ if __name__ == "__main__":
         sat, dpllModel,
         input_class_fns=(("zero", zero), ("one", one)),
     )
-
+    # 현재 eps 값 출력
+    print("eps = ", eps)
     if sat:
         x1 = float(dpllModel.get("x1", 0.0))
         x2 = float(dpllModel.get("x2", 0.0))
         sx = xor_nn_sx(x1, x2)
-        print(f"\n  Evaluated sx for (x1, x2) = ({_fmt(x1)}, {_fmt(x2)}): sx = {_fmt(sx)}")
+        print(f"\n  Evaluated sx for (x1, x2) = ({_fmt(x1)}, {_fmt(x2)}): sx = {_fmt(sx)}  (raw={sx:+.18e})")
     else:
-        print("x0, x1 >= 0 + eps and x0, x1 <= 0.5-eps ")
+        print("x0, x1 >= 0 and x0, x1 <= 0.5-eps ")
         # 1만개 를 해당 범위내에서 샘플링 후 xor_nn_sx 계산해서 
         # xor 동작을 검증한 다음에 xor 동작과 다르면 x1, x2, xor(x1,x2) 결과를 출력해줘
         # 최대 10개까지만 출력해줘

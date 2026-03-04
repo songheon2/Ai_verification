@@ -238,6 +238,4 @@ if __name__ == "__main__":
         dpll_model, sat = dpll_t(Neg_spec, debug=False)
         print_cex(c, sat, dpll_model, nd=6)
 
-    print(Neg_spec)
-
     

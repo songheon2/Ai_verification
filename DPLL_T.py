@@ -81,7 +81,7 @@ def dpll_t(formula, max_rounds: int = 1000, debug: bool = False) -> Tuple[Option
                         coeffs_dict = dict(th.coeffs)
 
                         neg_coeffs = {v: -c for v, c in coeffs_dict.items()}
-                        neg_ineq = InequProp(coeffs=frozenset(neg_coeffs.items()), b=-th.b+1e-6)  # c * x < b
+                        neg_ineq = InequProp(coeffs=frozenset(neg_coeffs.items()), b=-th.b+1e-6)  # not ( c * x >= b ) => c * x < b => c * x <= b - eps 
                         active_ineqs.append(neg_ineq)
                     elif isinstance(th, ReLUProp):
                         # add negation of ReLU: y != relu(x) -> (y < 0 and x >= 0) or (y >= 0 and x < 0)

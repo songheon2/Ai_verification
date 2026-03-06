@@ -48,7 +48,7 @@ from DPLL import (
 )
 from DPLL_T import dpll_t
 from XOREncoding import NN_single, NN_dual, FreshGen, eq_lin
-
+import copy
 
 # -------------------------
 # small helper functions
@@ -537,13 +537,13 @@ if __name__ == "__main__":
         r1 = ranges[r1_idx]
         r2 = ranges[r2_idx]
 
-        def x1_range_prop(i): 
+        def x1_range_prop(i):
             return AndProp(
                 InequProp(frozenset([(i, 1.0)]), r1[0]),   # x1 >= lower bound
                 InequProp(frozenset([(i, -1.0)]), -r1[1])  # x1 <= upper bound
             )
 
-        def x2_range_prop(i): 
+        def x2_range_prop(i):
             return AndProp(
                 InequProp(frozenset([(i, 1.0)]), r2[0]),   # x2 >= lower bound
                 InequProp(frozenset([(i, -1.0)]), -r2[1])  # x2 <= upper bound
@@ -564,17 +564,60 @@ if __name__ == "__main__":
 
         print(f"\n==== XOR CEX query for x1 in [{r1[0]}, {r1[1]}], x2 in [{r2[0]}, {r2[1]}] ====")
 
-        dpllModel, sat = dpll_t(phi)
-        print_cex(
-            sat, dpllModel,
-            input_class_fns=(("zero", zero), ("one", one)),
-        )
-        print("eps = ", eps)
-        if sat:
+        counterexamples = []
+        phi_current = copy.deepcopy(phi)
+
+        while len(counterexamples) < 5:
+            dpllModel, sat = dpll_t(phi_current)
+            if not sat:
+                break
             x1v = float(dpllModel.get("x1", 0.0))
             x2v = float(dpllModel.get("x2", 0.0))
             sx = xor_nn_sx(x1v, x2v)
-            print(f"\n  Evaluated sx for (x1, x2) = ({_fmt(x1v)}, {_fmt(x2v)}): sx = {_fmt(sx)}  (raw={sx:+.18e})")
+
+            counterexamples.append((x1v, x2v, sx))
+
+            # SMT Solver는 연속 구간 해가 있을 때 "존재한다"의 대표 1개만 반환합니다.
+            # 반례 차단을 위해 (x1 != x1v) OR (x2 != x2v) 대신 "delta 차이 이상" 조건식 사용:
+            # 예전: 거의 같은 점 여러 번 찾기 → delta 너무 작음
+            #      실제 반례를 너무 많이 빼기 → delta 너무 큼
+
+            # 문제점
+            # 만약 대표 반례 하나만 하면 출력이 빠르지만
+            # 대표 반례 여러개 계산하려면 제약들이 추가되면서 계산시간이 기하습수적으로 늘어남
+            # high level에 or도 섞이게 되면서 체이틴 변환 과정에서 수많은 제약들이 추가됨
+
+            # delta 만큼 제외
+            # ex) 0 <= x <= 0.5 - eps 에서 해를 찾으면
+            # |--------------------|
+
+            # delta 만큼 제외한 구간에서 dpll_t로 다른 해를 찾기 (두번째 반례 찾기)
+            # |-----| |------------|
+
+            # 세번째 반례 찾기
+            # |-----| |----| |-----|
+
+            delta = 1e-1
+
+            exclude_x1 = OrProp(
+                InequProp(frozenset([(x1, 1.0)]), x1v + delta),
+                InequProp(frozenset([(x1, -1.0)]), -(x1v - delta))
+            )
+            exclude_x2 = OrProp(
+                InequProp(frozenset([(x2, 1.0)]), x2v + delta),
+                InequProp(frozenset([(x2, -1.0)]), -(x2v - delta))
+            )
+            neq = OrProp(exclude_x1, exclude_x2)
+            phi_current = AndProp(phi_current, neq)
+
+        if counterexamples:
+            for idx, (x1v, x2v, sx) in enumerate(counterexamples, 1):
+                print(f"SAT (counterexample) #{idx}:")
+                print(f"  x1 = {_fmt(x1v)}")
+                print(f"  x2 = {_fmt(x2v)}")
+                print(f"  sx = {_fmt(sx)}")
+                print("  evaluated label:", nn_label_from_sx(sx))
+                print()
         else:
             print(f"x1 in [{r1[0]}, {r1[1]}], x2 in [{r2[0]}, {r2[1]}] -- UNSAT")
             # 1만개 를 해당 범위내에서 샘플링 후 xor_nn_sx 계산해서 

@@ -38,6 +38,7 @@
 
 
 from numpy import isfinite
+import time
 
 import random
 from typing import List, Tuple
@@ -568,9 +569,17 @@ if __name__ == "__main__":
         phi_current = copy.deepcopy(phi)
 
         while len(counterexamples) < 5:
+            attempt_no = len(counterexamples) + 1
+            t0 = time.perf_counter()
             dpllModel, sat = dpll_t(phi_current)
+            elapsed = time.perf_counter() - t0
+
             if not sat:
+                print(f"  counterexample search #{attempt_no}: UNSAT ({elapsed:.3f}s)")
                 break
+
+            print(f"  counterexample #{attempt_no} found in {elapsed:.3f}s")
+
             x1v = float(dpllModel.get("x1", 0.0))
             x2v = float(dpllModel.get("x2", 0.0))
             sx = xor_nn_sx(x1v, x2v)
@@ -582,11 +591,6 @@ if __name__ == "__main__":
             # 예전: 거의 같은 점 여러 번 찾기 → delta 너무 작음
             #      실제 반례를 너무 많이 빼기 → delta 너무 큼
 
-            # 문제점
-            # 만약 대표 반례 하나만 하면 출력이 빠르지만
-            # 대표 반례 여러개 계산하려면 제약들이 추가되면서 계산시간이 기하습수적으로 늘어남
-            # high level에 or도 섞이게 되면서 체이틴 변환 과정에서 수많은 제약들이 추가됨
-
             # delta 만큼 제외
             # ex) 0 <= x <= 0.5 - eps 에서 해를 찾으면
             # |--------------------|
@@ -596,6 +600,11 @@ if __name__ == "__main__":
 
             # 세번째 반례 찾기
             # |-----| |----| |-----|
+
+            # 문제점
+            # 만약 대표 반례 하나만 하면 출력이 빠르지만
+            # 대표 반례 여러개 계산하려면 
+            # 논리식에 or도 섞이게 되면서 검색 공간 분기가 커진다. => 계산이 느려짐
 
             delta = 1e-1
 

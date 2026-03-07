@@ -48,7 +48,7 @@ def dpll_t(formula, max_rounds: int = 1000, debug: bool = False) -> Tuple[Option
         debug: if True, pass debug=True to the underlying simplex calls via
                reluplex (useful for tracing the theory-solving steps)
     """
-    cnf, atom_map = tseitin_cnf(formula)
+    cnf, atom_map, _memo = tseitin_cnf(formula)
 
     # inverse map: atom name -> theory atom (InequProp or ReLUProp)
     atom_to_theory = {v: k for k, v in atom_map.items()}

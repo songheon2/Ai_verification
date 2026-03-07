@@ -224,16 +224,13 @@ def cnf_to_dot(
     lines.append('    label="atom_map";')
     lines.append('    style=dashed; color=gray;')
 
+    abbrev = _build_abbrev(atom_map, memo)
+
     # atom_map 엔트리 (a 변수)
     sorted_a = sorted(atom_map.items(), key=lambda kv: kv[1])
     prev_id = None
     for prop, alias in sorted_a:
-        if isinstance(prop, InequProp):
-            desc = _ineq_label(prop)
-        elif isinstance(prop, ReLUProp):
-            desc = f"{prop.y} = relu({prop.x})"
-        else:
-            desc = show(prop)
+        desc = _desc_abbrev(prop, alias, abbrev)
         mid = _node_id()
         label = f"{alias}  ↔  {desc}"
         lines.append(f'    {mid} [label="{_escape_dot(label)}", shape=box, '
@@ -247,7 +244,8 @@ def cnf_to_dot(
         sorted_t = sorted(memo.items(), key=lambda kv: kv[1])
         for prop, alias in sorted_t:
             mid = _node_id()
-            label = f"{alias}  ↔  {show(prop)}"
+            desc = _desc_abbrev(prop, alias, abbrev)
+            label = f"{alias}  ↔  {desc}"
             lines.append(f'    {mid} [label="{_escape_dot(label)}", shape=box, '
                          f'style=filled, fillcolor="#fff3e0"];')
             if prev_id is not None:
@@ -264,23 +262,66 @@ def show_atom_map(
     atom_map: Dict[Prop, str],
     memo: Dict[Prop, str] | None = None,
 ) -> str:
-    """atom_map과 memo를 'alias : Prop 설명' 형태로 예쁘게 출력."""
+    """atom_map과 memo를 'alias : Prop 설명' 형태로 예쁘게 출력 (축약 사용)."""
+    abbrev = _build_abbrev(atom_map, memo)
     lines = []
     # a 변수: 이론 원자
     for prop, alias in sorted(atom_map.items(), key=lambda kv: kv[1]):
-        if isinstance(prop, InequProp):
-            desc = _ineq_label(prop)
-        elif isinstance(prop, ReLUProp):
-            desc = f"{prop.y} = relu({prop.x})"
-        else:
-            desc = show(prop)
+        desc = _desc_abbrev(prop, alias, abbrev)
         lines.append(f"  {alias} : {desc}")
     # t 변수: Tseitin 보조 변수
     if memo:
         lines.append("")
         for prop, alias in sorted(memo.items(), key=lambda kv: kv[1]):
-            lines.append(f"  {alias} : {show(prop)}")
+            desc = _desc_abbrev(prop, alias, abbrev)
+            lines.append(f"  {alias} : {desc}")
     return "\n".join(lines)
+
+
+def _show_abbrev(prop: Prop, abbrev: Dict[Prop, str]) -> str:
+    """show()와 동일하되, abbrev에 등록된 부분식은 변수 이름으로 대체."""
+    if prop in abbrev:
+        return abbrev[prop]
+    if isinstance(prop, TrueProp): return "⊤"
+    if isinstance(prop, FalseProp): return "⊥"
+    if isinstance(prop, VarProp): return prop.name
+    if isinstance(prop, InequProp): return f"({_ineq_label(prop)})"
+    if isinstance(prop, ReLUProp): return f"relu({prop.x},{prop.y})"
+    if isinstance(prop, NotProp): return f"¬{_show_abbrev(prop.p, abbrev)}"
+    if isinstance(prop, AndProp):
+        return f"({_show_abbrev(prop.p, abbrev)} ∧ {_show_abbrev(prop.q, abbrev)})"
+    if isinstance(prop, OrProp):
+        return f"({_show_abbrev(prop.p, abbrev)} ∨ {_show_abbrev(prop.q, abbrev)})"
+    if isinstance(prop, ImplProp):
+        return f"({_show_abbrev(prop.p, abbrev)} → {_show_abbrev(prop.q, abbrev)})"
+    return str(prop)
+
+
+def _build_abbrev(
+    atom_map: Dict[Prop, str],
+    memo: Dict[Prop, str] | None,
+) -> Dict[Prop, str]:
+    """memo와 atom_map의 Prop → 변수명 매핑을 통합한 dict."""
+    abbrev: Dict[Prop, str] = {}
+    for prop, alias in atom_map.items():
+        abbrev[prop] = alias
+    if memo:
+        for prop, alias in memo.items():
+            abbrev[prop] = alias
+    return abbrev
+
+
+def _desc_abbrev(
+    prop: Prop,
+    alias: str,
+    abbrev: Dict[Prop, str],
+) -> str:
+    """alias 자신은 abbrev에서 제외하고 1단계만 전개한 설명을 반환."""
+    saved = abbrev.pop(prop, None)
+    desc = _show_abbrev(prop, abbrev)
+    if saved is not None:
+        abbrev[prop] = saved
+    return desc
 
 
 def _escape_dot(s: str) -> str:

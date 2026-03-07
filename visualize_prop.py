@@ -145,13 +145,14 @@ def prop_to_dot(prop: Prop, name: str = "prop_tree") -> str:
 def cnf_to_dot(
     cnf: Prop,
     atom_map: Dict[Prop, str],
+    memo: Dict[Prop, str] | None = None,
     name: str = "cnf_graph",
 ) -> str:
     """
-    CNF Prop 트리와 atom_map 범례를 좌우 나란히 배치하는 DOT 그래프.
+    CNF Prop 트리와 atom_map/memo 범례를 좌우 나란히 배치하는 DOT 그래프.
 
     왼쪽: CNF Prop 트리 (prop_to_dot과 동일한 방식)
-    오른쪽: atom_map 범례 (명제 변수 → 원래 Prop 설명)
+    오른쪽: atom_map + memo 범례 (명제 변수 → 원래 Prop 설명)
     """
     _counter = itertools.count()
     lines: list[str] = []
@@ -223,10 +224,10 @@ def cnf_to_dot(
     lines.append('    label="atom_map";')
     lines.append('    style=dashed; color=gray;')
 
-    # atom_map 엔트리를 alias 순서로 정렬
-    sorted_entries = sorted(atom_map.items(), key=lambda kv: kv[1])
+    # atom_map 엔트리 (a 변수)
+    sorted_a = sorted(atom_map.items(), key=lambda kv: kv[1])
     prev_id = None
-    for prop, alias in sorted_entries:
+    for prop, alias in sorted_a:
         if isinstance(prop, InequProp):
             desc = _ineq_label(prop)
         elif isinstance(prop, ReLUProp):
@@ -235,16 +236,50 @@ def cnf_to_dot(
             desc = show(prop)
         mid = _node_id()
         label = f"{alias}  ↔  {desc}"
-        lines.append(f'    {mid} [label="{_escape_dot(label)}", shape=record, '
+        lines.append(f'    {mid} [label="{_escape_dot(label)}", shape=box, '
                      f'style=filled, fillcolor="#e8f5e9"];')
-        # 세로로 순서대로 연결 (보이지 않는 간선)
         if prev_id is not None:
             lines.append(f'    {prev_id} -> {mid} [style=invis];')
         prev_id = mid
 
+    # memo 엔트리 (t 변수)
+    if memo:
+        sorted_t = sorted(memo.items(), key=lambda kv: kv[1])
+        for prop, alias in sorted_t:
+            mid = _node_id()
+            label = f"{alias}  ↔  {show(prop)}"
+            lines.append(f'    {mid} [label="{_escape_dot(label)}", shape=box, '
+                         f'style=filled, fillcolor="#fff3e0"];')
+            if prev_id is not None:
+                lines.append(f'    {prev_id} -> {mid} [style=invis];')
+            prev_id = mid
+
     lines.append('  }')
 
     lines.append("}")
+    return "\n".join(lines)
+
+
+def show_atom_map(
+    atom_map: Dict[Prop, str],
+    memo: Dict[Prop, str] | None = None,
+) -> str:
+    """atom_map과 memo를 'alias : Prop 설명' 형태로 예쁘게 출력."""
+    lines = []
+    # a 변수: 이론 원자
+    for prop, alias in sorted(atom_map.items(), key=lambda kv: kv[1]):
+        if isinstance(prop, InequProp):
+            desc = _ineq_label(prop)
+        elif isinstance(prop, ReLUProp):
+            desc = f"{prop.y} = relu({prop.x})"
+        else:
+            desc = show(prop)
+        lines.append(f"  {alias} : {desc}")
+    # t 변수: Tseitin 보조 변수
+    if memo:
+        lines.append("")
+        for prop, alias in sorted(memo.items(), key=lambda kv: kv[1]):
+            lines.append(f"  {alias} : {show(prop)}")
     return "\n".join(lines)
 
 
@@ -301,9 +336,10 @@ if __name__ == "__main__":
     save_dot(dot_src, "neg_spec_tree")
     # render_dot("neg_spec_tree", fmt="png")
 
-    cnf, atom_map = tseitin_cnf(Neg_spec)
+    cnf, atom_map, memo = tseitin_cnf(Neg_spec)
     Neg_spec_cnf = cnf_to_prop(cnf)
     print(show(Neg_spec_cnf))
-    dot_src_cnf = cnf_to_dot(Neg_spec_cnf, atom_map, name="neg_spec_cnf")
+    print(show_atom_map(atom_map, memo))
+    dot_src_cnf = cnf_to_dot(Neg_spec_cnf, atom_map, memo, name="neg_spec_cnf")
     save_dot(dot_src_cnf, "neg_spec_cnf")
     # render_dot("neg_spec_cnf", fmt="png")

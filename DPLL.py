@@ -277,7 +277,7 @@ def tseitin_cnf(formula: Prop) -> Tuple[CNF, Dict[Prop, str]]:
 
     top = encode(f)
     cnf.append([top])
-    return cnf, atom_map
+    return cnf, atom_map, memo
 
 def show_cnf(cnf: CNF) -> str:
     return " ∧ ".join("(" + " ∨ ".join(cl) + ")" for cl in cnf)
@@ -655,7 +655,7 @@ def run_pipeline(formula: Prop) -> None:
     nnf_f = to_nnf(formula)
     print("NNF           :", show(nnf_f))
 
-    cnf, ineq_map = tseitin_cnf(formula)
+    cnf, ineq_map, _memo = tseitin_cnf(formula)
     print("CNF           :", show_cnf(cnf))
     
     # 절 단위 출력 추가

@@ -78,7 +78,7 @@ def prop_to_dot(prop: Prop, name: str = "prop_tree") -> str:
     lines: list[str] = []
     lines.append(f"digraph {name} {{")
     lines.append("  rankdir=TB;")
-    lines.append("  node [fontname=\"Helvetica\", fontsize=11];")
+    lines.append("  node [fontname=\"DejaVu Sans\", fontsize=11];")
     lines.append("  edge [arrowsize=0.7];")
 
     def _node_id() -> str:
@@ -158,7 +158,7 @@ def cnf_to_dot(
     lines: list[str] = []
     lines.append(f"digraph {name} {{")
     lines.append("  rankdir=TB;")
-    lines.append('  node [fontname="Helvetica", fontsize=10];')
+    lines.append('  node [fontname="DejaVu Sans", fontsize=10];')
     lines.append("  edge [arrowsize=0.6];")
 
     def _node_id() -> str:

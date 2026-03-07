@@ -51,6 +51,7 @@ from DPLL_T import dpll_t
 from XOREncoding import NN_single, NN_dual, FreshGen, eq_lin
 import copy
 
+from visualize_prop import dump_search_phi_visualization
 # -------------------------
 # small helper functions
 # -------------------------
@@ -523,6 +524,9 @@ if __name__ == "__main__":
     x1 = "x1"
     x2 = "x2"
 
+    VISUALIZE_PHI_EACH_ATTEMPT = True
+    VISUALIZE_RENDER_PNG = True
+
     ranges = [
         (0.0, 0.5 - eps),   # 구간1: [0, 0.5 - eps]
         (0.5 + eps, 1.0)    # 구간2: [0.5 + eps, 1]
@@ -535,6 +539,7 @@ if __name__ == "__main__":
     ]
 
     for i, (r1_idx, r2_idx, x1cls, x2cls, outcls) in enumerate(cases):
+        case_name = f"{r1_idx}{r2_idx}"
         r1 = ranges[r1_idx]
         r2 = ranges[r2_idx]
 
@@ -570,6 +575,16 @@ if __name__ == "__main__":
 
         while len(counterexamples) < 5:
             attempt_no = len(counterexamples) + 1
+
+            if VISUALIZE_PHI_EACH_ATTEMPT:
+                dump_search_phi_visualization(
+                    phi_current,
+                    case_name=case_name,
+                    attempt_no=attempt_no,
+                    render_png=VISUALIZE_RENDER_PNG,
+                    print_alias_map=False,
+                )
+
             t0 = time.perf_counter()
             dpllModel, sat = dpll_t(phi_current)
             elapsed = time.perf_counter() - t0

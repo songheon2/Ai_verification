@@ -18,7 +18,7 @@ Graphviz 설치 후, 명령줄에서 직접 렌더링 가능:
 """
 from __future__ import annotations
 import itertools
-
+from pathlib import Path
 from typing import Dict, List
 
 from DPLL import (
@@ -327,23 +327,36 @@ def _desc_abbrev(
 def _escape_dot(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
+OUTPUT_DIR = Path("./visualize_precise_prop")
 
 def save_dot(dot_src: str, filepath: str = "neg_spec_tree") -> str:
-    """DOT 소스를 .dot 파일로 저장. 경로(확장자 제외)를 반환."""
-    dot_path = filepath + ".dot"
+    """DOT 소스를 OUTPUT_DIR 아래 .dot 파일로 저장. 경로(확장자 제외)를 반환."""
+    base_path = OUTPUT_DIR / filepath
+    base_path.parent.mkdir(parents=True, exist_ok=True)
+    dot_path = base_path.with_suffix(".dot")
+
     with open(dot_path, "w", encoding="utf-8") as f:
         f.write(dot_src)
+
     print(f"DOT 파일 저장: {dot_path}")
-    return filepath
+    return str(base_path)
+
 
 
 def render_dot(filepath: str = "neg_spec_tree", fmt: str = "png") -> None:
-    """graphviz 패키지가 있으면 렌더링, 없으면 안내 메시지."""
+    """Graphviz가 있으면 OUTPUT_DIR 아래의 .dot를 렌더링."""
     import subprocess
     import shutil
 
-    dot_path = filepath + ".dot"
-    out_path = filepath + "." + fmt
+    base_path = Path(filepath)
+
+    # save_dot()가 이미 OUTPUT_DIR 포함 경로를 반환할 수 있으므로
+    # 부모 디렉터리가 없을 때만 OUTPUT_DIR를 붙인다.
+    if not base_path.is_absolute() and base_path.parent == Path("."):
+        base_path = OUTPUT_DIR / base_path
+
+    dot_path = base_path.with_suffix(".dot")
+    out_path = base_path.with_suffix(f".{fmt}")
 
     if shutil.which("dot") is None:
         print("'dot' 명령어를 찾을 수 없습니다.")
@@ -352,35 +365,173 @@ def render_dot(filepath: str = "neg_spec_tree", fmt: str = "png") -> None:
         print(f"설치 후 직접 실행: dot -T{fmt} {dot_path} -o {out_path}")
         return
 
-    subprocess.run(["dot", f"-T{fmt}", dot_path, "-o", out_path], check=True)
+    subprocess.run(["dot", f"-T{fmt}", str(dot_path), "-o", str(out_path)], check=True)
     print(f"이미지 저장: {out_path}")
 
+def visualize_precise_case(
+    case_name: str,
+    r1: tuple[float, float],
+    r2: tuple[float, float],
+    cls_x1,
+    cls_x2,
+    outcls,
+) -> None:
+    """PreciseEncoding.py의 단일 케이스 반례식을 시각화."""
+
+    x1 = "x1"
+    x2 = "x2"
+
+    def x1_range_prop(i: str) -> Prop:
+        return AndProp(
+            InequProp(frozenset([(i, 1.0)]), r1[0]),
+            InequProp(frozenset([(i, -1.0)]), -r1[1]),
+        )
+
+    def x2_range_prop(i: str) -> Prop:
+        return AndProp(
+            InequProp(frozenset([(i, 1.0)]), r2[0]),
+            InequProp(frozenset([(i, -1.0)]), -r2[1]),
+        )
+
+    from XOREncoding import FreshGen, NN_single
+    from PreciseEncoding import AND
+
+    fg = FreshGen(prefix=f"viz_x{case_name}_")
+    NNprop, s, _ = NN_single((x1, x2), gen=fg)
+
+    pre = AND(
+        cls_x1(x1),
+        cls_x2(x2),
+        x1_range_prop(x1),
+        x2_range_prop(x2),
+        NNprop,
+    )
+    post = outcls(s)
+    neg_spec = AND(pre, NotProp(post))
+
+    print(f"\n{'=' * 80}")
+    print(f"=== PreciseEncoding case {case_name} neg_spec ===")
+    print(show(neg_spec))
+
+    tree_base = f"precise_case{case_name}_tree"
+    cnf_base = f"precise_case{case_name}_cnf"
+
+    dot_src = prop_to_dot(neg_spec, name=f"precise_case{case_name}_neg_spec")
+    tree_path = save_dot(dot_src, tree_base)
+    render_dot(tree_path, fmt="png")
+
+    cnf, atom_map, memo = tseitin_cnf(neg_spec)
+    neg_spec_cnf = cnf_to_prop(cnf)
+
+    cnf, atom_map, memo = tseitin_cnf(neg_spec)
+    neg_spec_cnf = cnf_to_prop(cnf)
+
+    print("\n=== Tseitin CNF (as Prop) ===")
+    print(show(neg_spec_cnf))
+    print("\n=== atom_map / memo ===")
+    print(show_atom_map(atom_map, memo))
+
+    dot_src_cnf = cnf_to_dot(
+        neg_spec_cnf,
+        atom_map,
+        memo,
+        name=f"precise_case{case_name}_neg_spec_cnf",
+    )
+    cnf_path = save_dot(dot_src_cnf, cnf_base)
+    render_dot(cnf_path, fmt="png")
+
+def dump_search_phi_visualization(
+    phi: Prop,
+    *,
+    case_name: str,
+    attempt_no: int,
+    render_png: bool = True,
+    print_alias_map: bool = False,
+) -> None:
+    """
+    현재 dpll_t에 넣을 phi를 시각화한다.
+    저장 파일 예:
+      case_00/precise_search_case00_attempt1_tree.dot/.png
+      case_00/precise_search_case00_attempt1_cnf.dot/.png
+    """
+    case_dir = f"case_{case_name}"
+    base = f"precise_search_case{case_name}_attempt{attempt_no}"
+
+
+    dot_src = prop_to_dot(phi, name=f"{base}_tree")
+    tree_path = save_dot(dot_src, f"{case_dir}/{base}_tree")
+    if render_png:
+        render_dot(tree_path, fmt="png")
+
+    cnf, atom_map, memo = tseitin_cnf(phi)
+    phi_cnf = cnf_to_prop(cnf)
+
+    dot_src_cnf = cnf_to_dot(
+        phi_cnf,
+        atom_map,
+        memo,
+        name=f"{base}_cnf",
+    )
+    cnf_path = save_dot(dot_src_cnf, f"{case_dir}/{base}_cnf")
+    if render_png:
+        render_dot(cnf_path, fmt="png")
+
+    if print_alias_map:
+        print(f"\n=== alias map for {base} ===")
+        print(show_atom_map(atom_map, memo))
 
 # ============================================================
 # main: Robustness.py의 Neg_spec 하나(center=(0,0))를 시각화
 # ============================================================
 if __name__ == "__main__":
     from Robustness import make_precondition_linf_box, make_postcondition_same_class_by_logit
-    from XOREncoding import FreshGen, NN_dual
+    from XOREncoding import FreshGen, NN_dual, NN_single
+    from PreciseEncoding import AND, zero, out_zero_logit, one, out_one_logit
 
-    c = (0.0, 0.0)
-    x_vars = ("x0", "x1")
+    # Robustness.py 명세 버전
+    # c = (0.0, 0.0)
+    # x_vars = ("x0", "x1")
 
-    pre = make_precondition_linf_box(x_vars, c, eps=0.02, clamp_01=True)
-    fg = FreshGen(prefix=f"c{int(c[0])}{int(c[1])}_")
-    NN_prop, s_x_sym, s_c_sym, aux = NN_dual(x=x_vars, c=c, gen=fg)
-    post = make_postcondition_same_class_by_logit(s_x_sym, s_c_sym)
+    # pre = make_precondition_linf_box(x_vars, c, eps=0.02, clamp_01=True)
+    # fg = FreshGen(prefix=f"c{int(c[0])}{int(c[1])}_")
+    # NN_prop, s_x_sym, s_c_sym, aux = NN_dual(x=x_vars, c=c, gen=fg)
+    # post = make_postcondition_same_class_by_logit(s_x_sym, s_c_sym)
 
-    Neg_spec = AndProp(pre, AndProp(NN_prop, NotProp(post)))
-    print(show(Neg_spec))
-    dot_src = prop_to_dot(Neg_spec, name="Neg_spec")
-    save_dot(dot_src, "neg_spec_tree")
-    # render_dot("neg_spec_tree", fmt="png")
+    # Neg_spec = AndProp(pre, AndProp(NN_prop, NotProp(post)))
+    # print(show(Neg_spec))
+    # dot_src = prop_to_dot(Neg_spec, name="Neg_spec")
+    # save_dot(dot_src, "neg_spec_tree")
+    # # render_dot("neg_spec_tree", fmt="png")
 
-    cnf, atom_map, memo = tseitin_cnf(Neg_spec)
-    Neg_spec_cnf = cnf_to_prop(cnf)
-    print(show(Neg_spec_cnf))
-    print(show_atom_map(atom_map, memo))
-    dot_src_cnf = cnf_to_dot(Neg_spec_cnf, atom_map, memo, name="neg_spec_cnf")
-    save_dot(dot_src_cnf, "neg_spec_cnf")
-    # render_dot("neg_spec_cnf", fmt="png")
+    # cnf, atom_map, memo = tseitin_cnf(Neg_spec)
+    # Neg_spec_cnf = cnf_to_prop(cnf)
+    # print(show(Neg_spec_cnf))
+    # print(show_atom_map(atom_map, memo))
+    # dot_src_cnf = cnf_to_dot(Neg_spec_cnf, atom_map, memo, name="neg_spec_cnf")
+    # save_dot(dot_src_cnf, "neg_spec_cnf")
+    # # render_dot("neg_spec_cnf", fmt="png")
+
+    # PreciseEncoding.py 명세 버전
+
+    eps = 0.1
+    ranges = [
+        (0.0, 0.5 - eps),   # [0.0, 0.4]
+        (0.5 + eps, 1.0),   # [0.6, 1.0]
+    ]
+
+    cases = [
+        ("00", 0, 0, zero, zero, out_zero_logit),
+        ("01", 0, 1, zero, one,  out_one_logit),
+        ("10", 1, 0, one,  zero, out_one_logit),
+        ("11", 1, 1, one,  one,  out_zero_logit),
+    ]
+
+    for case_name, r1_idx, r2_idx, cls_x1, cls_x2, outcls in cases:
+        visualize_precise_case(
+            case_name=case_name,
+            r1=ranges[r1_idx],
+            r2=ranges[r2_idx],
+            cls_x1=cls_x1,
+            cls_x2=cls_x2,
+            outcls=outcls,
+        )

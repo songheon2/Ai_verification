@@ -48,6 +48,7 @@ def dpll_t(formula, max_rounds: int = 1000, debug: bool = False) -> Tuple[Option
         debug: if True, pass debug=True to the underlying simplex calls via
                reluplex (useful for tracing the theory-solving steps)
     """
+    # dpll 에 넣을 수 있게 cnf 형식으로 변환
     cnf, atom_map, _memo = tseitin_cnf(formula)
 
     # inverse map: atom name -> theory atom (InequProp or ReLUProp)
@@ -55,6 +56,7 @@ def dpll_t(formula, max_rounds: int = 1000, debug: bool = False) -> Tuple[Option
 
     for round_idx in range(max_rounds):
         model = dpll(cnf)
+        # if UNSAT -> 실수 제약, relu제약 확인할 필요 없음
         if model is None:
             return None, False
 
@@ -62,6 +64,7 @@ def dpll_t(formula, max_rounds: int = 1000, debug: bool = False) -> Tuple[Option
         active_ineqs = []
         active_relus: List[Tuple[str, str]] = []
         active_atoms = []
+        # 불추상화를 진행한 부울 변수들을 찾아서 실수, relu 제약들을 복구
         for atom, th in atom_to_theory.items():
             if atom in model and model[atom] is True:
                 active_atoms.append(atom)
@@ -94,6 +97,7 @@ def dpll_t(formula, max_rounds: int = 1000, debug: bool = False) -> Tuple[Option
             # return SAT with empty model (no reals specified)
             return {}, True
 
+        # 복구 시킨 제약들을 Reluplex Input 형태로 변환
         # translate to Reluplex input
         row_defs, bounds = inequ_list_to_reluplex(active_ineqs)
         # ensure variables referenced by relus exist in bounds
@@ -113,6 +117,10 @@ def dpll_t(formula, max_rounds: int = 1000, debug: bool = False) -> Tuple[Option
             # nothing to block -> UNSAT
             return None, False
 
+        # add blocking clause
+        # a1, a2 는 이론들을 고려해보니 잘못된 모델
+        # clause: ¬a1 ∨ ¬a2
+        # cnf /\ clause = cnf
         blocking_clause = ["~" + a for a in active_atoms]
         cnf.append(blocking_clause)
 

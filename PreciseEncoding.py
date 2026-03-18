@@ -1,12 +1,9 @@
-# =========================
-# eps_strict 제거 버전
-#  - input zero/one: eps 인자 없음
-#  - output logit class: eps 인자 없음 (필요하면 별도 margin 버전으로 분리 권장)
-#  - cex_case / cex_xor_all_cases: eps 인자 없음
-#  - print_input_class_eval / print_cex: eps 인자 없음
-# =========================
-
 # y = xor(x1, x2)
+
+# zero(i) : (0 <= i) ^ (i < 0.5)
+# one(i) : (0.5 <= i) ^ (i <= 1)
+
+# “이 신경망이 XOR을 정확하게 구현하는가?”
 
 # case 00
 
@@ -17,24 +14,18 @@
 # POST:(s < 0)   시그모이드 함수의 단조성에 의해 sigmoid(s) < 0.5
 
 # dpll(t) 에 넣을 최종 식
-# 반례 찾기 형식으로 (PRE and and NN and not POST)
+# 반례 찾기 형식   
+# 최종식 = not 원래식
+
+# (PRE and NN and not POST)
+
+# “이 신경망이 XOR과 다르게 동작하는 입력이 존재하는가?”
+
+# SAT => 반례 존제
+# UNSAT => 반례 없음
 
 
-# zero(i) : (0 <= i) ^ (i < 0.5)
-# one(i) : (0.5 <= i) ^ (i <= 1)
 
-# 증명할 4개의 명제를 or 시킨 명제 1개
-# case 00 or case 01 or case 10 or case 11
-
-# 문제점 
-# 너무 계산에 너무 오래걸리고(평균적으로 3분 소요) 제대로 된 반례를 찾지 못해서
-
-# case를 하나만 고려하면서 디버깅 중에 있습니다.
-
-# UNSAT일 때 진짜 반례가 없는지 확인을 위해 
-# x 범위에서 랜덤하게 샘플링하고 
-# 해당 x(x1, x2)를 실제 신경망을 돌려서
-# 일치하는지 확인해서 경험적으로 UNSAT 판단 (1만번)
 
 
 from numpy import isfinite
@@ -136,75 +127,6 @@ def out_one_logit_margin(s: str, margin: float) -> Prop:
 # -------------------------
 eps = 0.2
 
-def cex_case(
-    x1: str, x2: str,
-    cls_x1, cls_x2, cls_out_logit,
-    gen: FreshGen | None = None
-) -> Prop:
-    """
-    Returns counterexample formula: PRE ∧ NN ∧ ¬POST
-      PRE  = cls_x1(x1) ∧ cls_x2(x2) ∧ NNprop
-      POST = cls_out_logit(s) where s is the logit output of the NN
-    """
-    NNprop, s, _ = NN_single((x1, x2), gen=gen)
-
-    # x1, x2 가 0.5를 제외한 범위에서 샘플링된다고 가정 (즉, zero/one 클래스에 속한다고 가정)
-    #     # x0, x1 >= 0.1 and x0, x1 <= 0.5 and x0, x1 >= 0.6 and x1, x2 <= 0.9
-    # pre = AND(
-    #     cls_x1(x1),
-    #     cls_x2(x2),
-    #     NNprop,
-    #     InequProp(frozenset([(x1, 1.0)]), 0.1),   # x1 >= 0.1
-    #     InequProp(frozenset([(x1, -1.0)]), -0.9), # x1 <= 0.9
-    #     InequProp(frozenset([(x2, 1.0)]), 0.1),   # x2 >= 0.1
-    #     InequProp(frozenset([(x2, -1.0)]), -0.9), # x2 <= 0.9
-    #     InequProp(frozenset([(x1, 1.0)]), 0.6),   # x1 >= 0.6
-    #     InequProp(frozenset([(x2, 1.0)]), 0.6),   # x2 >= 0.6
-    #     InequProp(frozenset([(x1, -1.0)]), -0.4), # x1 <= 0.4
-    #     InequProp(frozenset([(x2, -1.0)]), -0.4), # x2 <= 0.4
-    # )
-
-    # case 00
-    # x1, x2 >= 0 and x1, x2 <= 0.5-eps 
-
-    # eps = 1e-1
-    # x1, x2 >= 0.1 and x1, x2 <= 0.4
-
-    pre = AND(
-        cls_x1(x1),
-        cls_x2(x2),
-        NNprop,
-        InequProp(frozenset([(x1, -1.0)]), -0.5 + eps), # x1 <= 0.5 - eps
-        InequProp(frozenset([(x1, 1.0)]), 0.0 ),   # x1 >= 0.0 + eps
-        InequProp(frozenset([(x2, -1.0)]), -0.5 + eps), # x2 <= 0.5 - eps
-        InequProp(frozenset([(x2, 1.0)]), 0.0 ),   # x2 >= 0.0 + eps
-
-        # InequProp(frozenset([(x1, -1.0)]), -1.0 + eps), # x1 <= 1.0 - eps
-        # InequProp(frozenset([(x2, -1.0)]), -1.0 + eps), # x2 <= 1.0 - eps
-        # InequProp(frozenset([(x1, 1.0)]), 0.5 + eps),   # x1 >= 0.5 + eps
-        # InequProp(frozenset([(x2, 1.0)]), 0.5 + eps),   # x2 >= 0.5 + eps
-        
-        
-    )
-    post = cls_out_logit(s)
-    return AND(pre, NotProp(post))
-
-def cex_xor_all_cases(x1="x1", x2="x2") -> Prop:
-    # case마다 fresh generator를 새로 만들어야 변수 충돌 없이 깔끔
-    fg = FreshGen(prefix="x00_")
-    cex00 = cex_case(x1, x2, zero, zero, out_zero_logit, gen=fg)  # 0 xor 0 = 0
-
-    fg = FreshGen(prefix="x01_")
-    cex01 = cex_case(x1, x2, zero, one,  out_one_logit,  gen=fg)  # 0 xor 1 = 1
-
-    fg = FreshGen(prefix="x10_")
-    cex10 = cex_case(x1, x2, one,  zero, out_one_logit,  gen=fg)  # 1 xor 0 = 1
-
-    fg = FreshGen(prefix="x11_")
-    cex11 = cex_case(x1, x2, one,  one,  out_zero_logit, gen=fg)  # 1 xor 1 = 0
-
-    # "어느 케이스든 실패하면" 반례이므로 OR
-    return OrProp(OrProp(cex00, cex01), OrProp(cex10, cex11))
 
 
 # -------------------------
@@ -559,9 +481,12 @@ if __name__ == "__main__":
         fg = FreshGen(prefix=f"x{r1_idx}{r2_idx}_")
         NNprop, s, _ = NN_single((x1, x2), gen=fg)
 
+        # case 00
+        # PRE: zero(x1) and zero(x2)
+        # pre = (x1, x2 >= 0) and (x1, x2 < 0.5 - eps) and NN
+        # post = not (s < 0)
+
         pre = AND(
-            x1cls(x1),
-            x2cls(x2),
             x1_range_prop(x1),
             x2_range_prop(x2),
             NNprop
@@ -574,9 +499,11 @@ if __name__ == "__main__":
         counterexamples = []
         phi_current = copy.deepcopy(phi)
 
+        # 반례 최대 5개 찾기
         while len(counterexamples) < 5:
             attempt_no = len(counterexamples) + 1
 
+            # phi_current를 시각화
             if VISUALIZE_PHI_EACH_ATTEMPT:
                 dump_search_phi_visualization(
                     phi_current,
@@ -624,6 +551,7 @@ if __name__ == "__main__":
 
             delta = 1e-1
 
+            # x1, x2 제외
             exclude_x1 = OrProp(
                 InequProp(frozenset([(x1, 1.0)]), x1v + delta),
                 InequProp(frozenset([(x1, -1.0)]), -(x1v - delta))
@@ -632,6 +560,7 @@ if __name__ == "__main__":
                 InequProp(frozenset([(x2, 1.0)]), x2v + delta),
                 InequProp(frozenset([(x2, -1.0)]), -(x2v - delta))
             )
+            # phi = phi AND (x1 != x1v) OR (x2 != x2v)
             neq = OrProp(exclude_x1, exclude_x2)
             phi_current = AndProp(phi_current, neq)
 
@@ -646,9 +575,12 @@ if __name__ == "__main__":
         else:
             print(f"x1 in [{r1[0]}, {r1[1]}], x2 in [{r2[0]}, {r2[1]}] -- UNSAT")
             # 1만개 를 해당 범위내에서 샘플링 후 xor_nn_sx 계산해서 
-            # xor 동작을 검증한 다음에 xor 동작과 다르면 x1, x2, xor(x1,x2) 결과를 출력해줘
-            # 최대 10개까지만 출력해줘
-            # check_xor_on_region이용
+            # xor 동작을 검증한 다음에 xor 동작과 다르면 x1, x2, xor(x1,x2) 결과를 출력
+
+            # UNSAT일 때 진짜 반례가 없는지 확인을 위해 
+            # x 범위에서 랜덤하게 샘플링하고 
+            # 해당 x(x1, x2)를 실제 신경망을 돌려서
+            # 일치하는지 확인해서 경험적으로 UNSAT 판단 (1만번)
             print("\n[검산] NN이 각 region에서 실제로 xor 동작을 하는지 1만개 샘플링 검증:")
             mismatches = check_xor_on_region(
                 r1, r2,

@@ -4,6 +4,13 @@ from typing import Dict, Tuple, List
 from DPLL import Prop, TrueProp, FalseProp, VarProp, InequProp, ReLUProp, AndProp, OrProp, NotProp, ImplProp
 from DPLL import parse_prop, tseitin_cnf, dpll, neg
 
+# xor 신경망 파라미터
+
+# zx1 = 2.1247*x0 + 2.1267*x1 - 2.1259
+# zx2 = -2.1237*x0 - 2.1235*x1 + 2.1234
+# hx1 = relu(zx1)
+# hx2 = relu(zx2)
+# sx = -3.6788*hx1 - 3.6766*hx2 + 3.5451
 
 # ============================================================
 # 유틸: And를 n-ary처럼 쓰기 위한 헬퍼
@@ -23,7 +30,7 @@ def disj(props: List[Prop]) -> Prop:
     for p in props[1:]:
         out = OrProp(out, p)
     return out
-
+    
 # ============================================================
 # 유틸: 선형 부등식 만들기
 # InequProp은 "sum(ci*xi) >= b" 만 표현 가능
@@ -36,7 +43,6 @@ def ge_lin(terms: Dict[str, float], b: float) -> Prop:
 def eq_lin(terms: Dict[str, float], b: float) -> Prop:
     # sum(terms[var]*var) == b
     # <=> sum(...) >= b  AND  -sum(...) >= -b
-    # <=> sum(...) >= b  AND  sum(...) <= b
     p1 = ge_lin(terms, b)
     neg_terms = {v: -c for v, c in terms.items()}
     p2 = ge_lin(neg_terms, -b)

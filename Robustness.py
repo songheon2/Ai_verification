@@ -219,7 +219,7 @@ if __name__ == "__main__":
 
     for c in centers:
         # 예: XOR 중심 c=(1,1), eps=0.05, 입력변수 x0,x1
-        pre = make_precondition_linf_box(("x0", "x1"), c, eps = 0.02, clamp_01=True)
+        pre = make_precondition_linf_box(("x0", "x1"), c, eps = 0.4, clamp_01=True)
 
         # center마다 fresh generator를 새로 만들어야 변수 충돌 없이 깔끔
         fg = FreshGen(prefix=f"c{int(c[0])}{int(c[1])}_")
@@ -238,4 +238,3 @@ if __name__ == "__main__":
         dpll_model, sat = dpll_t(Neg_spec, debug=False)
         print_cex(c, sat, dpll_model, nd=6)
 
-    

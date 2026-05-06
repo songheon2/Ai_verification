@@ -1,4 +1,5 @@
 import time
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 import platform
@@ -12,6 +13,7 @@ from XOREncoding import FreshGen, NN_single
 from Robustness import make_precondition_linf_box
 from PreciseEncoding import out_zero_logit, out_one_logit
 from PreciseEncoding import xor_nn_sx  # 실제 신경망 함수 추가
+from visualize_prop import dump_search_phi_visualization
 
 # 폰트 설정
 if platform.system() == 'Windows':
@@ -22,10 +24,21 @@ else:
     plt.rcParams['font.family'] = 'NanumGothic'
 plt.rcParams['axes.unicode_minus'] = False
 
+
+plt.rcParams['axes.unicode_minus'] = False
+
+VISUALIZE_REPRESENTATIVE_PHI = True
+VISUALIZE_RENDER_PNG = True
+LOCAL_VIS_DIR = "visualize_LocalRobustness"
+
 def run_milestone_sweep():
     eps_values = np.arange(0.0, 0.505, 0.005)
     sat_counts = []
     
+    representative_visualized = False
+
+    os.makedirs(LOCAL_VIS_DIR, exist_ok=True)
+
     # 🌟 추가된 로직: SAT 개수가 점프하는 '구간(Milestone)'의 모든 반례를 저장할 딕셔너리
     # 예: {2: {'eps': 0.230, 'cexs': [반례1, 반례2]}, 4: {'eps': 0.280, 'cexs': [반례1..4]}}
     milestones = {}
@@ -52,6 +65,18 @@ def run_milestone_sweep():
             post = out_zero_logit(s_var) if expected == 0 else out_one_logit(s_var)
             phi = AndProp(pre, AndProp(nn_prop, NotProp(post)))
             
+            if VISUALIZE_REPRESENTATIVE_PHI and not representative_visualized:
+                print("---------------------------")
+                dump_search_phi_visualization(
+                    phi,
+                    case_name="representative_local_robustness_phi",
+                    attempt_no=1,
+                    output_dir=LOCAL_VIS_DIR,
+                    render_png=VISUALIZE_RENDER_PNG,
+                    print_alias_map=False,
+                )
+                representative_visualized = True
+
             model, sat = dpll_t(phi, debug=False)
             
             if sat:

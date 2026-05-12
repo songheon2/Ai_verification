@@ -127,7 +127,7 @@ if __name__ == "__main__":
     # 2. 수집된 모든 마일스톤(계단 구간)의 반례들을 다 꺼내서 검증
     if milestones:
         print("\n\n" + "="*70)
-        print("🔍 [자동 검산] 각 고장 구간(Jump)별 발견된 모든 반례 정밀 검증")
+        print("[자동 검산] 각 고장 구간(Jump)별 발견된 모든 반례 정밀 검증")
         print("="*70)
         
         # 2개 점프 구간, 4개 점프 구간 순서대로 출력
@@ -136,7 +136,7 @@ if __name__ == "__main__":
             eps = data['eps']
             cexs = data['cexs']
             
-            print(f"\n🚀 [새로운 고장 구간 진입!] 총 {sat_count}개 케이스 고장 (epsilon = {eps:.3f})")
+            print(f"\n[새로운 고장 구간 진입!] 총 {sat_count}개 케이스 고장 (epsilon = {eps:.3f})")
             print("-" * 70)
             
             for i, cex in enumerate(cexs, start=1):
@@ -146,17 +146,17 @@ if __name__ == "__main__":
                 x1_cex = cex['x1']
                 
                 print(f"  [{i}/{len(cexs)}] 분석 중인 케이스: ({c1}, {c2}) -> 기대값 {expected}")
-                print(f"     👉 솔버가 찾은 입력 : x0 = {x0_cex:.8f}, x1 = {x1_cex:.8f}")
+                print(f"     솔버가 찾은 입력 : x0 = {x0_cex:.8f}, x1 = {x1_cex:.8f}")
                 
                 # 신경망 로짓 계산
                 logit_val = xor_nn_sx(x0_cex, x1_cex)
                 prediction = 1 if logit_val >= 0 else 0
                 
                 if prediction != expected:
-                    print(f"     ✅ 기본 검증 완료 : Logit = {logit_val:.8f} (오답 발생 확인!)")
+                    print(f"     기본 검증 완료 : Logit = {logit_val:.8f} (오답 발생 확인!)")
                 else:
                     # 파이썬 수치 오차로 정답이 나와버리는 경우 -> 0.001 바깥으로 밀어내기
-                    print(f"     ❓ 파이썬 수치 오차 감지 (Logit = {logit_val:.8f}). 미세 밀어내기 적용 중...")
+                    print(f"     파이썬 수치 오차 감지 (Logit = {logit_val:.8f}). 미세 밀어내기 적용 중...")
                     
                     shift = 0.001
                     x0_pushed = x0_cex + (shift if x0_cex > c1 else -shift)
@@ -166,12 +166,12 @@ if __name__ == "__main__":
                     pred_pushed = 1 if logit_pushed >= 0 else 0
                     
                     if pred_pushed != expected:
-                        print(f"     ✅ 밀어내기 성공  : x0={x0_pushed:.5f}, x1={x1_pushed:.5f}")
+                        print(f"     밀어내기 성공  : x0={x0_pushed:.5f}, x1={x1_pushed:.5f}")
                         print(f"                       Logit = {logit_pushed:.8f} (오답 확인!)")
                     else:
-                        print(f"     ❌ 밀어내기 실패  : 조금 더 강한 밀어내기가 필요할 수 있습니다.")
+                        print(f"     밀어내기 실패  : 조금 더 강한 밀어내기가 필요할 수 있습니다.")
                 print("") # 줄바꿈
     else:
-        print("\n✅ 반례가 발견되지 않았습니다.")
+        print("\n반례가 발견되지 않았습니다.")
     
     plt.show()

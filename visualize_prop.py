@@ -445,6 +445,7 @@ def dump_search_phi_visualization(
     *,
     case_name: str,
     attempt_no: int,
+    output_dir: str | None = None,
     render_png: bool = True,
     print_alias_map: bool = False,
 ) -> None:
@@ -453,13 +454,22 @@ def dump_search_phi_visualization(
     저장 파일 예:
       case_00/precise_search_case00_attempt1_tree.dot/.png
       case_00/precise_search_case00_attempt1_cnf.dot/.png
+
+    output_dir : 저장 루트 디렉터리. None이면 OUTPUT_DIR 사용.
     """
-    case_dir = f"case_{case_name}"
+    root = Path(output_dir) if output_dir is not None else OUTPUT_DIR
+    case_dir = root / f"case_{case_name}"
     base = f"precise_search_case{case_name}_attempt{attempt_no}"
 
+    def _save(dot_src: str, stem: str) -> str:
+        path = (case_dir / stem).with_suffix(".dot")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(dot_src, encoding="utf-8")
+        print(f"DOT 파일 저장: {path}")
+        return str(path.with_suffix(""))
 
     dot_src = prop_to_dot(phi, name=f"{base}_tree")
-    tree_path = save_dot(dot_src, f"{case_dir}/{base}_tree")
+    tree_path = _save(dot_src, f"{base}_tree")
     if render_png:
         render_dot(tree_path, fmt="png")
 
@@ -472,7 +482,7 @@ def dump_search_phi_visualization(
         memo,
         name=f"{base}_cnf",
     )
-    cnf_path = save_dot(dot_src_cnf, f"{case_dir}/{base}_cnf")
+    cnf_path = _save(dot_src_cnf, f"{base}_cnf")
     if render_png:
         render_dot(cnf_path, fmt="png")
 

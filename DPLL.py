@@ -655,9 +655,9 @@ def run_pipeline(formula: Prop) -> None:
     nnf_f = to_nnf(formula)
     print("NNF           :", show(nnf_f))
 
-    cnf, ineq_map, _memo = tseitin_cnf(formula)
+    cnf, ineq_map, memo = tseitin_cnf(formula)
     print("CNF           :", show_cnf(cnf))
-    
+
     # 절 단위 출력 추가
     print_cnf_clauses(cnf, max_clauses=200)
 
@@ -666,13 +666,19 @@ def run_pipeline(formula: Prop) -> None:
         for k, v in ineq_map.items():
             print(f"  {v} := {show(k)}")
 
+    tseitin_map = {v: k for k, v in memo.items()}
+
     model = dpll(cnf)
     if model is None:
         print("DPLL 결과     : UNSAT")
     else:
         print("DPLL 결과     : SAT")
         for var in sorted(model.keys()):
-            print(f"  {var} = {model[var]}")
+            val = model[var]
+            if var in tseitin_map:
+                print(f"  {var} = {val}    [{var} := {show(tseitin_map[var])}]")
+            else:
+                print(f"  {var} = {val}")
     print()
 
 

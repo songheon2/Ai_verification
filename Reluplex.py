@@ -211,7 +211,7 @@ def main() -> None:
     }
     relus = [("x", "y")]
     try:
-        sol_rel, sat_rel = reluplex(row_defs_rel, bounds_rel, relus)
+        sol_rel, sat_rel = reluplex(row_defs_rel, bounds_rel, relus, debug=True)
         print(f"Reluplex 결과: {'SAT: ' + str(sol_rel) if sat_rel else 'UNSAT'}")
     except Exception as e:
         print(f"Reluplex 테스트 중 오류: {e}")

@@ -27,7 +27,7 @@ plt.rcParams['axes.unicode_minus'] = False
 
 plt.rcParams['axes.unicode_minus'] = False
 
-VISUALIZE_REPRESENTATIVE_PHI = True
+VISUALIZE_REPRESENTATIVE_PHI = False
 VISUALIZE_RENDER_PNG = True
 LOCAL_VIS_DIR = "visualize_LocalRobustness"
 

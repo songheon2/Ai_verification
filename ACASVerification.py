@@ -146,7 +146,7 @@ def main():
     else:
         model_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            "Custom", "output.txt"
+            "Custom", "output.bin"
         )
     model = load_nn_model(model_path)
     print(f"Model: {model.num_layers} layers  "

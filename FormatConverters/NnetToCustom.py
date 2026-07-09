@@ -1,16 +1,14 @@
 """
-.nnet → 커스텀 형식 변환기
+.nnet → 커스텀 형식 변환기 (바이너리)
 
-커스텀 형식:
-  Line 1        : m  (가중치 레이어 수)
-  Lines 2..m+2  : 각 레이어의 노드 수 n_0, n_1, ..., n_m  (한 줄에 하나)
-  이후 m개 블록 :
-      n_{i+1} 행 x n_i 열의 가중치 행렬  (행 단위로 공백 구분)
-      n_{i+1} 개의 바이어스 값  (한 줄에 공백 구분)
+파일 포맷 정의는 CustomBinary.py 참조.
 """
 
 import sys
 import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from CustomBinary import write_custom
 
 
 def parse_nnet(filepath):
@@ -63,31 +61,13 @@ def parse_nnet(filepath):
     return layer_sizes, weights, biases
 
 
-def write_custom(layer_sizes, weights, biases, filepath):
-    m = len(weights)  # 가중치 레이어 수
-
-    with open(filepath, 'w') as f:
-        # Line 1: 레이어 수
-        f.write(f"{m}\n")
-
-        # Lines 2..m+2: 각 레이어 노드 수
-        for size in layer_sizes:
-            f.write(f"{size}\n")
-
-        # m개 블록: 가중치 행렬 + 바이어스
-        for W, b in zip(weights, biases):
-            for row in W:
-                f.write(" ".join(f"{v:.6g}" for v in row) + "\n")
-            f.write(" ".join(f"{v:.6g}" for v in b) + "\n")
-
-
 def convert(input_path, output_path=None):
     if output_path is None:
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         custom_dir = os.path.join(project_root, "Custom")
         os.makedirs(custom_dir, exist_ok=True)
         base = os.path.splitext(os.path.basename(input_path))[0]
-        output_path = os.path.join(custom_dir, base + "_custom.txt")
+        output_path = os.path.join(custom_dir, base + "_custom.bin")
 
     print(f"파싱 중: {input_path}")
     layer_sizes, weights, biases = parse_nnet(input_path)
@@ -101,7 +81,7 @@ def convert(input_path, output_path=None):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("사용법: python nnet_to_custom.py <input.nnet> [output.txt]")
+        print("사용법: python NnetToCustom.py <input.nnet> [output.bin]")
         sys.exit(1)
 
     input_path = sys.argv[1]

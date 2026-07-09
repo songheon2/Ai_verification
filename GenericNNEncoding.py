@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from DPLL import Prop, ReLUProp
 from XOREncoding import conj, eq_lin, FreshGen
+from CustomBinary import read_custom
 
 
 # ============================================================
@@ -31,49 +32,12 @@ class NNModel:
 
 def load_nn_model(filepath: str) -> NNModel:
     """
-    표준 텍스트 형식의 신경망 파일을 읽어 NNModel로 반환한다.
+    커스텀 바이너리 형식(.bin)의 신경망 파일을 읽어 NNModel로 반환한다.
 
-    파일 형식
-    ---------
-    Line 1        : m  (가중치 레이어 수)
-    Lines 2..m+2  : 각 레이어의 노드 수 n_0, n_1, ..., n_m  (한 줄에 하나)
-    이후 m개 블록 :
-        n_{i+1} 행 x n_i 열의 가중치 행렬  (행 단위로 공백 구분)
-        n_{i+1} 개의 바이어스 값  (한 줄에 공백 구분)
-
-    토큰 단위로 파싱하므로 줄바꿈 위치는 유연하게 허용된다.
+    파일 포맷 정의는 CustomBinary.py 참조.
     """
-    with open(filepath, "r") as f:
-        tokens = f.read().split()
-
-    pos = 0
-
-    def read_int() -> int:
-        nonlocal pos
-        v = int(tokens[pos])
-        pos += 1
-        return v
-
-    def read_float() -> float:
-        nonlocal pos
-        v = float(tokens[pos])
-        pos += 1
-        return v
-
-    m = read_int()
-    sizes = [read_int() for _ in range(m + 1)]
-
-    weights: List[List[List[float]]] = []
-    biases: List[List[float]] = []
-
-    for i in range(m):
-        n_in, n_out = sizes[i], sizes[i + 1]
-        W = [[read_float() for _ in range(n_in)] for _ in range(n_out)]
-        b = [read_float() for _ in range(n_out)]
-        weights.append(W)
-        biases.append(b)
-
-    return NNModel(num_layers=m, layer_sizes=sizes, weights=weights, biases=biases)
+    sizes, weights, biases = read_custom(filepath)
+    return NNModel(num_layers=len(weights), layer_sizes=sizes, weights=weights, biases=biases)
 
 
 # ============================================================
@@ -173,7 +137,7 @@ def main():
         plt.rcParams['font.family'] = 'NanumGothic'
     plt.rcParams['axes.unicode_minus'] = False
 
-    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xor_network.txt")
+    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xor_network.bin")
     model = load_nn_model(model_path)
     print(f"모델 로드 완료: 가중치 레이어 {model.num_layers}개, 크기 {model.layer_sizes}")
 

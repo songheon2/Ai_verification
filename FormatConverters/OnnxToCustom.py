@@ -1,7 +1,14 @@
 """
-ONNX (FC+ReLU 신경망) → 커스텀 형식 변환기 (바이너리)
+ONNX (FC+ReLU 신경망) → 커스텀 형식 변환기
 
-NnetToCustom.py와 동일한 커스텀 바이너리 형식을 사용한다 (정의는 CustomBinary.py 참조).
+NnetToCustom.py와 동일한 커스텀 형식을 사용한다:
+
+커스텀 형식:
+  Line 1        : m  (가중치 레이어 수)
+  Lines 2..m+2  : 각 레이어의 노드 수 n_0, n_1, ..., n_m  (한 줄에 하나)
+  이후 m개 블록 :
+      n_{i+1} 행 x n_i 열의 가중치 행렬  (행 단위로 공백 구분)
+      n_{i+1} 개의 바이어스 값  (한 줄에 공백 구분)
 
 ONNX 그래프를 입력에서 출력까지 순차적으로 따라가며, Gemm/MatMul/Add/Mul/Sub로
 이어지는 연속된 아핀(affine) 연산들을 하나의 FC 레이어로 접고(fold), Relu 등의
@@ -22,11 +29,9 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from CustomBinary import write_custom
-
 _PASSTHROUGH_OPS = {"Identity", "Reshape", "Flatten", "Squeeze", "Unsqueeze", "Cast"}
 _ACTIVATION_OPS = {"Relu", "Sigmoid", "Tanh", "LeakyRelu", "Elu", "Softmax", "HardSigmoid"}
+_INPUT_PREPROCESS_OPS = {"Clip", "Max", "Min", "Add", "Sub", "Mul", "Div"}
 
 
 def _split_const_and_data(node, current_tensor, initializers, op_name):
@@ -52,12 +57,18 @@ def parse_onnx(filepath):
         for inp in n.input:
             consumers.setdefault(inp, []).append(n)
 
-    if len(graph.input) != 1:
-        raise ValueError(f"입력 텐서가 정확히 1개여야 합니다 (현재: {[i.name for i in graph.input]})")
+    # 구형 ONNX는 initializer를 graph.input에도 중복 등록할 수 있다.
+    # 실제 데이터 입력에서는 initializer와 이름이 같은 항목을 제외한다.
+    data_inputs = [value for value in graph.input if value.name not in initializers]
+    if len(data_inputs) != 1:
+        raise ValueError(
+            f"실제 입력 텐서가 정확히 1개여야 합니다 "
+            f"(현재: {[value.name for value in data_inputs]})"
+        )
     if len(graph.output) != 1:
         raise ValueError(f"출력 텐서가 정확히 1개여야 합니다 (현재: {[o.name for o in graph.output]})")
 
-    current = graph.input[0].name
+    current = data_inputs[0].name
     output_name = graph.output[0].name
 
     layer_sizes = None
@@ -97,6 +108,23 @@ def parse_onnx(filepath):
         op = node.op_type
 
         if op in _PASSTHROUGH_OPS:
+            current = node.output[0]
+            continue
+
+        # 커스텀 형식은 첫 번째 FC 레이어가 입력받는 텐서부터 시작한다.
+        # 입력 전처리는 AutoVerify의 모델 계약에 별도로 기록하므로 여기서는 건너뛴다.
+        if not started and op in _INPUT_PREPROCESS_OPS:
+            if current not in node.input:
+                raise ValueError(
+                    f"input preprocessing node '{node.name}' does not consume "
+                    f"the current tensor '{current}'"
+                )
+            non_current_inputs = [name for name in node.input if name and name != current]
+            missing = [name for name in non_current_inputs if name not in initializers]
+            if missing:
+                raise ValueError(
+                    f"input preprocessing node '{node.name}' has non-constant inputs: {missing}"
+                )
             current = node.output[0]
             continue
 
@@ -176,13 +204,28 @@ def parse_onnx(filepath):
     return layer_sizes, weights, biases
 
 
+def write_custom(layer_sizes, weights, biases, filepath):
+    m = len(weights)
+
+    with open(filepath, 'w') as f:
+        f.write(f"{m}\n")
+
+        for size in layer_sizes:
+            f.write(f"{size}\n")
+
+        for W, b in zip(weights, biases):
+            for row in W:
+                f.write(" ".join(f"{v:.6g}" for v in row) + "\n")
+            f.write(" ".join(f"{v:.6g}" for v in b) + "\n")
+
+
 def convert(input_path, output_path=None):
     if output_path is None:
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         custom_dir = os.path.join(project_root, "Custom")
         os.makedirs(custom_dir, exist_ok=True)
         base = os.path.splitext(os.path.basename(input_path))[0]
-        output_path = os.path.join(custom_dir, base + "_custom.bin")
+        output_path = os.path.join(custom_dir, base + "_custom.txt")
 
     print(f"파싱 중: {input_path}")
     layer_sizes, weights, biases = parse_onnx(input_path)
@@ -196,7 +239,7 @@ def convert(input_path, output_path=None):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("사용법: python OnnxToCustom.py <input.onnx> [output.bin]")
+        print("사용법: python OnnxToCustom.py <input.onnx> [output.txt]")
         sys.exit(1)
 
     input_path = sys.argv[1]

@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+from Automation.SolverStatus import SolverLimitReached, check_deadline
 
 
 # ─────────────────────────────────────────────
@@ -251,7 +252,14 @@ def _print_tableau(tableau: SimplexTableau, iteration: int) -> None:
 #  (Dutertre & de Moura, "A Fast Linear-Arithmetic Solver for DPLL(T)")
 # ─────────────────────────────────────────────
 
-def simplex(tableau: SimplexTableau, max_iter: int = 10000, debug: bool = False) -> Tuple[Optional[Dict[str, float]], bool]:
+def simplex(
+    tableau: SimplexTableau,
+    max_iter: int = 10000,
+    debug: bool = False,
+    *,
+    deadline: Optional[float] = None,
+    report_unknown: bool = False,
+) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     Simplex 알고리즘 (Algorithm 3 스타일).
 
@@ -279,6 +287,7 @@ def simplex(tableau: SimplexTableau, max_iter: int = 10000, debug: bool = False)
     EPS = 1e-9
 
     for iteration in range(max_iter):
+        check_deadline(deadline)
         if debug:
             _print_tableau(tableau, iteration)
 
@@ -350,7 +359,9 @@ def simplex(tableau: SimplexTableau, max_iter: int = 10000, debug: bool = False)
         for row in tableau.rows:
             tableau.assign[row.basic_var] = _compute_basic(tableau, row)
 
-    # 반복 제한 초과
+    # 반복 제한 초과는 논리적 UNSAT이 아니라 결론을 내리지 못한 UNKNOWN이다.
+    if report_unknown:
+        raise SolverLimitReached("SIMPLEX_ITERATION_LIMIT")
     return (None, False)
 
 

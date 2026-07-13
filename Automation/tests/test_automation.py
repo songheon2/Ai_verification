@@ -162,6 +162,28 @@ class SolverStatusTests(unittest.TestCase):
         )
         self.assertEqual(result.status, SolverStatus.UNSAT)
 
+    def test_theory_conflict_blocks_signed_literals(self):
+        result = dpll_t_detailed(
+            parse_prop(
+                "(ineq(1,x,1) and not ineq(1,x,0)) "
+                "or (ineq(1,x,1) and ineq(1,x,0))"
+            ),
+            max_rounds=10,
+            timeout_seconds=1.0,
+        )
+        self.assertEqual(result.status, SolverStatus.SAT)
+
+    def test_false_theory_literals_do_not_short_circuit_unsat(self):
+        result = dpll_t_detailed(
+            parse_prop(
+                "(not ineq(1,x,0) and not ineq(-1,x,0)) "
+                "or (not ineq(1,x,0) and ineq(-1,x,0))"
+            ),
+            max_rounds=10,
+            timeout_seconds=1.0,
+        )
+        self.assertEqual(result.status, SolverStatus.SAT)
+
     def test_dpll_t_round_limit_is_unknown(self):
         result = dpll_t_detailed(
             parse_prop("ineq(1,x,0)"),

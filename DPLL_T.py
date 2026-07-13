@@ -222,6 +222,15 @@ def main() -> None:
     if sat_unsat3:
         print("Theory model:", th_model_unsat3)
 
+    print("\n" + "=" * 55)
+    print(" blocking clause example: x >= 1 and x >= 0 ")
+    prop_unsat4 = parse_prop('(ineq(1,x,1) and not ineq(1,x,0)) or (ineq(1,x,1) and ineq(1,x,0))')
+    th_model_unsat4, sat_unsat4 = dpll_t(prop_unsat4, debug=True)
+
+    print('Result:', 'SAT' if sat_unsat4 else 'UNSAT')
+    if sat_unsat4:
+        print('Theory model:', th_model_unsat4)
+
 
 if __name__ == "__main__":
     main()

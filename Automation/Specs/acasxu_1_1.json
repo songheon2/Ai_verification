@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "model_contract": {
+    "input_size": 5,
+    "output_size": 5,
+    "layer_sizes": [
+      5,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      5
+    ]
+  },
+  "input": {
+    "space": "raw",
+    "domain": {
+      "lower": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "upper": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    "epsilon": 0.0,
+    "_note": "Raw bounds/cases are transformed with the preprocessing extracted from ONNX."
+  },
+  "output": {
+    "type": "unspecified",
+    "decision": "unspecified",
+    "space": "model",
+    "threshold": 0.0,
+    "margin": 0.0,
+    "_note": "Outputs are the model's final affine values."
+  },
+  "property": {
+    "reference": "expected",
+    "_note": "Use expected for correctness, or center_prediction for label stability."
+  },
+  "cases": [
+    {
+      "name": "edit_me",
+      "center": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "epsilon": 0.0,
+      "expected": null
+    }
+  ],
+  "solver": {
+    "max_rounds": 1000,
+    "max_relus_without_override": 50
+  },
+  "_inspection": {
+    "source_path": "D:\\Verification_semina\\vnn_comp\\vnncomp2025_benchmarks\\benchmarks\\acasxu_2023\\onnx\\ACASXU_run2a_1_1_batch_2000.onnx",
+    "source_format": "onnx",
+    "layer_sizes": [
+      5,
+      50,
+      50,
+      50,
+      50,
+      50,
+      50,
+      5
+    ],
+    "operation_counts": {
+      "Sub": 1,
+      "Flatten": 1,
+      "MatMul": 7,
+      "Add": 7,
+      "Relu": 6
+    },
+    "output_activation_removed": null,
+    "input_preprocessing": {
+      "space": "raw",
+      "domain": {
+        "lower": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ],
+        "upper": [
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    "warnings": [
+      "ONNX input preprocessing is represented in the generated raw-input contract"
+    ],
+    "input_size": 5,
+    "output_size": 5,
+    "relu_count": 300
+  }
+}

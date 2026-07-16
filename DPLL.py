@@ -7,6 +7,7 @@ Created on Mon Feb  2 17:03:24 2026
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Set, Union
+from Automation.SolverStatus import check_deadline
 
 # ============================================================
 # 0) Prop AST 정의
@@ -302,9 +303,14 @@ def lit_value(lit: Literal, asn: Assignment) -> Optional[bool]:
     val = asn[v]
     return (not val) if is_neg_lit(lit) else val
 
-def simplify_cnf_by_asn(cnf: CNF, asn: Assignment) -> Optional[CNF]:
+def simplify_cnf_by_asn(
+    cnf: CNF,
+    asn: Assignment,
+    deadline: Optional[float] = None,
+) -> Optional[CNF]:
     new_cnf: CNF = []
     for clause in cnf:
+        check_deadline(deadline)
         sat = False
         new_clause: Clause = []
         for lit in clause:
@@ -334,22 +340,32 @@ def apply_literal(asn: Assignment, lit: Literal) -> bool:
 def find_unit_literals(cnf: CNF) -> List[Literal]:
     return [cl[0] for cl in cnf if len(cl) == 1]
 
-def unit_propagation(cnf: CNF, asn: Assignment) -> Optional[CNF]:
+def unit_propagation(
+    cnf: CNF,
+    asn: Assignment,
+    deadline: Optional[float] = None,
+) -> Optional[CNF]:
     while True:
+        check_deadline(deadline)
         units = find_unit_literals(cnf)
         if not units:
             return cnf
         for u in units:
             if not apply_literal(asn, u):
                 return None
-        cnf2 = simplify_cnf_by_asn(cnf, asn)
+        cnf2 = simplify_cnf_by_asn(cnf, asn, deadline)
         if cnf2 is None:
             return None
         cnf = cnf2
 
-def pure_literal_elimination(cnf: CNF, asn: Assignment) -> Optional[CNF]:
+def pure_literal_elimination(
+    cnf: CNF,
+    asn: Assignment,
+    deadline: Optional[float] = None,
+) -> Optional[CNF]:
     lits: Set[Literal] = set()
     for clause in cnf:
+        check_deadline(deadline)
         for lit in clause:
             if var_of(lit) in asn:
                 continue
@@ -371,7 +387,7 @@ def pure_literal_elimination(cnf: CNF, asn: Assignment) -> Optional[CNF]:
     for pl in pures:
         apply_literal(asn, pl)
 
-    return simplify_cnf_by_asn(cnf, asn)
+    return simplify_cnf_by_asn(cnf, asn, deadline)
 
 def choose_branch_var(cnf: CNF, asn: Assignment) -> str:
     for clause in cnf:
@@ -381,23 +397,28 @@ def choose_branch_var(cnf: CNF, asn: Assignment) -> str:
                 return v
     return "__done__"
 
-def dpll(cnf: CNF, asn: Optional[Assignment] = None) -> Optional[Assignment]:
+def dpll(
+    cnf: CNF,
+    asn: Optional[Assignment] = None,
+    deadline: Optional[float] = None,
+) -> Optional[Assignment]:
+    check_deadline(deadline)
     if asn is None:
         asn = {}
 
-    cnf = simplify_cnf_by_asn(cnf, asn)
+    cnf = simplify_cnf_by_asn(cnf, asn, deadline)
     if cnf is None:
         return None
     if len(cnf) == 0:
         return asn
 
-    cnf = unit_propagation(cnf, asn)
+    cnf = unit_propagation(cnf, asn, deadline)
     if cnf is None:
         return None
     if len(cnf) == 0:
         return asn
 
-    cnf = pure_literal_elimination(cnf, asn)
+    cnf = pure_literal_elimination(cnf, asn, deadline)
     if cnf is None:
         return None
     if len(cnf) == 0:
@@ -409,13 +430,13 @@ def dpll(cnf: CNF, asn: Optional[Assignment] = None) -> Optional[Assignment]:
 
     asn1 = dict(asn)
     apply_literal(asn1, v)
-    res = dpll(cnf, asn1)
+    res = dpll(cnf, asn1, deadline)
     if res is not None:
         return res
 
     asn2 = dict(asn)
     apply_literal(asn2, "~" + v)
-    return dpll(cnf, asn2)
+    return dpll(cnf, asn2, deadline)
 
 
 # ============================================================

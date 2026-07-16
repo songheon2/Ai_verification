@@ -143,7 +143,7 @@ ReLU 제약이 포함된 실수 제약을 처리하는 **Reluplex 스타일 theo
 4. repair가 `branch_tau`번 이상 실패한 변수에 대해 **branching**:
    - `x >= 0` 분기: `y = x` 제약 추가
    - `x <= 0` 분기: `y = 0` 고정
-5. 최대 재귀 깊이(`max_recursion=50`) 초과 시 UNSAT 처리
+5. 최대 재귀 깊이(`max_recursion=50`) 초과 시 UNKNOWN 처리
 
 핵심 함수:
 - `reluplex(row_defs, bounds, relus, ...)` — 메인 진입점

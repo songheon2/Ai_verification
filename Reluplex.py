@@ -5,6 +5,7 @@
 """
 from typing import Dict, List, Tuple, Optional
 from Simplex import build_tableau, simplex, _pivot, _compute_basic, SimplexTableau
+from Automation.SolverStatus import SolverLimitReached, check_deadline
 import random
 
 def relu(v: float) -> float:
@@ -31,9 +32,19 @@ def reluplex(
     max_recursion: int = 50,
     simplex_max_iter: int = 10000,
     local_repair_max_iter: int = 10,
-    branch_tau: int = 5,    debug: bool = False,) -> Tuple[Optional[Dict[str, float]], bool]:
+    branch_tau: int = 5,
+    debug: bool = False,
+    *,
+    deadline: Optional[float] = None,
+    report_unknown: bool = False,
+) -> Tuple[Optional[Dict[str, float]], bool]:
 
     repair_count: Dict[Tuple[str, str], int] = {}
+
+    def _limit(reason: str) -> Tuple[Optional[Dict[str, float]], bool]:
+        if report_unknown:
+            raise SolverLimitReached(reason)
+        return None, False
 
     def _try_repair(
         tableau: SimplexTableau,
@@ -42,6 +53,7 @@ def reluplex(
         direction: int,
     ) -> Tuple[Optional[Dict[str, float]], bool]:
         import copy
+        check_deadline(deadline)
         t = copy.deepcopy(tableau)
 
         x_val = t.assign.get(x, 0.0)
@@ -75,7 +87,13 @@ def reluplex(
             # 예외 없이 모든 기저변수를 수식에 맞게 다시 계산!
             t.assign[row.basic_var] = _compute_basic(t, row)
 
-        return simplex(t, max_iter=simplex_max_iter, debug=debug)
+        return simplex(
+            t,
+            max_iter=simplex_max_iter,
+            debug=debug,
+            deadline=deadline,
+            report_unknown=report_unknown,
+        )
 
     def _select_violation(violations: List[Tuple[str, str]]) -> Tuple[str, str]:
         return min(violations, key=lambda p: repair_count.get(p, 0))
@@ -85,12 +103,13 @@ def reluplex(
         depth: int, 
         current_row_defs: Optional[List[Tuple[str, Dict[str, float]]]] = None
     ) -> Tuple[Optional[Dict[str, float]], bool]:
+        check_deadline(deadline)
         
         if current_row_defs is None:
             current_row_defs = row_defs
             
         if depth > max_recursion:
-            return None, False
+            return _limit("RELUPLEX_RECURSION_LIMIT")
 
         bounds_now = dict(bounds_now)
         for _, y in relus:
@@ -104,7 +123,13 @@ def reluplex(
             bounds_now[y] = (new_lo, hi)
 
         tableau = build_tableau(current_row_defs, bounds_now)
-        sol, sat = simplex(tableau, max_iter=simplex_max_iter, debug=debug)
+        sol, sat = simplex(
+            tableau,
+            max_iter=simplex_max_iter,
+            debug=debug,
+            deadline=deadline,
+            report_unknown=report_unknown,
+        )
         
         if not sat:
             return None, False
@@ -114,7 +139,9 @@ def reluplex(
         if not violations:
             return assign, True
 
+        repair_unknown_reason = None
         for _ in range(local_repair_max_iter):
+            check_deadline(deadline)
             x, y = _select_violation(violations)
             pair = (x, y)
             repair_count[pair] = repair_count.get(pair, 0) + 1
@@ -123,7 +150,13 @@ def reluplex(
             directions = [0, 1]
             random.shuffle(directions)
             for direction in directions:
-                sol2, sat2 = _try_repair(tableau, x, y, direction)
+                try:
+                    sol2, sat2 = _try_repair(tableau, x, y, direction)
+                except SolverLimitReached as exc:
+                    if exc.reason == "TIMEOUT":
+                        raise
+                    repair_unknown_reason = exc.reason
+                    continue
                 if not sat2:
                     continue
 
@@ -172,7 +205,14 @@ def reluplex(
                 row_defs1.append((slack_name, {relu_y: 1.0, branch_x: -1.0}))
                 bounds1[slack_name] = (0.0, 0.0) 
             
-            r1, sat1 = _rec(bounds1, depth + 1, row_defs1)
+            branch_unknown_reason = None
+            try:
+                r1, sat1 = _rec(bounds1, depth + 1, row_defs1)
+            except SolverLimitReached as exc:
+                if exc.reason == "TIMEOUT":
+                    raise
+                branch_unknown_reason = exc.reason
+                r1, sat1 = None, False
             if sat1:
                 return r1, True
 
@@ -183,13 +223,23 @@ def reluplex(
             if relu_y is not None:
                 bounds2[relu_y] = (0.0, 0.0)
             
-            r2, sat2 = _rec(bounds2, depth + 1, row_defs2)
+            try:
+                r2, sat2 = _rec(bounds2, depth + 1, row_defs2)
+            except SolverLimitReached as exc:
+                if exc.reason == "TIMEOUT":
+                    raise
+                branch_unknown_reason = branch_unknown_reason or exc.reason
+                r2, sat2 = None, False
             if sat2:
                 return r2, True
 
+            if branch_unknown_reason is not None:
+                return _limit(branch_unknown_reason)
             return None, False
 
-        return None, False
+        if depth >= max_recursion:
+            return _limit("RELUPLEX_RECURSION_LIMIT")
+        return _limit(repair_unknown_reason or "RELUPLEX_REPAIR_INCONCLUSIVE")
 
     # [누락되었던 부분 복구] reluplex 함수의 마지막 반환문!
     return _rec(dict(bounds), 0, row_defs)

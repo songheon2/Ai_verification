@@ -42,6 +42,7 @@ from CustomBinary import write_custom
 
 _PASSTHROUGH_OPS = {"Identity", "Reshape", "Flatten", "Squeeze", "Unsqueeze", "Cast"}
 _ACTIVATION_OPS = {"Relu", "Sigmoid", "Tanh", "LeakyRelu", "Elu", "Softmax", "HardSigmoid"}
+_INPUT_PREPROCESS_OPS = {"Clip", "Max", "Min", "Add", "Sub", "Mul", "Div"}
 
 
 def _split_const_and_data(node, current_tensor, initializers, op_name):
@@ -67,12 +68,18 @@ def parse_onnx(filepath):
         for inp in n.input:
             consumers.setdefault(inp, []).append(n)
 
-    if len(graph.input) != 1:
-        raise ValueError(f"입력 텐서가 정확히 1개여야 합니다 (현재: {[i.name for i in graph.input]})")
+    # 구형 ONNX는 initializer를 graph.input에도 중복 등록할 수 있다.
+    # 실제 데이터 입력에서는 initializer와 이름이 같은 항목을 제외한다.
+    data_inputs = [value for value in graph.input if value.name not in initializers]
+    if len(data_inputs) != 1:
+        raise ValueError(
+            f"실제 입력 텐서가 정확히 1개여야 합니다 "
+            f"(현재: {[value.name for value in data_inputs]})"
+        )
     if len(graph.output) != 1:
         raise ValueError(f"출력 텐서가 정확히 1개여야 합니다 (현재: {[o.name for o in graph.output]})")
 
-    current = graph.input[0].name
+    current = data_inputs[0].name
     output_name = graph.output[0].name
 
     layer_sizes = None
@@ -112,6 +119,23 @@ def parse_onnx(filepath):
         op = node.op_type
 
         if op in _PASSTHROUGH_OPS:
+            current = node.output[0]
+            continue
+
+        # 커스텀 형식은 첫 번째 FC 레이어가 입력받는 텐서부터 시작한다.
+        # 입력 전처리는 AutoVerify의 모델 계약에 별도로 기록하므로 여기서는 건너뛴다.
+        if not started and op in _INPUT_PREPROCESS_OPS:
+            if current not in node.input:
+                raise ValueError(
+                    f"input preprocessing node '{node.name}' does not consume "
+                    f"the current tensor '{current}'"
+                )
+            non_current_inputs = [name for name in node.input if name and name != current]
+            missing = [name for name in non_current_inputs if name not in initializers]
+            if missing:
+                raise ValueError(
+                    f"input preprocessing node '{node.name}' has non-constant inputs: {missing}"
+                )
             current = node.output[0]
             continue
 

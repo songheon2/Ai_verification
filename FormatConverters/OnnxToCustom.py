@@ -1,6 +1,21 @@
 """
 ONNX (FC+ReLU 신경망) → 커스텀 형식 변환기 (바이너리)
 
+사용법
+------
+    python FormatConverters/OnnxToCustom.py <input.onnx> [output.bin]
+
+    input.onnx  : 변환할 ONNX 모델 경로 (필수)
+    output.bin  : 출력 경로 (생략 시 Custom/<input파일명>_custom.bin 에 저장)
+
+예제
+----
+    python FormatConverters/OnnxToCustom.py "Onnx/ACASXU_experimental_v2a_1_1.onnx"
+    → Custom/ACASXU_experimental_v2a_1_1_custom.bin 생성
+
+    python FormatConverters/OnnxToCustom.py "Onnx/model.onnx" "Custom/my_model.bin"
+    → 출력 경로 직접 지정
+
 NnetToCustom.py와 동일한 커스텀 바이너리 형식을 사용한다 (정의는 CustomBinary.py 참조).
 
 ONNX 그래프를 입력에서 출력까지 순차적으로 따라가며, Gemm/MatMul/Add/Mul/Sub로

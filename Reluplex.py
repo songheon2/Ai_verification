@@ -6,6 +6,7 @@
 from typing import Dict, List, Tuple, Optional
 from Simplex import build_tableau, simplex, _pivot, _compute_basic, SimplexTableau
 from Automation.SolverStatus import SolverLimitReached, check_deadline
+from Automation.SolveTrace import SolveTrace, span
 import random
 
 def relu(v: float) -> float:
@@ -37,6 +38,7 @@ def reluplex(
     *,
     deadline: Optional[float] = None,
     report_unknown: bool = False,
+    trace: Optional[SolveTrace] = None,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
 
     repair_count: Dict[Tuple[str, str], int] = {}
@@ -87,13 +89,14 @@ def reluplex(
             # 예외 없이 모든 기저변수를 수식에 맞게 다시 계산!
             t.assign[row.basic_var] = _compute_basic(t, row)
 
-        return simplex(
-            t,
-            max_iter=simplex_max_iter,
-            debug=debug,
-            deadline=deadline,
-            report_unknown=report_unknown,
-        )
+        with span(trace, "simplex"):
+            return simplex(
+                t,
+                max_iter=simplex_max_iter,
+                debug=debug,
+                deadline=deadline,
+                report_unknown=report_unknown,
+            )
 
     def _select_violation(violations: List[Tuple[str, str]]) -> Tuple[str, str]:
         return min(violations, key=lambda p: repair_count.get(p, 0))
@@ -123,14 +126,15 @@ def reluplex(
             bounds_now[y] = (new_lo, hi)
 
         tableau = build_tableau(current_row_defs, bounds_now)
-        sol, sat = simplex(
-            tableau,
-            max_iter=simplex_max_iter,
-            debug=debug,
-            deadline=deadline,
-            report_unknown=report_unknown,
-        )
-        
+        with span(trace, "simplex", depth=depth):
+            sol, sat = simplex(
+                tableau,
+                max_iter=simplex_max_iter,
+                debug=debug,
+                deadline=deadline,
+                report_unknown=report_unknown,
+            )
+
         if not sat:
             return None, False
 
@@ -151,7 +155,8 @@ def reluplex(
             random.shuffle(directions)
             for direction in directions:
                 try:
-                    sol2, sat2 = _try_repair(tableau, x, y, direction)
+                    with span(trace, "reluplex_repair", depth=depth, branch_x=x):
+                        sol2, sat2 = _try_repair(tableau, x, y, direction)
                 except SolverLimitReached as exc:
                     if exc.reason == "TIMEOUT":
                         raise
@@ -194,48 +199,52 @@ def reluplex(
                 break
 
         if branch_x is not None and depth < max_recursion:
-            lo, hi = bounds_now.get(branch_x, (float('-inf'), float('inf')))
+            # 이 with 블록이 열려있는 동안(양쪽 분기가 다 끝날 때까지)이
+            # "지금 branch_x에서 split이 진행 중"인 구간이다 — 시각화에서
+            # "현재 열려있는 branch_x 스택"을 그대로 이 이벤트들로 재구성한다.
+            with span(trace, "reluplex_split", depth=depth, branch_x=branch_x):
+                lo, hi = bounds_now.get(branch_x, (float('-inf'), float('inf')))
 
-            # 1. x >= 0 분기
-            bounds1 = dict(bounds_now)
-            bounds1[branch_x] = (max(0.0, lo), hi)
-            row_defs1 = list(current_row_defs)
-            if relu_y is not None:
-                slack_name = f"relu_slack_{branch_x}_pos_{depth}" 
-                row_defs1.append((slack_name, {relu_y: 1.0, branch_x: -1.0}))
-                bounds1[slack_name] = (0.0, 0.0) 
-            
-            branch_unknown_reason = None
-            try:
-                r1, sat1 = _rec(bounds1, depth + 1, row_defs1)
-            except SolverLimitReached as exc:
-                if exc.reason == "TIMEOUT":
-                    raise
-                branch_unknown_reason = exc.reason
-                r1, sat1 = None, False
-            if sat1:
-                return r1, True
+                # 1. x >= 0 분기
+                bounds1 = dict(bounds_now)
+                bounds1[branch_x] = (max(0.0, lo), hi)
+                row_defs1 = list(current_row_defs)
+                if relu_y is not None:
+                    slack_name = f"relu_slack_{branch_x}_pos_{depth}"
+                    row_defs1.append((slack_name, {relu_y: 1.0, branch_x: -1.0}))
+                    bounds1[slack_name] = (0.0, 0.0)
 
-            # 2. x <= 0 분기
-            bounds2 = dict(bounds_now)
-            bounds2[branch_x] = (lo, min(0.0, hi))
-            row_defs2 = list(current_row_defs)
-            if relu_y is not None:
-                bounds2[relu_y] = (0.0, 0.0)
-            
-            try:
-                r2, sat2 = _rec(bounds2, depth + 1, row_defs2)
-            except SolverLimitReached as exc:
-                if exc.reason == "TIMEOUT":
-                    raise
-                branch_unknown_reason = branch_unknown_reason or exc.reason
-                r2, sat2 = None, False
-            if sat2:
-                return r2, True
+                branch_unknown_reason = None
+                try:
+                    r1, sat1 = _rec(bounds1, depth + 1, row_defs1)
+                except SolverLimitReached as exc:
+                    if exc.reason == "TIMEOUT":
+                        raise
+                    branch_unknown_reason = exc.reason
+                    r1, sat1 = None, False
+                if sat1:
+                    return r1, True
 
-            if branch_unknown_reason is not None:
-                return _limit(branch_unknown_reason)
-            return None, False
+                # 2. x <= 0 분기
+                bounds2 = dict(bounds_now)
+                bounds2[branch_x] = (lo, min(0.0, hi))
+                row_defs2 = list(current_row_defs)
+                if relu_y is not None:
+                    bounds2[relu_y] = (0.0, 0.0)
+
+                try:
+                    r2, sat2 = _rec(bounds2, depth + 1, row_defs2)
+                except SolverLimitReached as exc:
+                    if exc.reason == "TIMEOUT":
+                        raise
+                    branch_unknown_reason = branch_unknown_reason or exc.reason
+                    r2, sat2 = None, False
+                if sat2:
+                    return r2, True
+
+                if branch_unknown_reason is not None:
+                    return _limit(branch_unknown_reason)
+                return None, False
 
         if depth >= max_recursion:
             return _limit("RELUPLEX_RECURSION_LIMIT")

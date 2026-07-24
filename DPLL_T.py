@@ -9,6 +9,7 @@ from Automation.SolverStatus import (
     SolverStatus,
     check_deadline,
 )
+from Automation.SolveTrace import SolveTrace
 
 
 def inequ_list_to_reluplex(
@@ -45,6 +46,7 @@ def _dpll_t_run(
     max_rounds: int,
     debug: bool,
     deadline: Optional[float],
+    trace: Optional[SolveTrace] = None,
 ) -> Tuple[Optional[Dict[str, float]], SolverStatus, str, int]:
     """
     DPLL(T) main loop.
@@ -61,7 +63,7 @@ def _dpll_t_run(
 
     for round_idx in range(max_rounds):
         check_deadline(deadline)
-        model = dpll(cnf, deadline=deadline)
+        model = dpll(cnf, deadline=deadline, trace=trace)
         if model is None:
             return None, SolverStatus.UNSAT, "BOOLEAN_UNSAT", round_idx + 1
 
@@ -111,6 +113,7 @@ def _dpll_t_run(
             debug=debug,
             deadline=deadline,
             report_unknown=True,
+            trace=trace,
         )
         if th_sat:
             return th_model, SolverStatus.SAT, "THEORY_SAT", round_idx + 1
@@ -129,8 +132,14 @@ def dpll_t_detailed(
     max_rounds: int = 1000,
     debug: bool = False,
     timeout_seconds: Optional[float] = None,
+    trace: Optional[SolveTrace] = None,
 ) -> SolverResult:
-    """Run DPLL(T), distinguishing SAT, UNSAT, and UNKNOWN."""
+    """Run DPLL(T), distinguishing SAT, UNSAT, and UNKNOWN.
+
+    trace를 넘기면(SolveTrace()) BCP/Simplex/Reluplex 구간 타이밍과 ReLU split
+    이벤트가 그 안에 기록된다 (Automation/SolveTrace.py 참고). 안 넘기면
+    계측 코드가 전혀 실행되지 않는다.
+    """
     started_at = monotonic()
     deadline = (
         started_at + float(timeout_seconds)
@@ -143,6 +152,7 @@ def dpll_t_detailed(
             max_rounds=max_rounds,
             debug=debug,
             deadline=deadline,
+            trace=trace,
         )
     except SolverLimitReached as exc:
         model = None
@@ -162,12 +172,14 @@ def dpll_t(
     formula,
     max_rounds: int = 1000,
     debug: bool = False,
+    trace: Optional[SolveTrace] = None,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     result = dpll_t_detailed(
         formula,
         max_rounds=max_rounds,
         debug=debug,
         timeout_seconds=None,
+        trace=trace,
     )
     if result.status == SolverStatus.UNKNOWN:
         raise SolverLimitReached(result.reason)

@@ -20,6 +20,9 @@ GenericNNEncoding.NNModel을 "교재 스타일" 완전연결망 다이어그램(
     잦으면 "...40...⋮...200..." 처럼). threshold를 넘는 뉴런이 cap개보다
     많으면 값이 큰 순으로 cap개만 남긴다 (그래도 선이 너무 빽빽해지지 않게).
     ReLU split 횟수처럼 "어디가 핫스팟인지"를 보여줄 때 이 모드를 쓴다.
+    단, 레이어 노드 수가 max_display 이하면 threshold를 무시하고 전부 그린다
+    (예: 입력/출력층처럼 애초에 node_values가 없는 작은 레이어가 통째로
+    "⋮" 하나로 사라지는 것을 막음 — 다 그려도 안 빽빽하니 굳이 숨길 이유가 없음).
 
 기본 색은 역할별(input=초록, hidden=보라, output=분홍)로 칠하고, node_values를
 넘기면 그 값이 있는 노드만 색 농도(cmap)로 덮어 칠한다. 생략(⋮)된 노드는
@@ -78,7 +81,7 @@ import matplotlib.patches as patches
 
 from GenericNNEncoding import NNModel
 
-_NEURON_VAR_RE = re.compile(r"^[zh](\d+)_(\d+)$")
+_NEURON_VAR_RE = re.compile(r"^[zh](\d+)_(\d+)(?:_.*)?$")
 
 _ROLE_COLORS = {
     "input": "#8fd19e",
@@ -88,8 +91,11 @@ _ROLE_COLORS = {
 
 
 def parse_neuron_var(name: str) -> Optional[Tuple[int, int]]:
-    """'z2_5' 또는 'h2_5' -> (layer=2, neuron=5). GenericNNEncoding.py 명명 규칙과
-    맞지 않는 이름이면 None을 반환한다 (예: ineq_slack_3, relu_slack_x_pos_1 등)."""
+    """'z2_5' 또는 'h2_5' -> (layer=2, neuron=5). GenericNNEncoding.py의
+    encode_nn()은 FreshGen을 거치면서 'z2_5_<prefix><n>' 처럼 뒤에 유일성
+    suffix가 덧붙으므로, 접두사(z2_5) 뒤에 '_'로 시작하는 나머지는 무시하고
+    매칭한다. 그 형식 자체와 안 맞는 이름이면 None을 반환한다
+    (예: ineq_slack_3, relu_slack_x_pos_1 등)."""
     m = _NEURON_VAR_RE.match(name)
     if m is None:
         return None
@@ -209,6 +215,9 @@ def compute_layout(
         골라 그리고, 나머지는 숨겨서 연속 구간마다 "⋮"로 접는다. 넘는 뉴런이
         cap개보다 많으면 값이 큰 순으로 cap개만 남긴다. 예: split 횟수가 높은
         뉴런만 보이게 하고 싶을 때 node_values=split_counts, threshold=5 처럼 쓴다.
+        단, 레이어의 노드 수 n이 max_display 이하면 threshold를 무시하고 전부
+        그린다 — 입력/출력층처럼 애초에 node_values가 없는 작은 레이어가
+        전부 숨겨져서 "⋮" 하나만 남는 것을 막기 위함(어차피 다 그려도 안 빽빽함).
 
     반환: {layer: LayerLayout}  (LayerLayout.ellipsis_ys는 레이어 안에서 숨겨진
     구간마다 하나씩 들어가므로, threshold 모드에서는 여러 개일 수 있다)
@@ -224,6 +233,8 @@ def compute_layout(
     for li, n in enumerate(model.layer_sizes):
         if select_mode == "index":
             shown = _select_by_index(n, max_display)
+        elif n <= max_display:
+            shown = list(range(n))
         else:
             shown = _select_by_threshold(li, n, node_values or {}, threshold, cap)
 

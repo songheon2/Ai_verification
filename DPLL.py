@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Set, Union
 from Automation.SolverStatus import check_deadline
+from Automation.SolveTrace import SolveTrace, span
 
 # ============================================================
 # 0) Prop AST 정의
@@ -401,6 +402,7 @@ def dpll(
     cnf: CNF,
     asn: Optional[Assignment] = None,
     deadline: Optional[float] = None,
+    trace: Optional[SolveTrace] = None,
 ) -> Optional[Assignment]:
     check_deadline(deadline)
     if asn is None:
@@ -412,7 +414,8 @@ def dpll(
     if len(cnf) == 0:
         return asn
 
-    cnf = unit_propagation(cnf, asn, deadline)
+    with span(trace, "bcp"):
+        cnf = unit_propagation(cnf, asn, deadline)
     if cnf is None:
         return None
     if len(cnf) == 0:
@@ -430,13 +433,13 @@ def dpll(
 
     asn1 = dict(asn)
     apply_literal(asn1, v)
-    res = dpll(cnf, asn1, deadline)
+    res = dpll(cnf, asn1, deadline, trace)
     if res is not None:
         return res
 
     asn2 = dict(asn)
     apply_literal(asn2, "~" + v)
-    return dpll(cnf, asn2, deadline)
+    return dpll(cnf, asn2, deadline, trace)
 
 
 # ============================================================

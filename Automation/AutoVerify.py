@@ -25,6 +25,22 @@
      python AutoVerify.py verify-vnnlib --model model.onnx --vnnlib prop_1.vnnlib.gz \
          --allow-large-model --timeout-seconds 300 --json-output Results/prop_1.json
 
+   verify-vnnlib 전용: 이 인스턴스를 실행하면서 SolveTrace로 ReLU split
+   이벤트를 모아 NetworkLayout 기반 히트맵을 PNG로 저장할 수 있다
+   (Automation/SolveTrace.py, SplitHeatmap.py 참고):
+
+     python AutoVerify.py verify-vnnlib --model model.onnx --vnnlib prop_1.vnnlib.gz \
+         --allow-large-model --timeout-seconds 300 \
+         --split-heatmap-output Results/prop_1_split.png \
+         --split-heatmap-threshold 1 --split-heatmap-cap 20
+
+   결과 JSON에도 split_summary(total_split_events, distinct_neurons)가 같이
+   담긴다. 단, ReLU 분기 없이 순수 불리언 추론만으로 UNSAT이 확정되는
+   인스턴스(solver.reason == BOOLEAN_UNSAT)는 Reluplex 자체가 호출되지
+   않아서 split이 0건이고 히트맵도 비어있다(전부 "⋮") — 버그가 아니라 그
+   인스턴스가 이론 솔버까지 갈 필요가 없었다는 뜻이다. 실제 split 이벤트를
+   보려면 이론 솔버(Reluplex)까지 도달하는 인스턴스가 필요하다.
+
 공통 플래그
 -----------
   --dry-run              ONNX/VNNLIB 로드 + 신경망 인코딩까지만 하고 실제 솔버는 안 돌림 (배관 확인용)
@@ -34,6 +50,12 @@
   --max-rounds N          DPLL(T) 라운드 수 상한 (verify-vnnlib 기본 1000)
   --json-output PATH      결과 전체를 JSON으로 저장 (반례 입력/출력, solver.reason 등 포함)
   --debug                 Simplex/Reluplex 내부 tableau를 매 스텝 출력 (매우 장황함)
+
+verify-vnnlib 전용 플래그
+--------------------------
+  --split-heatmap-output PATH     주어지면 ReLU split 히트맵 PNG를 이 경로에 저장
+  --split-heatmap-threshold N     이 횟수 이상 split된 뉴런만 히트맵에 표시 (기본 1)
+  --split-heatmap-cap N           히트맵에서 레이어당 최대 표시 뉴런 수 (기본 20)
 
 입력 파일 관련 주의사항
 ------------------------
@@ -52,7 +74,11 @@
   (실측: ACAS Xu 1_1 네트워크(은닉 ReLU 300개)의 공식 prop_1은 60초 타임아웃
   안에 1라운드도 못 끝냈다 — 이 저장소의 순수 Python Reluplex로는 이 규모의
   공식 VNNCOMP property가 매우 느리므로, --timeout-seconds를 넉넉히 주거나
-  더 쉬운 자체 property(작은 epsilon 등)로 먼저 시도하는 것을 권장.)
+  더 쉬운 자체 property(작은 epsilon 등)로 먼저 시도하는 것을 권장.
+  반대 사례도 있다: safenlp_2024/ruarobot(은닉 ReLU 128개)의 hyperrectangle_0은
+  90초는 부족했지만 900초 타임아웃에서는 124초 만에 VERIFIED로 끝났다 —
+  즉 모델 크기만으로 소요 시간을 예측하기 어렵고, 급할 때는 --timeout-seconds를
+  일단 넉넉하게(수백~천 단위) 주고 실제로 얼마나 걸리는지 실측하는 편이 낫다.)
 
 결과 해석
 ----------
@@ -99,6 +125,8 @@ from Automation.PropertyBuilder import (
 from Automation.VnnlibParser import LinearExpression, parse_vnnlib_file
 from XOREncoding import FreshGen
 from Automation.SolverStatus import SolverStatus
+from Automation.SolveTrace import SolveTrace
+from SplitHeatmap import split_counts_from_trace, draw_split_heatmap
 
 
 def load_spec(path: str) -> Dict[str, Any]:
@@ -439,8 +467,17 @@ def run_vnnlib_verification(
     max_relus_without_override: int = 50,
     strict_epsilon: float = 1e-6,
     timeout_seconds: Optional[float] = 300.0,
+    trace: Optional[SolveTrace] = None,
+    split_heatmap_output: Optional[str] = None,
+    split_heatmap_threshold: float = 1,
+    split_heatmap_cap: int = 20,
 ) -> Dict[str, Any]:
-    """VNNLIB이 정의한 unsafe 영역과 신경망의 교집합을 직접 탐색한다."""
+    """VNNLIB이 정의한 unsafe 영역과 신경망의 교집합을 직접 탐색한다.
+
+    split_heatmap_output을 주면 trace(안 넘겼으면 내부에서 새로 만듦)로 이
+    인스턴스를 실행한 뒤, ReLU split 이벤트를 모아 NetworkLayout 기반 히트맵
+    PNG를 저장한다 (Automation/SolveTrace.py, SplitHeatmap.py 참고).
+    """
 
     model, info = load_model_for_verification(model_path)
     if info.output_activation_removed:
@@ -500,6 +537,9 @@ def run_vnnlib_verification(
         result["status"] = "DRY_RUN"
         return result
 
+    if split_heatmap_output is not None and trace is None:
+        trace = SolveTrace()
+
     # VNNLIB assertion은 unsafe 집합을 나타내므로 SAT이면 반례가 존재한다.
     query = AndProp(nn_property, document.formula)
     solver_result = dpll_t_detailed(
@@ -507,12 +547,34 @@ def run_vnnlib_verification(
         max_rounds=max_rounds,
         debug=debug,
         timeout_seconds=timeout_seconds,
+        trace=trace,
     )
     result["solver"] = {
         **solver_result.to_dict(),
         "max_rounds": max_rounds,
         "timeout_seconds": timeout_seconds,
     }
+
+    if trace is not None:
+        split_counts = split_counts_from_trace(trace)
+        result["split_summary"] = {
+            "total_split_events": sum(
+                1 for ev in trace.events if ev.component == "reluplex_split"
+            ),
+            "distinct_neurons": len(split_counts),
+        }
+        if split_heatmap_output is not None:
+            fig, _ax = draw_split_heatmap(
+                model, split_counts,
+                threshold=split_heatmap_threshold, cap=split_heatmap_cap,
+                title=f"Split heatmap: {Path(model_path).name}",
+            )
+            Path(split_heatmap_output).parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(split_heatmap_output, dpi=150, bbox_inches="tight")
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+            result["split_heatmap_output"] = split_heatmap_output
+
     if solver_result.status == SolverStatus.SAT:
         result["status"] = "COUNTEREXAMPLE"
         result["counterexample"] = _counterexample(
@@ -584,6 +646,14 @@ def _print_vnnlib_verification(result: Mapping[str, Any]) -> None:
             f"  solver: {solver['status']} | reason={solver['reason']} | "
             f"rounds={solver['rounds']} | elapsed={solver['elapsed_seconds']:.3f}s"
         )
+    split_summary = result.get("split_summary")
+    if split_summary:
+        print(
+            f"  split : {split_summary['total_split_events']} events across "
+            f"{split_summary['distinct_neurons']} neurons"
+        )
+    if result.get("split_heatmap_output"):
+        print(f"  split heatmap: {result['split_heatmap_output']}")
 
 
 def _write_json_result(result: Mapping[str, Any], output_path: str) -> None:
@@ -642,6 +712,18 @@ def build_parser() -> argparse.ArgumentParser:
     vnnlib_parser.add_argument("--strict-epsilon", type=float, default=1e-6)
     vnnlib_parser.add_argument("--timeout-seconds", type=float, default=300.0)
     vnnlib_parser.add_argument("--json-output")
+    vnnlib_parser.add_argument(
+        "--split-heatmap-output",
+        help="ReLU split 이벤트를 모아 NetworkLayout 히트맵 PNG로 저장 (Automation/SolveTrace.py + SplitHeatmap.py)",
+    )
+    vnnlib_parser.add_argument(
+        "--split-heatmap-threshold", type=float, default=1,
+        help="이 횟수 이상 split된 뉴런만 히트맵에 표시 (기본 1)",
+    )
+    vnnlib_parser.add_argument(
+        "--split-heatmap-cap", type=int, default=20,
+        help="히트맵에서 레이어당 최대 표시 뉴런 수 (기본 20)",
+    )
     return parser
 
 
@@ -670,6 +752,9 @@ def main() -> int:
                 max_relus_without_override=args.max_relus_without_override,
                 strict_epsilon=args.strict_epsilon,
                 timeout_seconds=args.timeout_seconds,
+                split_heatmap_output=args.split_heatmap_output,
+                split_heatmap_threshold=args.split_heatmap_threshold,
+                split_heatmap_cap=args.split_heatmap_cap,
             )
             _print_vnnlib_verification(result)
             if args.json_output:

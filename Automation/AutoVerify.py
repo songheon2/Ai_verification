@@ -1,10 +1,71 @@
-"""설정 파일 기반 신경망 검증 실행기.
+"""ONNX/커스텀 완전연결(ReLU) 신경망을 이 저장소의 DPLL(T)/Reluplex로 검증하는 CLI.
 
-사용 예시
----------
-  python AutoVerify.py inspect Onnx/model.onnx --output Specs/model.json
-  python AutoVerify.py verify --model Onnx/model.onnx --spec Specs/model.json
-  python AutoVerify.py verify --model Custom/model.txt --spec Specs/model.json --dry-run
+세 개 서브커맨드
+----------------
+1) inspect — 모델 구조를 읽어서 출력하고, 필요하면 스펙 템플릿을 만든다.
+
+     python AutoVerify.py inspect Onnx/model.onnx
+     python AutoVerify.py inspect Onnx/model.onnx --output Specs/model.json
+
+   출력 예: "Layers: 5 -> 50 -> 50 -> 5", "Hidden ReLUs: 300". --output을 주면
+   그 구조에 맞는 JSON 스펙 뼈대(cases는 "edit_me" 자리표시자)를 만들어준다 —
+   그 안의 cases/epsilon/expected를 직접 채운 뒤 verify에 넘기는 용도.
+
+2) verify — JSON/YAML 스펙 파일(input/output/property/cases 정의)로 검증.
+   스펙 자체 검증용 로컬 강건성/분류 조건을 여러 case로 정의할 때 쓴다.
+
+     python AutoVerify.py verify --model Onnx/model.onnx --spec Specs/model.json
+     python AutoVerify.py verify --model Custom/model.txt --spec Specs/model.json --dry-run
+
+3) verify-vnnlib — ONNX + 표준 VNNLIB 속성 파일을 그대로 검증 (VNNCOMP
+   벤치마크 형식). VNNLIB의 출력 assertion은 "찾으려는 unsafe 조건"이므로
+   SAT=반례 있음(COUNTEREXAMPLE), UNSAT=안전 확정(VERIFIED)으로 뒤집어 보고한다.
+
+     python AutoVerify.py verify-vnnlib --model model.onnx --vnnlib prop_1.vnnlib --dry-run
+     python AutoVerify.py verify-vnnlib --model model.onnx --vnnlib prop_1.vnnlib.gz \
+         --allow-large-model --timeout-seconds 300 --json-output Results/prop_1.json
+
+공통 플래그
+-----------
+  --dry-run              ONNX/VNNLIB 로드 + 신경망 인코딩까지만 하고 실제 솔버는 안 돌림 (배관 확인용)
+  --allow-large-model     은닉 ReLU 개수가 안전 한도(기본 50, verify-vnnlib는 --max-relus-without-override로 조절)를
+                           넘는 모델도 강행 실행 (ACAS Xu류는 은닉 ReLU 300개라 필수)
+  --timeout-seconds N     N초 안에 SAT/UNSAT을 못 정하면 UNKNOWN으로 종료
+  --max-rounds N          DPLL(T) 라운드 수 상한 (verify-vnnlib 기본 1000)
+  --json-output PATH      결과 전체를 JSON으로 저장 (반례 입력/출력, solver.reason 등 포함)
+  --debug                 Simplex/Reluplex 내부 tableau를 매 스텝 출력 (매우 장황함)
+
+입력 파일 관련 주의사항
+------------------------
+- ONNX는 .onnx 확장자만 인식한다 — VNNCOMP 배포본처럼 .onnx.gz로 압축돼 있으면
+  실행 전에 직접 압축을 풀어야 한다(예: `gunzip -k model.onnx.gz`). VNNLIB는
+  .vnnlib.gz를 그대로 읽을 수 있어서(Automation/VnnlibParser.py) 압축 해제가 필요 없다.
+- 은닉 ReLU가 많은 모델(ACAS Xu급, 300개)은 dpll()이 재귀 호출이라 Python
+  기본 재귀 한도(1000)를 넘겨서 RecursionError가 날 수 있다. 이럴 때는
+  sys.setrecursionlimit(100000) 등을 먼저 걸고 실행해야 한다:
+
+    python -c "import sys, runpy; sys.setrecursionlimit(100000); \
+        sys.argv=['AutoVerify.py']+sys.argv[1:]; \
+        runpy.run_path('Automation/AutoVerify.py', run_name='__main__')" \
+        verify-vnnlib --model model.onnx --vnnlib prop_1.vnnlib.gz --allow-large-model
+
+  (실측: ACAS Xu 1_1 네트워크(은닉 ReLU 300개)의 공식 prop_1은 60초 타임아웃
+  안에 1라운드도 못 끝냈다 — 이 저장소의 순수 Python Reluplex로는 이 규모의
+  공식 VNNCOMP property가 매우 느리므로, --timeout-seconds를 넉넉히 주거나
+  더 쉬운 자체 property(작은 epsilon 등)로 먼저 시도하는 것을 권장.)
+
+결과 해석
+----------
+  DRY_RUN         --dry-run일 때만. 로드/파싱/인코딩 성공.
+  COUNTEREXAMPLE   반례 존재 확정 (솔버 SAT)
+  VERIFIED         안전 확정 (솔버 UNSAT)
+  UNKNOWN          시간/라운드 한도로 결론 못 냄 — result.solver.reason 확인
+                    (TIMEOUT / DPLL_T_ROUND_LIMIT / SIMPLEX_ITERATION_LIMIT /
+                     RELUPLEX_RECURSION_LIMIT / RELUPLEX_REPAIR_INCONCLUSIVE)
+
+VNNCOMP 벤치마크(ACAS Xu 등)를 특정 경로 기준으로 처음부터 끝까지 돌리는
+전체 walkthrough(환경 설정, 경로 등록, prop_1~6 연속 실행 등)는
+Automation/VNNCOMP_RUNBOOK.md 참고.
 """
 
 from __future__ import annotations

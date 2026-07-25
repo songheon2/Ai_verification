@@ -41,6 +41,18 @@
    인스턴스가 이론 솔버까지 갈 필요가 없었다는 뜻이다. 실제 split 이벤트를
    보려면 이론 솔버(Reluplex)까지 도달하는 인스턴스가 필요하다.
 
+   계속 SIMPLEX_ITERATION_LIMIT으로 UNKNOWN이 나면 --simplex-max-iter를
+   크게 올린다 (기본 10000):
+
+     python AutoVerify.py verify-vnnlib --model model.onnx --vnnlib prop_1.vnnlib.gz \
+         --allow-large-model --timeout-seconds 900 --simplex-max-iter 1000000
+
+   (스모크 테스트로 실측: relu_smoke.onnx + counterexample.vnnlib를
+   --simplex-max-iter 1로 강제로 돌리면 SIMPLEX_ITERATION_LIMIT/UNKNOWN이
+   재현되고, 기본값(10000)으로는 정상적으로 COUNTEREXAMPLE이 나온다 —
+   즉 --timeout-seconds와 별개로 반복 횟수 자체가 부족해서 UNKNOWN이 나는
+   경우엔 이 옵션이 필요하다.)
+
 공통 플래그
 -----------
   --dry-run              ONNX/VNNLIB 로드 + 신경망 인코딩까지만 하고 실제 솔버는 안 돌림 (배관 확인용)
@@ -48,6 +60,11 @@
                            넘는 모델도 강행 실행 (ACAS Xu류는 은닉 ReLU 300개라 필수)
   --timeout-seconds N     N초 안에 SAT/UNSAT을 못 정하면 UNKNOWN으로 종료
   --max-rounds N          DPLL(T) 라운드 수 상한 (verify-vnnlib 기본 1000)
+  --simplex-max-iter N    Reluplex 내부 Simplex 호출당 반복 상한 (기본 10000). 계속
+                           SIMPLEX_ITERATION_LIMIT으로 UNKNOWN이 나면 크게 올릴 것
+                           (예: 1000000) — 실질적인 안전장치는 --timeout-seconds이므로
+                           이 값을 올릴 때는 timeout도 같이 넉넉히 잡을 것 (verify는 spec의
+                           solver.simplex_max_iter를 오버라이드, 안 주면 spec/기본값 사용)
   --json-output PATH      결과 전체를 JSON으로 저장 (반례 입력/출력, solver.reason 등 포함)
   --debug                 Simplex/Reluplex 내부 tableau를 매 스텝 출력 (매우 장황함)
 
@@ -272,6 +289,7 @@ def run_verification(
     allow_large_model: bool = False,
     debug: bool = False,
     timeout_seconds_override: Optional[float] = None,
+    simplex_max_iter_override: Optional[int] = None,
 ) -> Dict[str, Any]:
     model, info = load_model_for_verification(model_path)
     _validate_contract(spec, info)
@@ -305,6 +323,13 @@ def run_verification(
     timeout_seconds = None if timeout_value is None else float(timeout_value)
     if timeout_seconds is not None and timeout_seconds <= 0:
         raise ValueError("solver.timeout_seconds must be positive or null")
+    simplex_max_iter = int(
+        simplex_max_iter_override
+        if simplex_max_iter_override is not None
+        else solver_spec.get("simplex_max_iter", 10000)
+    )
+    if simplex_max_iter <= 0:
+        raise ValueError("solver.simplex_max_iter must be positive")
     safe_relu_limit = int(solver_spec.get("max_relus_without_override", 50))
     if (
         not dry_run
@@ -366,11 +391,13 @@ def run_verification(
                 max_rounds=max_rounds,
                 debug=debug,
                 timeout_seconds=timeout_seconds,
+                simplex_max_iter=simplex_max_iter,
             )
             result["solver"] = {
                 **solver_result.to_dict(),
                 "max_rounds": max_rounds,
                 "timeout_seconds": timeout_seconds,
+                "simplex_max_iter": simplex_max_iter,
             }
             if solver_result.status == SolverStatus.SAT:
                 result["status"] = "COUNTEREXAMPLE"
@@ -467,6 +494,7 @@ def run_vnnlib_verification(
     max_relus_without_override: int = 50,
     strict_epsilon: float = 1e-6,
     timeout_seconds: Optional[float] = 300.0,
+    simplex_max_iter: int = 10000,
     trace: Optional[SolveTrace] = None,
     split_heatmap_output: Optional[str] = None,
     split_heatmap_threshold: float = 1,
@@ -477,6 +505,10 @@ def run_vnnlib_verification(
     split_heatmap_output을 주면 trace(안 넘겼으면 내부에서 새로 만듦)로 이
     인스턴스를 실행한 뒤, ReLU split 이벤트를 모아 NetworkLayout 기반 히트맵
     PNG를 저장한다 (Automation/SolveTrace.py, SplitHeatmap.py 참고).
+
+    simplex_max_iter는 Reluplex 내부 각 Simplex 호출의 반복 상한이다.
+    SIMPLEX_ITERATION_LIMIT으로 UNKNOWN이 자주 나면 크게 올릴 것 — 이때
+    timeout_seconds도 같이 넉넉하게 잡아야 한다(실질적인 안전장치는 timeout).
     """
 
     model, info = load_model_for_verification(model_path)
@@ -489,6 +521,8 @@ def run_vnnlib_verification(
         raise ValueError("max_rounds must be positive")
     if timeout_seconds is not None and timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive or null")
+    if simplex_max_iter <= 0:
+        raise ValueError("simplex_max_iter must be positive")
     if max_relus_without_override < 0:
         raise ValueError("max_relus_without_override must be non-negative")
     if (
@@ -548,11 +582,13 @@ def run_vnnlib_verification(
         debug=debug,
         timeout_seconds=timeout_seconds,
         trace=trace,
+        simplex_max_iter=simplex_max_iter,
     )
     result["solver"] = {
         **solver_result.to_dict(),
         "max_rounds": max_rounds,
         "timeout_seconds": timeout_seconds,
+        "simplex_max_iter": simplex_max_iter,
     }
 
     if trace is not None:
@@ -693,6 +729,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="override solver.timeout_seconds from the spec",
     )
+    verify_parser.add_argument(
+        "--simplex-max-iter",
+        type=int,
+        help="override solver.simplex_max_iter from the spec (raise this if you keep hitting "
+             "SIMPLEX_ITERATION_LIMIT; raise --timeout-seconds too since that's the real backstop)",
+    )
     verify_parser.add_argument("--json-output", help="write detailed results as JSON")
 
     vnnlib_parser = subparsers.add_parser(
@@ -711,6 +753,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vnnlib_parser.add_argument("--strict-epsilon", type=float, default=1e-6)
     vnnlib_parser.add_argument("--timeout-seconds", type=float, default=300.0)
+    vnnlib_parser.add_argument(
+        "--simplex-max-iter", type=int, default=10000,
+        help="Reluplex 내부 Simplex 호출당 반복 상한. SIMPLEX_ITERATION_LIMIT으로 "
+             "UNKNOWN이 자주 나면 크게 올릴 것 (예: 1000000) — 이때 --timeout-seconds도 "
+             "넉넉히 잡을 것, 실질적인 안전장치는 timeout이다.",
+    )
     vnnlib_parser.add_argument("--json-output")
     vnnlib_parser.add_argument(
         "--split-heatmap-output",
@@ -752,6 +800,7 @@ def main() -> int:
                 max_relus_without_override=args.max_relus_without_override,
                 strict_epsilon=args.strict_epsilon,
                 timeout_seconds=args.timeout_seconds,
+                simplex_max_iter=args.simplex_max_iter,
                 split_heatmap_output=args.split_heatmap_output,
                 split_heatmap_threshold=args.split_heatmap_threshold,
                 split_heatmap_cap=args.split_heatmap_cap,
@@ -772,6 +821,7 @@ def main() -> int:
             allow_large_model=args.allow_large_model,
             debug=args.debug,
             timeout_seconds_override=args.timeout_seconds,
+            simplex_max_iter_override=args.simplex_max_iter,
         )
         _print_verification(result)
         if args.json_output:

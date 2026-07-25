@@ -47,6 +47,7 @@ def _dpll_t_run(
     debug: bool,
     deadline: Optional[float],
     trace: Optional[SolveTrace] = None,
+    simplex_max_iter: int = 10000,
 ) -> Tuple[Optional[Dict[str, float]], SolverStatus, str, int]:
     """
     DPLL(T) main loop.
@@ -114,6 +115,7 @@ def _dpll_t_run(
             deadline=deadline,
             report_unknown=True,
             trace=trace,
+            simplex_max_iter=simplex_max_iter,
         )
         if th_sat:
             return th_model, SolverStatus.SAT, "THEORY_SAT", round_idx + 1
@@ -133,12 +135,17 @@ def dpll_t_detailed(
     debug: bool = False,
     timeout_seconds: Optional[float] = None,
     trace: Optional[SolveTrace] = None,
+    simplex_max_iter: int = 10000,
 ) -> SolverResult:
     """Run DPLL(T), distinguishing SAT, UNSAT, and UNKNOWN.
 
     trace를 넘기면(SolveTrace()) BCP/Simplex/Reluplex 구간 타이밍과 ReLU split
     이벤트가 그 안에 기록된다 (Automation/SolveTrace.py 참고). 안 넘기면
     계측 코드가 전혀 실행되지 않는다.
+
+    simplex_max_iter는 Reluplex 내부 각 Simplex 호출의 반복 상한이다
+    (SIMPLEX_ITERATION_LIMIT으로 UNKNOWN이 자주 나면 크게 올릴 것). timeout_seconds가
+    실질적인 안전장치이므로, 이 값을 크게 올릴 때는 timeout_seconds도 넉넉히 잡아야 한다.
     """
     started_at = monotonic()
     deadline = (
@@ -153,6 +160,7 @@ def dpll_t_detailed(
             debug=debug,
             deadline=deadline,
             trace=trace,
+            simplex_max_iter=simplex_max_iter,
         )
     except SolverLimitReached as exc:
         model = None
@@ -173,6 +181,7 @@ def dpll_t(
     max_rounds: int = 1000,
     debug: bool = False,
     trace: Optional[SolveTrace] = None,
+    simplex_max_iter: int = 10000,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     result = dpll_t_detailed(
         formula,
@@ -180,6 +189,7 @@ def dpll_t(
         debug=debug,
         timeout_seconds=None,
         trace=trace,
+        simplex_max_iter=simplex_max_iter,
     )
     if result.status == SolverStatus.UNKNOWN:
         raise SolverLimitReached(result.reason)

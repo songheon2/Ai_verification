@@ -291,7 +291,11 @@ def simplex(
         if debug:
             _print_tableau(tableau, iteration)
 
-        # ── 범위 위반 기저변수 찾기 ──
+        # ── 범위 위반 기저변수 찾기 (Bland's rule: 이름 사전순 최소인 변수) ──
+        # 진입변수(pivot_xi)를 sorted()로 고르는 것과 동일한 전순서를 여기서도
+        # 써야 anti-cycling 보장이 성립한다. tableau.rows의 list 순서는 피벗마다
+        # 바뀌므로 "첫 번째로 찾은 row"를 쓰면 Bland's rule이 깨져서 특히
+        # 퇴화(degenerate)된 tableau에서 진짜로 순환(cycle)할 수 있다.
         violated_row = None
         for row in tableau.rows:
             xj = row.basic_var
@@ -299,8 +303,8 @@ def simplex(
             b = tableau.bounds[xj]
 
             if val < b.lower - EPS or val > b.upper + EPS:
-                violated_row = row
-                break
+                if violated_row is None or xj < violated_row.basic_var:
+                    violated_row = row
 
         if violated_row is None:
             # 모든 기저변수가 범위 안 → SAT

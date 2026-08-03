@@ -6,6 +6,7 @@ Created on Mon Feb  2 17:03:24 2026
 """
 from __future__ import annotations
 from dataclasses import dataclass
+from time import monotonic
 from typing import Dict, List, Optional, Tuple, Set, Union
 from Automation.SolverStatus import check_deadline
 from Automation.SolveTrace import SolveTrace, span
@@ -403,7 +404,17 @@ def dpll(
     asn: Optional[Assignment] = None,
     deadline: Optional[float] = None,
     trace: Optional[SolveTrace] = None,
+    profile_state: Optional[Dict] = None,
 ) -> Optional[Assignment]:
+    if profile_state is not None:
+        profile_state["calls"] += 1
+        if profile_state["calls"] % profile_state["print_every"] == 0:
+            elapsed = monotonic() - profile_state["start"]
+            print(
+                f"[profile] dpll(): {profile_state['calls']:,} calls, "
+                f"{elapsed:.1f}s elapsed, still running..."
+            )
+
     check_deadline(deadline)
     if asn is None:
         asn = {}
@@ -433,13 +444,13 @@ def dpll(
 
     asn1 = dict(asn)
     apply_literal(asn1, v)
-    res = dpll(cnf, asn1, deadline, trace)
+    res = dpll(cnf, asn1, deadline, trace, profile_state)
     if res is not None:
         return res
 
     asn2 = dict(asn)
     apply_literal(asn2, "~" + v)
-    return dpll(cnf, asn2, deadline, trace)
+    return dpll(cnf, asn2, deadline, trace, profile_state)
 
 
 # ============================================================

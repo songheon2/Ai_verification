@@ -53,6 +53,33 @@
    즉 --timeout-seconds와 별개로 반복 횟수 자체가 부족해서 UNKNOWN이 나는
    경우엔 이 옵션이 필요하다.)
 
+   TIMEOUT이 나는데 어느 단계에서 멈춰있는지(encode_nn / VNNLIB 파싱 /
+   tseitin_cnf / dpll() 재귀 탐색) 전혀 안 보일 때는 --profile-stages로
+   단계별 소요시간을 찍어본다:
+
+     python AutoVerify.py verify-vnnlib --model model.onnx --vnnlib prop_1.vnnlib.gz \
+         --allow-large-model --timeout-seconds 300 --profile-stages
+
+   dpll()은 재귀 호출이 너무 잦아서 매번 찍으면 감당이 안 되니, 기본
+   1000회 호출마다 한 번씩만 "dpll(): N calls, elapsed Xs, still
+   running..."을 찍는다 (DPLL_T.py의 profile_state["print_every"]를
+   고치면 간격 조절 가능, CLI 옵션으로는 아직 안 뚫어놨음). 출력이
+   encode_nn/파싱/tseitin_cnf까지만 나오고 dpll() 진행 로그가 한 번도 안
+   찍힌 채 타임아웃 났다면 → dpll() 호출 자체는 그 간격만큼도 안 됐는데
+   그 각각이 느리다는 뜻 (조합폭발이 아니라 개별 호출이 비효율적인 게 병목).
+
+   (실측/결론: mMIMO 모델(은닉 ReLU 982개, 256->491->491->16)의 idx=0,
+   eps=1 인스턴스로 확인. tseitin_cnf는 20.5s에 CNF 10660절/3554변수를
+   만드는데, print_every를 1로 낮춰서 보니 dpll() 호출 #1->#2는 15.6초,
+   #2->#3은 **40시간(144000초)을 줘도 안 끝남** — 즉 조합폭발(호출 수가
+   많음)이 아니라 단일 호출 안에서 멈춰있는 것이다. 원인은
+   `DPLL.py`의 `unit_propagation()`: 새 unit literal이 하나 확정될
+   때마다 전체 CNF를 처음부터 다시 스캔하는 구조라서(watched-literal 같은
+   최적화 없음), 이 신경망처럼 3단으로 깊게 이어진 회로에서는 분기 하나가
+   전체 층을 타고 전파되며 "재스캔 한 번"이 수백~수천 번 반복될 수 있다.
+   즉 --timeout-seconds를 아무리 늘려도 해결 안 되고, `unit_propagation()`
+   자체를 최적화해야 하는 문제다.)
+
 공통 플래그
 -----------
   --dry-run              ONNX/VNNLIB 로드 + 신경망 인코딩까지만 하고 실제 솔버는 안 돌림 (배관 확인용)
@@ -67,6 +94,8 @@
                            solver.simplex_max_iter를 오버라이드, 안 주면 spec/기본값 사용)
   --json-output PATH      결과 전체를 JSON으로 저장 (반례 입력/출력, solver.reason 등 포함)
   --debug                 Simplex/Reluplex 내부 tableau를 매 스텝 출력 (매우 장황함)
+  --profile-stages        encode_nn/tseitin_cnf/dpll() 단계별 소요시간을 [profile]
+                           접두어로 출력 (평소엔 꺼둘 것, 어디서 멈췄는지 진단할 때만 켤 것)
 
 verify-vnnlib 전용 플래그
 --------------------------
@@ -115,6 +144,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 import sys
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -290,6 +320,7 @@ def run_verification(
     debug: bool = False,
     timeout_seconds_override: Optional[float] = None,
     simplex_max_iter_override: Optional[int] = None,
+    profile_stages: bool = False,
 ) -> Dict[str, Any]:
     model, info = load_model_for_verification(model_path)
     _validate_contract(spec, info)
@@ -353,7 +384,12 @@ def run_verification(
         )
 
         generator = FreshGen(prefix=f"auto{case_index}_")
-        nn_property, output_vars, _ = encode_nn(model, input_vars, generator)
+        if profile_stages:
+            _t0 = time.monotonic()
+            nn_property, output_vars, _ = encode_nn(model, input_vars, generator)
+            print(f"[profile] {case_name}: encode_nn: {time.monotonic() - _t0:.1f}s")
+        else:
+            nn_property, output_vars, _ = encode_nn(model, input_vars, generator)
 
         reference = str(
             case.get("reference", property_spec.get("reference", "expected"))
@@ -392,6 +428,7 @@ def run_verification(
                 debug=debug,
                 timeout_seconds=timeout_seconds,
                 simplex_max_iter=simplex_max_iter,
+                profile_stages=profile_stages,
             )
             result["solver"] = {
                 **solver_result.to_dict(),
@@ -499,6 +536,7 @@ def run_vnnlib_verification(
     split_heatmap_output: Optional[str] = None,
     split_heatmap_threshold: float = 1,
     split_heatmap_cap: int = 20,
+    profile_stages: bool = False,
 ) -> Dict[str, Any]:
     """VNNLIB이 정의한 unsafe 영역과 신경망의 교집합을 직접 탐색한다.
 
@@ -509,6 +547,10 @@ def run_vnnlib_verification(
     simplex_max_iter는 Reluplex 내부 각 Simplex 호출의 반복 상한이다.
     SIMPLEX_ITERATION_LIMIT으로 UNKNOWN이 자주 나면 크게 올릴 것 — 이때
     timeout_seconds도 같이 넉넉하게 잡아야 한다(실질적인 안전장치는 timeout).
+
+    profile_stages=True면 encode_nn/VNNLIB 파싱/tseitin_cnf/dpll() 각 단계의
+    소요시간(및 dpll()은 기본 1000회마다 진행상황)을 [profile] 접두어로 찍는다 —
+    큰 모델이 어느 단계에서 멈춰있는지 진단할 때 켠다.
     """
 
     model, info = load_model_for_verification(model_path)
@@ -538,13 +580,26 @@ def run_vnnlib_verification(
 
     input_vars = [f"x{index}" for index in range(info.input_size)]
     generator = FreshGen(prefix="vnnlib_")
-    nn_property, output_vars, _ = encode_nn(model, input_vars, generator)
+
+    if profile_stages:
+        _t0 = time.monotonic()
+        nn_property, output_vars, _ = encode_nn(model, input_vars, generator)
+        print(f"[profile] encode_nn: {time.monotonic() - _t0:.1f}s")
+    else:
+        nn_property, output_vars, _ = encode_nn(model, input_vars, generator)
+
     substitutions = _vnnlib_substitutions(info, input_vars, output_vars)
-    document = parse_vnnlib_file(
-        vnnlib_path,
-        substitutions,
-        strict_epsilon=strict_epsilon,
-    )
+
+    if profile_stages:
+        _t0 = time.monotonic()
+        document = parse_vnnlib_file(vnnlib_path, substitutions, strict_epsilon=strict_epsilon)
+        print(f"[profile] parse_vnnlib_file: {time.monotonic() - _t0:.1f}s ({document.assertion_count} asserts)")
+    else:
+        document = parse_vnnlib_file(
+            vnnlib_path,
+            substitutions,
+            strict_epsilon=strict_epsilon,
+        )
 
     if len(document.input_variables) != info.input_size:
         raise ValueError(
@@ -583,6 +638,7 @@ def run_vnnlib_verification(
         timeout_seconds=timeout_seconds,
         trace=trace,
         simplex_max_iter=simplex_max_iter,
+        profile_stages=profile_stages,
     )
     result["solver"] = {
         **solver_result.to_dict(),
@@ -735,6 +791,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="override solver.simplex_max_iter from the spec (raise this if you keep hitting "
              "SIMPLEX_ITERATION_LIMIT; raise --timeout-seconds too since that's the real backstop)",
     )
+    verify_parser.add_argument(
+        "--profile-stages",
+        action="store_true",
+        help="encode_nn/tseitin_cnf/dpll() 각 단계의 소요시간을 [profile] 접두어로 출력 "
+             "(어느 단계에서 멈춰있는지 진단할 때 켤 것, 평소엔 꺼둘 것)",
+    )
     verify_parser.add_argument("--json-output", help="write detailed results as JSON")
 
     vnnlib_parser = subparsers.add_parser(
@@ -772,6 +834,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-heatmap-cap", type=int, default=20,
         help="히트맵에서 레이어당 최대 표시 뉴런 수 (기본 20)",
     )
+    vnnlib_parser.add_argument(
+        "--profile-stages",
+        action="store_true",
+        help="encode_nn/VNNLIB 파싱/tseitin_cnf/dpll() 각 단계의 소요시간(dpll()은 기본 1000회마다 "
+             "진행상황)을 [profile] 접두어로 출력 (큰 모델이 어느 단계에서 멈춰있는지 진단할 때 "
+             "켤 것, 평소엔 꺼둘 것)",
+    )
     return parser
 
 
@@ -804,6 +873,7 @@ def main() -> int:
                 split_heatmap_output=args.split_heatmap_output,
                 split_heatmap_threshold=args.split_heatmap_threshold,
                 split_heatmap_cap=args.split_heatmap_cap,
+                profile_stages=args.profile_stages,
             )
             _print_vnnlib_verification(result)
             if args.json_output:
@@ -822,6 +892,7 @@ def main() -> int:
             debug=args.debug,
             timeout_seconds_override=args.timeout_seconds,
             simplex_max_iter_override=args.simplex_max_iter,
+            profile_stages=args.profile_stages,
         )
         _print_verification(result)
         if args.json_output:

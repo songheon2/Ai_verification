@@ -48,6 +48,7 @@ def _dpll_t_run(
     deadline: Optional[float],
     trace: Optional[SolveTrace] = None,
     simplex_max_iter: int = 10000,
+    profile_stages: bool = False,
 ) -> Tuple[Optional[Dict[str, float]], SolverStatus, str, int]:
     """
     DPLL(T) main loop.
@@ -57,14 +58,26 @@ def _dpll_t_run(
     conflict depends on a negated theory atom such as ``not ineq(...)``.
     """
     check_deadline(deadline)
-    cnf, atom_map, _memo = tseitin_cnf(formula)
+    if profile_stages:
+        _t0 = monotonic()
+        cnf, atom_map, _memo = tseitin_cnf(formula)
+        print(
+            f"[profile] tseitin_cnf: {monotonic() - _t0:.1f}s -> "
+            f"{len(cnf)} clauses, {len(atom_map)} atoms"
+        )
+    else:
+        cnf, atom_map, _memo = tseitin_cnf(formula)
     check_deadline(deadline)
 
     atom_to_theory = {v: k for k, v in atom_map.items()}
 
+    profile_state = (
+        {"calls": 0, "start": monotonic(), "print_every": 1000} if profile_stages else None
+    )
+
     for round_idx in range(max_rounds):
         check_deadline(deadline)
-        model = dpll(cnf, deadline=deadline, trace=trace)
+        model = dpll(cnf, deadline=deadline, trace=trace, profile_state=profile_state)
         if model is None:
             return None, SolverStatus.UNSAT, "BOOLEAN_UNSAT", round_idx + 1
 
@@ -136,6 +149,7 @@ def dpll_t_detailed(
     timeout_seconds: Optional[float] = None,
     trace: Optional[SolveTrace] = None,
     simplex_max_iter: int = 10000,
+    profile_stages: bool = False,
 ) -> SolverResult:
     """Run DPLL(T), distinguishing SAT, UNSAT, and UNKNOWN.
 
@@ -146,6 +160,10 @@ def dpll_t_detailed(
     simplex_max_iter는 Reluplex 내부 각 Simplex 호출의 반복 상한이다
     (SIMPLEX_ITERATION_LIMIT으로 UNKNOWN이 자주 나면 크게 올릴 것). timeout_seconds가
     실질적인 안전장치이므로, 이 값을 크게 올릴 때는 timeout_seconds도 넉넉히 잡아야 한다.
+
+    profile_stages=True면 tseitin_cnf() 소요시간+CNF 크기, dpll() 재귀 호출
+    진행상황(1000회마다)을 stdout에 [profile] 접두어로 찍는다 — 어느 단계에서
+    멈춰있는지 진단할 때 켠다 (평소엔 꺼둘 것, 출력이 늘어남).
     """
     started_at = monotonic()
     deadline = (
@@ -161,6 +179,7 @@ def dpll_t_detailed(
             deadline=deadline,
             trace=trace,
             simplex_max_iter=simplex_max_iter,
+            profile_stages=profile_stages,
         )
     except SolverLimitReached as exc:
         model = None
@@ -182,6 +201,7 @@ def dpll_t(
     debug: bool = False,
     trace: Optional[SolveTrace] = None,
     simplex_max_iter: int = 10000,
+    profile_stages: bool = False,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     result = dpll_t_detailed(
         formula,
@@ -190,6 +210,7 @@ def dpll_t(
         timeout_seconds=None,
         trace=trace,
         simplex_max_iter=simplex_max_iter,
+        profile_stages=profile_stages,
     )
     if result.status == SolverStatus.UNKNOWN:
         raise SolverLimitReached(result.reason)

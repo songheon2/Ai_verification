@@ -270,12 +270,26 @@ def simplex(
         기저변수만 범위를 위반할 수 있음.
 
     알고리즘:
-        1. 범위를 위반한 기저변수 xj를 찾는다.
+        1. 범위를 위반한 기저변수 xj를 찾는다 (이름 사전순 최소).
         2. xj의 row에서 피벗 가능한 비기저변수 xi를 찾는다.
             - xj < lj: xi를 올릴 수 있는 변수 (a_ij > 0, xi < u_i)
                       또는 xi를 내릴 수 있는 변수 (a_ij < 0, xi > l_i)
             - xj > uj: 반대 조건
         3. xi를 찾으면 피벗, 못 찾으면 UNSAT.
+
+    수치 안정성 (중요)
+    ------------------
+    2번에서 후보가 여럿이면 |a_ij|가 가장 큰 것을 고른다(threshold pivoting).
+    Bland's rule로 이름 사전순 최초를 고르면 |a|~1e-10짜리 열도 그대로 선택되고,
+    _pivot()의 -c/a 에서 오차가 1e10배 증폭된다. 실제로 정수 가중치 모델에서
+    몇백 번 피벗한 뒤 row가 통째로 잡음이 되어, 있지도 않은 UNSAT을 선언하고
+    Reluplex가 분기 한 번 없이 종료한 사례가 있었다.
+
+    Bland's rule은 BLAND_AFTER 반복 이후 순환 방지 폴백으로만 쓴다. DdM 불변식은
+    진입변수 선택과 무관하게 유지되므로, 도중에 Bland로 전환해도 종료성은 보장된다.
+
+    경계 위반 판정과 여유 판정은 절대 EPS가 아니라 값의 크기에 비례한 상대
+    허용오차(_tol)를 쓰고, 계수 0 판정도 row 최대계수 대비 상대값(ZERO_REL)을 쓴다.
 
     Args:
         tableau : SimplexTableau 객체
@@ -287,6 +301,16 @@ def simplex(
         (None, False)       — UNSAT
     """
     EPS = 1e-9
+    # row 안에서 "사실상 0"으로 볼 계수의 상대 임계값. 절대값으로 자르면
+    # (예전 구현) 정상적인 1e-10짜리 계수가 통째로 버려져서 피벗 후보가
+    # 사라지고 없는 UNSAT이 만들어진다.
+    ZERO_REL = 1e-12
+    # 이 반복 횟수를 넘어가면 진입변수 선택을 순수 Bland's rule로 영구 전환한다.
+    # DdM 불변식(비기저변수는 항상 범위 안)은 진입변수를 어떻게 고르든 매 피벗마다
+    # 유지되므로, 어느 시점에 Bland로 갈아타도 그때부터는 유효한 상태에서 시작하는
+    # 정상 Bland 실행이라 종료가 보장된다.
+    BLAND_AFTER = 2 * len(tableau.rows) + 1000
+
     context = dict(progress_context or {})
     call_id = None
     iteration_count = 0
@@ -310,6 +334,17 @@ def simplex(
                 pivots=pivot_count,
             )
 
+    def _tol(x: float) -> float:
+        """절대 EPS 대신 값의 크기에 비례한 허용오차.
+
+        값이 16 정도만 돼도 상대오차 4e-10짜리 부동소수 오차가 절대 1e-9를
+        넘어서 '경계 위반'으로 오인된다 — 실제로 이것 때문에 멀쩡한 tableau가
+        UNSAT으로 판정된 사례가 있었다.
+        """
+        if x in (float('inf'), float('-inf')):
+            return EPS
+        return EPS * max(1.0, abs(x))
+
     for iteration in range(max_iter):
         iteration_count = iteration + 1
         try:
@@ -320,18 +355,21 @@ def simplex(
         if debug:
             _print_tableau(tableau, iteration)
 
+        use_bland = iteration >= BLAND_AFTER
+
         # ── 범위 위반 기저변수 찾기 (Bland's rule: 이름 사전순 최소인 변수) ──
-        # 진입변수(pivot_xi)를 sorted()로 고르는 것과 동일한 전순서를 여기서도
-        # 써야 anti-cycling 보장이 성립한다. tableau.rows의 list 순서는 피벗마다
-        # 바뀌므로 "첫 번째로 찾은 row"를 쓰면 Bland's rule이 깨져서 특히
-        # 퇴화(degenerate)된 tableau에서 진짜로 순환(cycle)할 수 있다.
+        # 이탈변수는 항상 이 전순서로 고른다. 진입변수도 Bland로 고르는 폴백
+        # 구간(use_bland)에서는 두 선택이 같은 전순서를 쓰게 되어 anti-cycling
+        # 보장이 성립한다. tableau.rows의 list 순서는 피벗마다 바뀌므로
+        # "첫 번째로 찾은 row"를 쓰면 그 보장이 깨져서 특히 퇴화(degenerate)된
+        # tableau에서 진짜로 순환(cycle)할 수 있다.
         violated_row = None
         for row in tableau.rows:
             xj = row.basic_var
             val = tableau.assign[xj]
             b = tableau.bounds[xj]
 
-            if val < b.lower - EPS or val > b.upper + EPS:
+            if val < b.lower - _tol(b.lower) or val > b.upper + _tol(b.upper):
                 if violated_row is None or xj < violated_row.basic_var:
                     violated_row = row
 
@@ -357,29 +395,42 @@ def simplex(
                 upper=b_xj.upper,
             )
 
-        # ── 피벗 가능한 비기저변수 xi 탐색 (Bland's rule: 인덱스 최소) ──
-        pivot_xi = None
+        amax = max((abs(c) for c in violated_row.coeffs.values()), default=0.0)
+        zero_thr = max(ZERO_REL * amax, 1e-300)
 
-        for xi in sorted(violated_row.coeffs.keys()):  # Bland's rule
-            a = violated_row.coeffs[xi]
+        def _eligible(xi: str, a: float) -> bool:
+            """xi를 진입변수로 썼을 때 xj를 원하는 방향으로 움직일 수 있는가."""
+            if abs(a) <= zero_thr:
+                return False
             b_xi = tableau.bounds[xi]
             xi_val = tableau.assign[xi]
+            if (a > 0) == going_up:
+                # xi를 올려야 한다 → upper 쪽에 여유가 있어야 함
+                return xi_val < b_xi.upper - _tol(b_xi.upper)
+            # xi를 내려야 한다 → lower 쪽에 여유가 있어야 함
+            return xi_val > b_xi.lower + _tol(b_xi.lower)
 
-            if going_up:
-                # xj < lj → xj를 올려야 함 → LHS를 증가시킬 xi
-                # xj를 올리려면 a * xi가 커져야한다
-                # a > 0 -> xi를 올려야해서 upper보다 작은지, 
-                if a > EPS and xi_val < b_xi.upper - EPS:
-                    pivot_xi = xi; break
-                # a < 0 -> xi를 내려야해서 lower보다 큰지 확인
-                if a < -EPS and xi_val > b_xi.lower + EPS:
-                    pivot_xi = xi; break
-            else:
-                # xj > uj → xj를 내려야 함
-                if a < -EPS and xi_val < b_xi.upper - EPS:
-                    pivot_xi = xi; break
-                if a > EPS and xi_val > b_xi.lower + EPS:
-                    pivot_xi = xi; break
+        # ── 피벗 가능한 비기저변수 xi 탐색 ──
+        # 기본은 |a| 최대(threshold pivoting). Bland's rule은 |a|~1e-10짜리 열도
+        # 태연히 고르는데, _pivot()의 -c/a 에서 오차가 1e10배 증폭되어 몇백 번만
+        # 피벗해도 정수 tableau가 잡음 덩어리가 된다.
+        pivot_xi = None
+        if use_bland:
+            for xi in sorted(violated_row.coeffs.keys()):  # Bland's rule
+                if _eligible(xi, violated_row.coeffs[xi]):
+                    pivot_xi = xi
+                    break
+        else:
+            best = None
+            for xi, a in violated_row.coeffs.items():
+                if not _eligible(xi, a):
+                    continue
+                m = abs(a)
+                # 동률은 이름 사전순으로 → 실행이 결정론적으로 유지된다
+                if best is None or m > best[0] or (m == best[0] and xi < best[1]):
+                    best = (m, xi)
+            if best is not None:
+                pivot_xi = best[1]
 
         if pivot_xi is None:
             # 피벗 가능한 변수 없음 → UNSAT
@@ -406,6 +457,19 @@ def simplex(
 
         # 구조적 피벗 (row 재작성)
         _pivot(tableau, pivot_xi, xj)
+
+        # fill-in으로 생긴 잡음 계수를 정확히 0으로 지워 누적을 끊는다.
+        # (이걸 안 하면 원래 0이어야 할 자리가 1e-10 언저리로 떠다니면서
+        #  row가 실제로는 걸지 않는 제약을 거는 것처럼 보이게 된다)
+        for row in tableau.rows:
+            if not row.coeffs:
+                continue
+            m = max(abs(c) for c in row.coeffs.values())
+            if m == 0.0:
+                continue
+            thr = ZERO_REL * m
+            for v in [v for v, c in row.coeffs.items() if abs(c) <= thr]:
+                del row.coeffs[v]
 
         # 피벗 후 새 비기저변수 xj는 경계값으로 고정
         tableau.assign[xj] = target

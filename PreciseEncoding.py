@@ -42,7 +42,7 @@ from DPLL_T import dpll_t
 from XOREncoding import NN_single, NN_dual, FreshGen, eq_lin
 import copy
 
-from visualize_prop import dump_search_phi_visualization
+from visualization.visualize_prop import dump_search_phi_visualization
 # -------------------------
 # small helper functions
 # -------------------------
@@ -446,7 +446,7 @@ if __name__ == "__main__":
     x1 = "x1"
     x2 = "x2"
 
-    # visualize_precise_prop 폴더에 이미지 파일 만들기
+    # visualization/outputs/precise_prop 폴더에 이미지 파일 만들기
     VISUALIZE_PHI_EACH_ATTEMPT = False
     VISUALIZE_RENDER_PNG = False
 

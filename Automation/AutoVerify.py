@@ -25,19 +25,18 @@
      python AutoVerify.py verify-vnnlib --model model.onnx --vnnlib prop_1.vnnlib.gz \
          --allow-large-model --timeout-seconds 300 --json-output Results/prop_1.json
 
-   verify-vnnlib 전용: 이 인스턴스를 실행하면서 SolveTrace로 ReLU split
-   이벤트를 모아 NetworkLayout 기반 히트맵을 PNG로 저장할 수 있다
-   (Automation/SolveTrace.py, SplitHeatmap.py 참고):
+   verify-vnnlib 전용 visualization은 --visualization-mode로 선택한다.
+   realtime은 실행 중 활성 split 점을 갱신하고, feedback은 종료 후 누적
+   SplitHeatmap을 저장하며, both는 둘 다 실행한다:
 
      python AutoVerify.py verify-vnnlib --model model.onnx --vnnlib prop_1.vnnlib.gz \
          --allow-large-model --timeout-seconds 300 \
-         --split-heatmap-output Results/prop_1_split.png \
-         --split-heatmap-threshold 1 --split-heatmap-cap 20
+         --visualization-mode both
 
    결과 JSON에도 split_summary(total_split_events, distinct_neurons)가 같이
    담긴다. 단, ReLU 분기 없이 순수 불리언 추론만으로 UNSAT이 확정되는
    인스턴스(solver.reason == BOOLEAN_UNSAT)는 Reluplex 자체가 호출되지
-   않아서 split이 0건이고 히트맵도 비어있다(전부 "⋮") — 버그가 아니라 그
+    않아서 split이 0건이고 히트맵 값도 모두 0이다 — 버그가 아니라 그
    인스턴스가 이론 솔버까지 갈 필요가 없었다는 뜻이다. 실제 split 이벤트를
    보려면 이론 솔버(Reluplex)까지 도달하는 인스턴스가 필요하다.
 
@@ -99,9 +98,12 @@
 
 verify-vnnlib 전용 플래그
 --------------------------
-  --split-heatmap-output PATH     주어지면 ReLU split 히트맵 PNG를 이 경로에 저장
-  --split-heatmap-threshold N     이 횟수 이상 split된 뉴런만 히트맵에 표시 (기본 1)
-  --split-heatmap-cap N           히트맵에서 레이어당 최대 표시 뉴런 수 (기본 20)
+  --visualization-mode MODE       off, realtime, feedback, both 중 선택
+  --realtime-log-output PATH      실시간 +/- JSONL 로그 경로
+  --realtime-split-output PATH    실시간 활성 split 점 PNG 경로
+  --split-heatmap-output PATH     사후 feedback 히트맵 경로 (--feedback-heatmap-output 별칭)
+  --split-heatmap-threshold N     이전 버전과의 호환용 (현재 모든 노드를 표시)
+  --split-heatmap-cap N           이전 버전과의 호환용 (현재 모든 노드를 표시)
 
 입력 파일 관련 주의사항
 ------------------------
@@ -133,7 +135,8 @@ verify-vnnlib 전용 플래그
   VERIFIED         안전 확정 (솔버 UNSAT)
   UNKNOWN          시간/라운드 한도로 결론 못 냄 — result.solver.reason 확인
                     (TIMEOUT / DPLL_T_ROUND_LIMIT / SIMPLEX_ITERATION_LIMIT /
-                     RELUPLEX_RECURSION_LIMIT / RELUPLEX_REPAIR_INCONCLUSIVE)
+                     RELUPLEX_RECURSION_LIMIT / RELUPLEX_REPAIR_INCONCLUSIVE /
+                     NEGATED_RELU_UNSUPPORTED)
 
 VNNCOMP 벤치마크(ACAS Xu 등)를 특정 경로 기준으로 처음부터 끝까지 돌리는
 전체 walkthrough(환경 설정, 경로 등록, prop_1~6 연속 실행 등)는
@@ -172,8 +175,26 @@ from Automation.PropertyBuilder import (
 from Automation.VnnlibParser import LinearExpression, parse_vnnlib_file
 from XOREncoding import FreshGen
 from Automation.SolverStatus import SolverStatus
-from Automation.SolveTrace import SolveTrace
-from SplitHeatmap import split_counts_from_trace, draw_split_heatmap
+from visualization.SolveTrace import SolveTrace
+from visualization.SplitHeatmap import split_counts_from_trace, draw_split_heatmap
+from visualization.RealtimeSplitVisualization import (
+    RealtimeSplitVisualizer,
+    SplitEventLogger,
+)
+from visualization.SolverProgress import (
+    SolverProgressLogger,
+    SolverProgressPanelVisualizer,
+    build_solver_feedback,
+    read_solver_progress,
+    solver_panel_paths,
+    write_solver_feedback_panels,
+)
+from visualization.UnifiedRealtimeDashboard import DedicatedRealtimeView
+from visualization.VisualizationMode import (
+    VisualizationMode,
+    combined_mode,
+    default_visualization_paths,
+)
 
 
 def load_spec(path: str) -> Dict[str, Any]:
@@ -533,16 +554,29 @@ def run_vnnlib_verification(
     timeout_seconds: Optional[float] = 300.0,
     simplex_max_iter: int = 10000,
     trace: Optional[SolveTrace] = None,
+    visualization_mode: str = "off",
+    realtime_visualization: bool = False,
+    feedback_visualization: bool = False,
+    open_realtime_view: bool = False,
+    realtime_panels: Optional[Sequence[str]] = None,
+    realtime_refresh_ms: int = 500,
+    realtime_playback_ms: int = 0,
+    realtime_log_output: Optional[str] = None,
+    realtime_split_output: Optional[str] = None,
     split_heatmap_output: Optional[str] = None,
+    solver_progress_log_output: Optional[str] = None,
+    solver_realtime_output: Optional[str] = None,
+    solver_feedback_output: Optional[str] = None,
     split_heatmap_threshold: float = 1,
     split_heatmap_cap: int = 20,
     profile_stages: bool = False,
 ) -> Dict[str, Any]:
     """VNNLIB이 정의한 unsafe 영역과 신경망의 교집합을 직접 탐색한다.
 
-    split_heatmap_output을 주면 trace(안 넘겼으면 내부에서 새로 만듦)로 이
-    인스턴스를 실행한 뒤, ReLU split 이벤트를 모아 NetworkLayout 기반 히트맵
-    PNG를 저장한다 (Automation/SolveTrace.py, SplitHeatmap.py 참고).
+    visualization_mode은 off/realtime/feedback/both를 지원한다. realtime은
+    실행 중 활성 split 점을 갱신하고, feedback은 실행 후 SolveTrace를 집계한
+    SplitHeatmap을 저장한다. both는 두 채널을 같은 solver 실행에 함께 연결한다.
+    기존 split_heatmap_output만 준 호출도 feedback으로 동작한다.
 
     simplex_max_iter는 Reluplex 내부 각 Simplex 호출의 반복 상한이다.
     SIMPLEX_ITERATION_LIMIT으로 UNKNOWN이 자주 나면 크게 올릴 것 — 이때
@@ -552,6 +586,56 @@ def run_vnnlib_verification(
     소요시간(및 dpll()은 기본 1000회마다 진행상황)을 [profile] 접두어로 찍는다 —
     큰 모델이 어느 단계에서 멈춰있는지 진단할 때 켠다.
     """
+
+    requested_visualization = VisualizationMode.parse(visualization_mode)
+    feedback_enabled = (
+        requested_visualization.feedback_enabled
+        or feedback_visualization
+        or split_heatmap_output is not None
+        or solver_feedback_output is not None
+    )
+    realtime_enabled = (
+        requested_visualization.realtime_enabled
+        or realtime_visualization
+        or solver_realtime_output is not None
+    )
+    effective_visualization = combined_mode(
+        realtime=realtime_enabled,
+        feedback=feedback_enabled,
+    )
+    allowed_realtime_panels = {"relu", "dpll-theory", "simplex"}
+    selected_realtime_panels = set(realtime_panels or allowed_realtime_panels)
+    unknown_realtime_panels = selected_realtime_panels - allowed_realtime_panels
+    if unknown_realtime_panels:
+        names = ", ".join(sorted(unknown_realtime_panels))
+        raise ValueError(f"지원하지 않는 realtime panel: {names}")
+    realtime_relu_enabled = realtime_enabled and "relu" in selected_realtime_panels
+    realtime_solver_panels = set()
+    if realtime_enabled and "dpll-theory" in selected_realtime_panels:
+        realtime_solver_panels.add("dpll_theory")
+    if realtime_enabled and "simplex" in selected_realtime_panels:
+        realtime_solver_panels.add("simplex")
+    realtime_solver_enabled = bool(realtime_solver_panels)
+    feedback_relu_enabled = feedback_enabled and "relu" in selected_realtime_panels
+    feedback_solver_panels = set()
+    if feedback_enabled and "dpll-theory" in selected_realtime_panels:
+        feedback_solver_panels.add("dpll_theory")
+    if feedback_enabled and "simplex" in selected_realtime_panels:
+        feedback_solver_panels.add("simplex")
+    feedback_solver_enabled = bool(feedback_solver_panels)
+    default_paths = default_visualization_paths(model_path, vnnlib_path)
+    if feedback_relu_enabled and split_heatmap_output is None:
+        split_heatmap_output = str(default_paths.feedback_heatmap)
+    if realtime_relu_enabled and realtime_log_output is None:
+        realtime_log_output = str(default_paths.realtime_log)
+    if realtime_relu_enabled and realtime_split_output is None:
+        realtime_split_output = str(default_paths.realtime_image)
+    if (realtime_solver_enabled or feedback_solver_enabled) and solver_progress_log_output is None:
+        solver_progress_log_output = str(default_paths.solver_progress_log)
+    if realtime_solver_enabled and solver_realtime_output is None:
+        solver_realtime_output = str(default_paths.solver_realtime_image)
+    if feedback_solver_enabled and solver_feedback_output is None:
+        solver_feedback_output = str(default_paths.solver_feedback_image)
 
     model, info = load_model_for_verification(model_path)
     if info.output_activation_removed:
@@ -567,6 +651,10 @@ def run_vnnlib_verification(
         raise ValueError("simplex_max_iter must be positive")
     if max_relus_without_override < 0:
         raise ValueError("max_relus_without_override must be non-negative")
+    if realtime_refresh_ms <= 0:
+        raise ValueError("realtime_refresh_ms must be positive")
+    if realtime_playback_ms < 0:
+        raise ValueError("realtime_playback_ms must be non-negative")
     if (
         not dry_run
         and not allow_large_model
@@ -577,6 +665,38 @@ def run_vnnlib_verification(
             f"{max_relus_without_override}. Use --dry-run first, then "
             "--allow-large-model only if the expected cost is acceptable."
         )
+
+    # 같은 model/property 조합은 매번 같은 출력 경로를 사용한다. JSONL만
+    # 초기화하면 새 이벤트가 렌더될 때까지 브라우저에 직전 실행의 마지막 PNG가
+    # 남으므로, 실제 인코딩을 시작하기 전에 빈 프레임으로 함께 교체한다.
+    if not dry_run and realtime_relu_enabled:
+        initial_split_visualizer = RealtimeSplitVisualizer(
+            realtime_log_output,
+            realtime_split_output,
+            playback_interval_ms=realtime_playback_ms,
+        )
+        initial_split_logger = SplitEventLogger(
+            realtime_log_output,
+            update_callback=initial_split_visualizer.request_update,
+            reset_log=True,
+        )
+        initial_split_logger.request_update()
+        initial_split_visualizer.flush()
+
+    if not dry_run and realtime_solver_enabled:
+        initial_progress_visualizer = SolverProgressPanelVisualizer(
+            solver_progress_log_output,
+            solver_realtime_output,
+            enabled_panels=realtime_solver_panels,
+        )
+        initial_progress_logger = SolverProgressLogger(
+            solver_progress_log_output,
+            update_callback=initial_progress_visualizer.request_update,
+            reset_log=True,
+            enabled_panels=realtime_solver_panels,
+        )
+        initial_progress_logger.request_update()
+        initial_progress_visualizer.flush()
 
     input_vars = [f"x{index}" for index in range(info.input_size)]
     generator = FreshGen(prefix="vnnlib_")
@@ -621,13 +741,82 @@ def run_vnnlib_verification(
             "output_variables": list(document.output_variables),
         },
         "dry_run": dry_run,
+        "visualization": {"mode": effective_visualization.value},
     }
     if dry_run:
         result["status"] = "DRY_RUN"
         return result
 
-    if split_heatmap_output is not None and trace is None:
+    if feedback_relu_enabled and trace is None:
         trace = SolveTrace()
+
+    realtime_live_views = {}
+    realtime_solver_panel_paths = {}
+    if realtime_enabled:
+        if realtime_solver_enabled:
+            all_solver_panel_paths = solver_panel_paths(solver_realtime_output)
+            realtime_solver_panel_paths = {
+                name: all_solver_panel_paths[name]
+                for name in realtime_solver_panels
+            }
+        dedicated_views = {}
+        if realtime_relu_enabled:
+            realtime_live_views["relu_split"] = Path(
+                realtime_split_output
+            ).with_suffix(".html")
+            dedicated_views["relu"] = DedicatedRealtimeView(
+                realtime_split_output,
+                realtime_live_views["relu_split"],
+                title="Realtime ReLU Split History",
+                description="활성 split 이력과 layer/index별 ReLU hotspot",
+                refresh_interval_ms=realtime_refresh_ms,
+            )
+        if "dpll_theory" in realtime_solver_panels:
+            realtime_live_views["dpll_theory"] = realtime_solver_panel_paths[
+                "dpll_theory"
+            ].with_suffix(".html")
+            dedicated_views["dpll-theory"] = DedicatedRealtimeView(
+                realtime_solver_panel_paths["dpll_theory"],
+                realtime_live_views["dpll_theory"],
+                title="DPLL Rounds & Theory Flow",
+                description="DPLL 라운드와 theory 전달 흐름",
+                refresh_interval_ms=realtime_refresh_ms,
+            )
+        if "simplex" in realtime_solver_panels:
+            realtime_live_views["simplex"] = realtime_solver_panel_paths[
+                "simplex"
+            ].with_suffix(".html")
+            dedicated_views["simplex"] = DedicatedRealtimeView(
+                realtime_solver_panel_paths["simplex"],
+                realtime_live_views["simplex"],
+                title="Simplex Internals",
+                description="Simplex 반복과 pivot 진행",
+                refresh_interval_ms=realtime_refresh_ms,
+            )
+        for name, view in dedicated_views.items():
+            view.write(
+                open_browser=open_realtime_view
+            )
+
+    progress = None
+    progress_visualizer = None
+    progress_panels = realtime_solver_panels | feedback_solver_panels
+    if progress_panels:
+        progress_update_callback = None
+        if realtime_solver_enabled:
+            progress_visualizer = SolverProgressPanelVisualizer(
+                solver_progress_log_output,
+                solver_realtime_output,
+                enabled_panels=realtime_solver_panels,
+                refresh_interval_ms=realtime_refresh_ms,
+            )
+            progress_update_callback = progress_visualizer.request_update
+        progress = SolverProgressLogger(
+            solver_progress_log_output,
+            update_callback=progress_update_callback,
+            reset_log=True,
+            enabled_panels=progress_panels,
+        )
 
     # VNNLIB assertion은 unsafe 집합을 나타내므로 SAT이면 반례가 존재한다.
     query = AndProp(nn_property, document.formula)
@@ -639,6 +828,12 @@ def run_vnnlib_verification(
         trace=trace,
         simplex_max_iter=simplex_max_iter,
         profile_stages=profile_stages,
+        split_mode="realtime" if realtime_relu_enabled else "off",
+        split_log_path=realtime_log_output,
+        realtime_output_path=realtime_split_output,
+        realtime_open_view=False,
+        realtime_playback_ms=realtime_playback_ms,
+        progress=progress,
     )
     result["solver"] = {
         **solver_result.to_dict(),
@@ -646,6 +841,41 @@ def run_vnnlib_verification(
         "timeout_seconds": timeout_seconds,
         "simplex_max_iter": simplex_max_iter,
     }
+    if progress_visualizer is not None:
+        progress_visualizer.flush()
+    if realtime_enabled:
+        realtime_result = {
+            "live_view_outputs": {
+                name: str(path) for name, path in realtime_live_views.items()
+            },
+            "opened_panels": sorted(selected_realtime_panels),
+            "refresh_interval_ms": realtime_refresh_ms,
+            "playback_interval_ms": realtime_playback_ms,
+        }
+        if realtime_relu_enabled:
+            realtime_result.update({
+                "log_output": realtime_log_output,
+                "image_output": realtime_split_output,
+            })
+        if realtime_solver_enabled:
+            realtime_result["solver_progress"] = {
+                "log_output": solver_progress_log_output,
+                "panel_outputs": {
+                    name: str(path)
+                    for name, path in realtime_solver_panel_paths.items()
+                },
+                "live_view_outputs": {
+                    name: str(realtime_live_views[name])
+                    for name in realtime_solver_panels
+                },
+            }
+        result["visualization"]["realtime"] = realtime_result
+
+    if progress is not None:
+        progress_feedback = build_solver_feedback(
+            read_solver_progress(solver_progress_log_output)
+        )
+        result["solver_progress_summary"] = progress_feedback["counts"]
 
     if trace is not None:
         split_counts = split_counts_from_trace(trace)
@@ -655,7 +885,7 @@ def run_vnnlib_verification(
             ),
             "distinct_neurons": len(split_counts),
         }
-        if split_heatmap_output is not None:
+        if feedback_relu_enabled and split_heatmap_output is not None:
             fig, _ax = draw_split_heatmap(
                 model, split_counts,
                 threshold=split_heatmap_threshold, cap=split_heatmap_cap,
@@ -666,6 +896,23 @@ def run_vnnlib_verification(
             import matplotlib.pyplot as plt
             plt.close(fig)
             result["split_heatmap_output"] = split_heatmap_output
+            result["visualization"]["feedback"] = {
+                "heatmap_output": split_heatmap_output,
+            }
+
+    if feedback_solver_enabled and solver_feedback_output is not None:
+        solver_feedback, solver_feedback_panels = write_solver_feedback_panels(
+            solver_progress_log_output,
+            solver_feedback_output,
+            enabled_panels=feedback_solver_panels,
+        )
+        result.setdefault("visualization", {}).setdefault("feedback", {})[
+            "solver_progress_panels"
+        ] = {name: str(path) for name, path in solver_feedback_panels.items()}
+        result["visualization"]["feedback"]["solver_progress_json"] = str(
+            Path(solver_feedback_output).with_suffix(".json")
+        )
+        result["solver_progress_summary"] = solver_feedback["counts"]
 
     if solver_result.status == SolverStatus.SAT:
         result["status"] = "COUNTEREXAMPLE"
@@ -746,6 +993,19 @@ def _print_vnnlib_verification(result: Mapping[str, Any]) -> None:
         )
     if result.get("split_heatmap_output"):
         print(f"  split heatmap: {result['split_heatmap_output']}")
+    visualization = result.get("visualization", {})
+    if visualization.get("mode", "off") != "off":
+        print(f"  visualization: {visualization['mode']}")
+        realtime = visualization.get("realtime")
+        if realtime:
+            print(f"    realtime log  : {realtime['log_output']}")
+            print(f"    realtime image: {realtime['image_output']}")
+            for name, path in realtime.get("live_view_outputs", {}).items():
+                print(f"    {name} live: {path}")
+        feedback = visualization.get("feedback")
+        if feedback and feedback.get("solver_progress_panels"):
+            for name, path in feedback["solver_progress_panels"].items():
+                print(f"    {name} feedback: {path}")
 
 
 def _write_json_result(result: Mapping[str, Any], output_path: str) -> None:
@@ -818,21 +1078,66 @@ def build_parser() -> argparse.ArgumentParser:
     vnnlib_parser.add_argument(
         "--simplex-max-iter", type=int, default=10000,
         help="Reluplex 내부 Simplex 호출당 반복 상한. SIMPLEX_ITERATION_LIMIT으로 "
-             "UNKNOWN이 자주 나면 크게 올릴 것 (예: 1000000) — 이때 --timeout-seconds도 "
+             "UNKNOWN이 자주 나면 크게 올릴 것 (예: 1000000) - 이때 --timeout-seconds도 "
              "넉넉히 잡을 것, 실질적인 안전장치는 timeout이다.",
     )
     vnnlib_parser.add_argument("--json-output")
     vnnlib_parser.add_argument(
-        "--split-heatmap-output",
-        help="ReLU split 이벤트를 모아 NetworkLayout 히트맵 PNG로 저장 (Automation/SolveTrace.py + SplitHeatmap.py)",
+        "--visualization-mode",
+        choices=[mode.value for mode in VisualizationMode],
+        default=VisualizationMode.OFF.value,
+        help="off: 끔, realtime: split+solver dashboard, feedback: split+solver 사후 분석, both: 둘 다",
+    )
+    vnnlib_parser.add_argument(
+        "--realtime-panels",
+        nargs="+",
+        choices=("relu", "dpll-theory", "simplex"),
+        help="실행·생성할 시각화 패널 선택; both에서는 feedback에도 적용 (기본: 모두)",
+    )
+    vnnlib_parser.add_argument(
+        "--realtime-refresh-ms",
+        type=int,
+        default=500,
+        help="실시간 브라우저 이미지 확인 주기 ms (기본: 500, 초당 최대 2회)",
+    )
+    vnnlib_parser.add_argument(
+        "--realtime-playback-ms",
+        type=int,
+        default=0,
+        help="ReLU +/- 이벤트를 하나씩 보여줄 간격 ms (기본 0: 실제 최신 상태)",
+    )
+    vnnlib_parser.add_argument(
+        "--realtime-log-output",
+        help="realtime/both의 +/- JSONL 로그 경로 (생략 시 visualization/outputs)",
+    )
+    vnnlib_parser.add_argument(
+        "--realtime-split-output",
+        help="realtime/both의 활성 split 점 PNG 경로 (생략 시 visualization/outputs)",
+    )
+    vnnlib_parser.add_argument(
+        "--split-heatmap-output", "--feedback-heatmap-output",
+        dest="split_heatmap_output",
+        help="feedback/both의 실행 후 split 히트맵 PNG 경로 (기존 옵션명도 지원)",
+    )
+    vnnlib_parser.add_argument(
+        "--solver-progress-log-output",
+        help="DPLL/Simplex/Theory flow JSONL 경로",
+    )
+    vnnlib_parser.add_argument(
+        "--solver-realtime-output",
+        help="DPLL+Theory/Simplex 실시간 패널 base PNG 경로 (_dpll_theory/_simplex 생성)",
+    )
+    vnnlib_parser.add_argument(
+        "--solver-feedback-output",
+        help="DPLL+Theory/Simplex feedback 패널 base PNG 경로 (_dpll_theory/_simplex 생성)",
     )
     vnnlib_parser.add_argument(
         "--split-heatmap-threshold", type=float, default=1,
-        help="이 횟수 이상 split된 뉴런만 히트맵에 표시 (기본 1)",
+        help="호환용 옵션 (현재 split 횟수와 무관하게 모든 노드를 표시)",
     )
     vnnlib_parser.add_argument(
         "--split-heatmap-cap", type=int, default=20,
-        help="히트맵에서 레이어당 최대 표시 뉴런 수 (기본 20)",
+        help="호환용 옵션 (현재 레이어당 표시 노드 수를 제한하지 않음)",
     )
     vnnlib_parser.add_argument(
         "--profile-stages",
@@ -870,7 +1175,17 @@ def main() -> int:
                 strict_epsilon=args.strict_epsilon,
                 timeout_seconds=args.timeout_seconds,
                 simplex_max_iter=args.simplex_max_iter,
+                visualization_mode=args.visualization_mode,
+                open_realtime_view=args.visualization_mode in ("realtime", "both"),
+                realtime_panels=args.realtime_panels,
+                realtime_refresh_ms=args.realtime_refresh_ms,
+                realtime_playback_ms=args.realtime_playback_ms,
+                realtime_log_output=args.realtime_log_output,
+                realtime_split_output=args.realtime_split_output,
                 split_heatmap_output=args.split_heatmap_output,
+                solver_progress_log_output=args.solver_progress_log_output,
+                solver_realtime_output=args.solver_realtime_output,
+                solver_feedback_output=args.solver_feedback_output,
                 split_heatmap_threshold=args.split_heatmap_threshold,
                 split_heatmap_cap=args.split_heatmap_cap,
                 profile_stages=args.profile_stages,

@@ -1,0 +1,11 @@
+; 실제 custom XOR 신경망의 ReLU 분기 확인용 unsafe 영역.
+; 입력을 한 점으로 고정하지 않아 hidden ReLU 상태를 solver가 결정해야 한다.
+(declare-const X_0 Real)
+(declare-const X_1 Real)
+(declare-const Y_0 Real)
+
+(assert (>= X_0 0.0))
+(assert (<= X_0 1.0))
+(assert (>= X_1 0.0))
+(assert (<= X_1 1.0))
+(assert (<= Y_0 0.0))

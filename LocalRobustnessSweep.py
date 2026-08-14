@@ -13,7 +13,7 @@ from XOREncoding import FreshGen, NN_single
 from Robustness import make_precondition_linf_box
 from PreciseEncoding import out_zero_logit, out_one_logit
 from PreciseEncoding import xor_nn_sx  # 실제 신경망 함수 추가
-from visualize_prop import dump_search_phi_visualization
+from visualization.visualize_prop import dump_search_phi_visualization
 
 # 폰트 설정
 if platform.system() == 'Windows':

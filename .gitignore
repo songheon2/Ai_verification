@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+# Generated verification and visualization artifacts
+Automation/Results/
+visualization/outputs/

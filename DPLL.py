@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Dict, List, Optional, Tuple, Set, Union
 from Automation.SolverStatus import check_deadline
-from Automation.SolveTrace import SolveTrace, span
+from visualization.SolveTrace import SolveTrace, span
 
 # ============================================================
 # 0) Prop AST 정의
@@ -48,6 +48,9 @@ class ReLUProp(Prop):
     # relu(x,y) represents y = relu(x)
     x: str
     y: str
+    # 신경망 인코더가 만든 ReLU이면 원래 뉴런 좌표를 함께 보존한다.
+    layer: Optional[int] = None
+    index: Optional[int] = None
 
 @dataclass(frozen=True)
 class AndProp(Prop):

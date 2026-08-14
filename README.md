@@ -32,7 +32,7 @@ Python으로 구현한 **DPLL(T) + Simplex + Reluplex 기반 ReLU 신경망 검�
 - **Robustness.py** — L∞ 박스 perturbation에 대한 same-class robustness 검증
 - **PreciseEncoding.py** — XOR 입력 구간별 counterexample 탐색, 다중 반례 수집, 샘플링 기반 검산
 - **LocalRobustnessSweep.py** — epsilon을 점진적으로 증가시키며 robustness 붕괴 지점 추적
-- **visualize_prop.py** — 검증 대상 Prop 식과 Tseitin CNF 결과를 Graphviz DOT/PNG로 시각화
+- **visualization/** — solver trace, 신경망 layout/heatmap, Prop/CNF 및 sparsity 시각화
 - **Tseitin_Transformation.py** — 정수 기반 Tseitin 변환 독립 구현 (교육용)
 
 ---
@@ -49,7 +49,15 @@ Python으로 구현한 **DPLL(T) + Simplex + Reluplex 기반 ReLU 신경망 검�
 ├── Robustness.py
 ├── PreciseEncoding.py
 ├── LocalRobustnessSweep.py
-├── visualize_prop.py
+├── visualization/
+│   ├── SolveTrace.py
+│   ├── RealtimeSplitVisualization.py
+│   ├── SplitHeatmap.py
+│   ├── NetworkLayout.py
+│   ├── visualize_prop.py
+│   ├── VisualizeSparsity.py
+│   ├── tests/
+│   └── outputs/
 ├── Tseitin_Transformation.py
 └── README.md
 ```
@@ -253,14 +261,14 @@ XOR 신경망에 대해 **epsilon 값을 점진적으로 증가시키면서 loca
 
 ---
 
-### 🔹 `visualize_prop.py`
+### 🔹 `visualization/visualize_prop.py`
 
 검증 대상 논리식과 Tseitin 변환 후 CNF를 **Graphviz 그래프 형태로 시각화**하는 유틸리티입니다.
 
 주요 함수:
 - `prop_to_dot(prop, name)` — Prop 트리를 DOT 형식으로 변환 (노드 종류별 색상 구분)
 - `cnf_to_dot(cnf, atom_map, memo, name)` — CNF 트리 + atom_map 범례를 나란히 배치
-- `save_dot(dot_src, filepath)` — `visualize_precise_prop/` 하위에 `.dot` 파일 저장
+- `save_dot(dot_src, filepath)` — `visualization/outputs/precise_prop/` 하위에 `.dot` 파일 저장
 - `render_dot(filepath, fmt)` — Graphviz `dot` 명령으로 PNG 렌더링
 - `dump_search_phi_visualization(phi, case_name, attempt_no, ...)` — 반례 탐색 중인 phi를 tree/CNF 두 형태로 저장
 - `visualize_precise_case(case_name, r1, r2, ...)` — PreciseEncoding 단일 케이스 시각화
@@ -461,15 +469,15 @@ python LocalRobustnessSweep.py
 
 ---
 
-### `visualize_prop.py`
+### `visualization/visualize_prop.py`
 
 검증 대상식과 Tseitin 변환 후 CNF 식을 Graphviz DOT/PNG로 시각화합니다.
 
 ```bash
-python visualize_prop.py
+python -m visualization.visualize_prop
 ```
 
-실행 결과 (`visualize_precise_prop/` 디렉터리에 저장):
+실행 결과 (`visualization/outputs/precise_prop/` 디렉터리에 저장):
 - `case00/precise_search_case00_*_tree.dot/.png`
 - `case00/precise_search_case00_*_cnf.dot/.png`
 - (case01, case10, case11도 동일)
@@ -581,7 +589,7 @@ XOR 예제에서는 sigmoid를 직접 인코딩하지 않고, 출력 logit `s`�
 - strict inequality는 직접 지원하지 않으므로 작은 epsilon 기반 근사가 필요합니다.
 - class 경계값(`s = 0` 근방)에서 미세한 음수 logit이 양수로 처리될 수 있어 위양성 반례가 발생할 수 있습니다.
 - counterexample을 여러 개 찾기 위해 OR 기반 blocking constraint를 누적하면 탐색 공간이 조각나 속도가 크게 느려질 수 있습니다.
-- `visualize_prop.py`의 PNG 렌더링은 Graphviz `dot` 명령이 설치되어 있어야 합니다. 미설치 시 `.dot` 파일만 생성됩니다.
+- `visualization/visualize_prop.py`의 PNG 렌더링은 Graphviz `dot` 명령이 설치되어 있어야 합니다. 미설치 시 `.dot` 파일만 생성됩니다.
 
 ---
 
@@ -598,7 +606,7 @@ XOR 예제에서는 sigmoid를 직접 인코딩하지 않고, 출력 logit `s`�
 7. `python Robustness.py` → robustness 예제 실행
 8. `python PreciseEncoding.py` → 입력 region별 정밀 반례 탐색 및 검산
 9. `python LocalRobustnessSweep.py` → epsilon sweep 기반 robustness 붕괴 지점 분석
-10. `python visualize_prop.py` → 검증 대상식과 CNF 구조 시각화
+10. `python -m visualization.visualize_prop` → 검증 대상식과 CNF 구조 시각화
 
 ---
 

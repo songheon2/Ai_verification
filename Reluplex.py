@@ -3,11 +3,19 @@
 이 모듈은 `reluplex(row_defs, bounds, relus)`를 제공하며,
 사진의 Algorithm 4(간단화된 Reluplex)의 재귀적 구현을 따릅니다.
 """
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from Simplex import build_tableau, simplex, _pivot, _compute_basic, SimplexTableau
 from Automation.SolverStatus import SolverLimitReached, check_deadline
-from Automation.SolveTrace import SolveTrace, span
+from visualization.SolveTrace import SolveTrace, span
 import random
+import re
+
+_NEURON_VAR_RE = re.compile(r"^[zh](\d+)_(\d+)(?:_.*)?$")
+
+
+def _parse_neuron_var(name: str) -> Optional[Tuple[int, int]]:
+    match = _NEURON_VAR_RE.match(name)
+    return (int(match.group(1)), int(match.group(2))) if match is not None else None
 
 def relu(v: float) -> float:
     """ReLU 함수: 음수일 경우 0, 양수일 경우 자기 자신을 반환."""
@@ -39,9 +47,14 @@ def reluplex(
     deadline: Optional[float] = None,
     report_unknown: bool = False,
     trace: Optional[SolveTrace] = None,
+    split_logger: Optional[Any] = None,
+    relu_metadata: Optional[Dict[Tuple[str, str], Tuple[Optional[int], Optional[int]]]] = None,
+    progress: Optional[Any] = None,
+    progress_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
 
     repair_count: Dict[Tuple[str, str], int] = {}
+    base_progress_context = dict(progress_context or {})
 
     def _limit(reason: str) -> Tuple[Optional[Dict[str, float]], bool]:
         if report_unknown:
@@ -53,6 +66,7 @@ def reluplex(
         x: str,
         y: str,
         direction: int,
+        depth: int,
     ) -> Tuple[Optional[Dict[str, float]], bool]:
         import copy
         check_deadline(deadline)
@@ -96,6 +110,12 @@ def reluplex(
                 debug=debug,
                 deadline=deadline,
                 report_unknown=report_unknown,
+                progress=progress,
+                progress_context={
+                    **base_progress_context,
+                    "depth": depth,
+                    "origin": "relu_repair",
+                },
             )
 
     def _select_violation(violations: List[Tuple[str, str]]) -> Tuple[str, str]:
@@ -133,6 +153,12 @@ def reluplex(
                 debug=debug,
                 deadline=deadline,
                 report_unknown=report_unknown,
+                progress=progress,
+                progress_context={
+                    **base_progress_context,
+                    "depth": depth,
+                    "origin": "reluplex",
+                },
             )
 
         if not sat:
@@ -156,7 +182,7 @@ def reluplex(
             for direction in directions:
                 try:
                     with span(trace, "reluplex_repair", depth=depth, branch_x=x):
-                        sol2, sat2 = _try_repair(tableau, x, y, direction)
+                        sol2, sat2 = _try_repair(tableau, x, y, direction, depth)
                 except SolverLimitReached as exc:
                     if exc.reason == "TIMEOUT":
                         raise
@@ -199,11 +225,21 @@ def reluplex(
                 break
 
         if branch_x is not None and depth < max_recursion:
+            neuron_key = None
+            if relu_y is not None and relu_metadata is not None:
+                layer_index = relu_metadata.get((branch_x, relu_y))
+                if layer_index is not None and None not in layer_index:
+                    neuron_key = (int(layer_index[0]), int(layer_index[1]))
+            if neuron_key is None:
+                neuron_key = _parse_neuron_var(branch_x)
+
             # 이 with 블록이 열려있는 동안(양쪽 분기가 다 끝날 때까지)이
             # "지금 branch_x에서 split이 진행 중"인 구간이다 — 시각화에서
             # "현재 열려있는 branch_x 스택"을 그대로 이 이벤트들로 재구성한다.
             with span(trace, "reluplex_split", depth=depth, branch_x=branch_x):
                 lo, hi = bounds_now.get(branch_x, (float('-inf'), float('inf')))
+                layer = neuron_key[0] if neuron_key is not None else None
+                index = neuron_key[1] if neuron_key is not None else None
 
                 # 1. x >= 0 분기
                 bounds1 = dict(bounds_now)
@@ -215,36 +251,54 @@ def reluplex(
                     bounds1[slack_name] = (0.0, 0.0)
 
                 branch_unknown_reason = None
+                split_id = None
+                if split_logger is not None:
+                    # global_split_count 증가 및 '+' 기록: 첫 Reluplex 재귀 호출 직전.
+                    split_id = split_logger.begin(branch_x, layer, index)
                 try:
-                    r1, sat1 = _rec(bounds1, depth + 1, row_defs1)
-                except SolverLimitReached as exc:
-                    if exc.reason == "TIMEOUT":
-                        raise
-                    branch_unknown_reason = exc.reason
-                    r1, sat1 = None, False
-                if sat1:
-                    return r1, True
+                    try:
+                        r1, sat1 = _rec(bounds1, depth + 1, row_defs1)
+                    except SolverLimitReached as exc:
+                        if exc.reason == "TIMEOUT":
+                            raise
+                        branch_unknown_reason = exc.reason
+                        r1, sat1 = None, False
+                    if sat1:
+                        return r1, True
 
-                # 2. x <= 0 분기
-                bounds2 = dict(bounds_now)
-                bounds2[branch_x] = (lo, min(0.0, hi))
-                row_defs2 = list(current_row_defs)
-                if relu_y is not None:
-                    bounds2[relu_y] = (0.0, 0.0)
+                    # 2. x <= 0 분기
+                    bounds2 = dict(bounds_now)
+                    bounds2[branch_x] = (lo, min(0.0, hi))
+                    row_defs2 = list(current_row_defs)
+                    inactive_bounds_conflict = False
+                    if relu_y is not None:
+                        y_lo, y_hi = bounds2.get(
+                            relu_y, (float('-inf'), float('inf'))
+                        )
+                        inactive_bounds_conflict = max(y_lo, 0.0) > min(y_hi, 0.0) + 1e-9
+                        if not inactive_bounds_conflict:
+                            bounds2[relu_y] = (max(y_lo, 0.0), min(y_hi, 0.0))
 
-                try:
-                    r2, sat2 = _rec(bounds2, depth + 1, row_defs2)
-                except SolverLimitReached as exc:
-                    if exc.reason == "TIMEOUT":
-                        raise
-                    branch_unknown_reason = branch_unknown_reason or exc.reason
-                    r2, sat2 = None, False
-                if sat2:
-                    return r2, True
+                    if inactive_bounds_conflict:
+                        r2, sat2 = None, False
+                    else:
+                        try:
+                            r2, sat2 = _rec(bounds2, depth + 1, row_defs2)
+                        except SolverLimitReached as exc:
+                            if exc.reason == "TIMEOUT":
+                                raise
+                            branch_unknown_reason = branch_unknown_reason or exc.reason
+                            r2, sat2 = None, False
+                    if sat2:
+                        return r2, True
 
-                if branch_unknown_reason is not None:
-                    return _limit(branch_unknown_reason)
-                return None, False
+                    if branch_unknown_reason is not None:
+                        return _limit(branch_unknown_reason)
+                    return None, False
+                finally:
+                    if split_logger is not None and split_id is not None:
+                        # 두 번째 재귀 호출 이후(또는 조기 반환/예외 시) count 감소.
+                        split_logger.end(split_id, branch_x, layer, index)
 
         if depth >= max_recursion:
             return _limit("RELUPLEX_RECURSION_LIMIT")

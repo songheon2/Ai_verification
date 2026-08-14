@@ -104,7 +104,7 @@ def encode_nn(
             else:
                 # 은닉층: ReLU 제약 추가
                 h = gen.fresh(f"h{li+1}_{j}")
-                constraints.append(ReLUProp(x=z, y=h))
+                constraints.append(ReLUProp(x=z, y=h, layer=li + 1, index=j))
                 layer_out.append(h)
 
         aux[f"L{li+1}"] = layer_out

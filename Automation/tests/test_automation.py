@@ -13,7 +13,12 @@ REPO_DIR = PROJECT_DIR.parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from Automation.AutoVerify import forward_model, run_verification, run_vnnlib_verification
+from Automation.AutoVerify import (
+    build_parser,
+    forward_model,
+    run_verification,
+    run_vnnlib_verification,
+)
 from DPLL import AndProp, InequProp, Prop, parse_prop
 from DPLL_T import dpll_t_detailed
 from GenericNNEncoding import load_nn_model
@@ -183,6 +188,19 @@ class SolverStatusTests(unittest.TestCase):
             timeout_seconds=1.0,
         )
         self.assertEqual(result.status, SolverStatus.SAT)
+
+    def test_negated_relu_is_unknown_instead_of_false_unsat(self):
+        # x=1, y=0은 y != ReLU(x)를 만족하므로 이 식은 SAT이다. negated
+        # ReLU를 지원하지 않는 동안에는 적어도 UNSAT으로 오판하면 안 된다.
+        result = dpll_t_detailed(
+            parse_prop(
+                "not relu(x,y) and ineq(1,x,1) and ineq(-1,y,0)"
+            ),
+            max_rounds=10,
+            timeout_seconds=1.0,
+        )
+        self.assertEqual(result.status, SolverStatus.UNKNOWN)
+        self.assertEqual(result.reason, "NEGATED_RELU_UNSUPPORTED")
 
     def test_dpll_t_round_limit_is_unknown(self):
         result = dpll_t_detailed(
@@ -438,6 +456,215 @@ class AutomationIntegrationTests(unittest.TestCase):
         self.assertEqual(
             result["counterexample"]["input_declared_space"], [0.0, 0.0]
         )
+
+    def test_visualization_cli_uses_combined_mode_and_rejects_removed_flags(self):
+        args = build_parser().parse_args([
+            "verify-vnnlib",
+            "--model", "model.bin",
+            "--vnnlib", "property.vnnlib",
+            "--visualization-mode", "both",
+        ])
+        self.assertEqual(args.visualization_mode, "both")
+
+        for removed_flag in ("--realtime-visualization", "--feedback-visualization"):
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args([
+                    "verify-vnnlib",
+                    "--model", "model.bin",
+                    "--vnnlib", "property.vnnlib",
+                    removed_flag,
+                ])
+
+    def test_visualization_cli_accepts_relu_only_realtime_panel(self):
+        args = build_parser().parse_args([
+            "verify-vnnlib",
+            "--model", "model.bin",
+            "--vnnlib", "property.vnnlib",
+            "--visualization-mode", "realtime",
+            "--realtime-panels", "relu",
+            "--realtime-refresh-ms", "50",
+            "--realtime-playback-ms", "750",
+        ])
+        self.assertEqual(args.realtime_panels, ["relu"])
+        self.assertEqual(args.realtime_refresh_ms, 50)
+        self.assertEqual(args.realtime_playback_ms, 750)
+
+    def test_realtime_frame_is_reset_before_model_encoding(self):
+        import Automation.AutoVerify as auto_verify
+        import tempfile
+
+        text = """
+        (declare-const X_0 Real)
+        (declare-const X_1 Real)
+        (declare-const Y_0 Real)
+        (assert (= X_0 0))
+        (assert (= X_1 0))
+        (assert (<= Y_0 0))
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            property_path = root / "xor_unsafe.vnnlib"
+            solver_log = root / "solver.jsonl"
+            solver_realtime = root / "solver_realtime.png"
+            dpll_image = root / "solver_realtime_dpll_theory.png"
+            property_path.write_text(text, encoding="utf-8")
+            solver_log.write_text('{"event":"old-run"}\n', encoding="utf-8")
+            dpll_image.write_bytes(b"old-run-image")
+
+            observed = {}
+            original_encode_nn = auto_verify.encode_nn
+
+            def observe_initial_frame(*args, **kwargs):
+                observed["log"] = solver_log.read_text(encoding="utf-8")
+                observed["image"] = dpll_image.read_bytes()
+                return original_encode_nn(*args, **kwargs)
+
+            with patch(
+                "Automation.AutoVerify.encode_nn",
+                side_effect=observe_initial_frame,
+            ):
+                run_vnnlib_verification(
+                    str(self.model_path),
+                    str(property_path),
+                    visualization_mode="realtime",
+                    realtime_panels=["dpll-theory"],
+                    solver_progress_log_output=str(solver_log),
+                    solver_realtime_output=str(solver_realtime),
+                )
+
+            self.assertEqual(observed["log"], "")
+            self.assertTrue(observed["image"].startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertNotEqual(observed["image"], b"old-run-image")
+
+    def test_both_mode_writes_realtime_and_feedback_outputs(self):
+        import tempfile
+
+        text = """
+        (declare-const X_0 Real)
+        (declare-const X_1 Real)
+        (declare-const Y_0 Real)
+        (assert (= X_0 0))
+        (assert (= X_1 0))
+        (assert (<= Y_0 0))
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            property_path = root / "xor_unsafe.vnnlib"
+            realtime_log = root / "realtime.jsonl"
+            realtime_image = root / "realtime.png"
+            feedback_image = root / "feedback.png"
+            solver_log = root / "solver.jsonl"
+            solver_realtime = root / "solver_realtime.png"
+            solver_feedback = root / "solver_feedback.png"
+            property_path.write_text(text, encoding="utf-8")
+
+            with patch(
+                "visualization.UnifiedRealtimeDashboard.webbrowser.open"
+            ) as open_browser:
+                result = run_vnnlib_verification(
+                    str(self.model_path),
+                    str(property_path),
+                    realtime_visualization=True,
+                    feedback_visualization=True,
+                    open_realtime_view=True,
+                    realtime_panels=["relu"],
+                    realtime_log_output=str(realtime_log),
+                    realtime_split_output=str(realtime_image),
+                    split_heatmap_output=str(feedback_image),
+                    solver_progress_log_output=str(solver_log),
+                    solver_realtime_output=str(solver_realtime),
+                    solver_feedback_output=str(solver_feedback),
+                )
+
+            self.assertEqual(result["visualization"]["mode"], "both")
+            self.assertTrue(realtime_log.exists())
+            self.assertTrue(realtime_image.exists())
+            self.assertTrue(feedback_image.exists())
+            self.assertFalse(solver_log.exists())
+            for name in ("dpll_theory", "simplex"):
+                self.assertFalse(
+                    solver_realtime.with_name(
+                        f"{solver_realtime.stem}_{name}{solver_realtime.suffix}"
+                    ).exists()
+                )
+            self.assertTrue(realtime_image.with_suffix(".html").exists())
+            self.assertFalse(solver_realtime.with_suffix(".html").exists())
+            for name in ("dpll_theory", "simplex"):
+                self.assertFalse(
+                    solver_realtime.with_name(
+                        f"{solver_realtime.stem}_{name}.html"
+                    ).exists()
+                )
+                self.assertFalse(
+                    solver_feedback.with_name(
+                        f"{solver_feedback.stem}_{name}{solver_feedback.suffix}"
+                    ).exists()
+                )
+            self.assertFalse(solver_feedback.with_suffix(".json").exists())
+            self.assertIn("realtime", result["visualization"])
+            self.assertEqual(
+                set(result["visualization"]["realtime"]["live_view_outputs"]),
+                {"relu_split"},
+            )
+            self.assertEqual(
+                result["visualization"]["realtime"]["opened_panels"], ["relu"]
+            )
+            open_browser.assert_called_once_with(
+                realtime_image.with_suffix(".html").resolve().as_uri()
+            )
+            self.assertIn("feedback", result["visualization"])
+            self.assertIn("split_summary", result)
+            self.assertNotIn("solver_progress_summary", result)
+
+    def test_relu_only_realtime_skips_solver_progress_visualization(self):
+        import tempfile
+
+        text = """
+        (declare-const X_0 Real)
+        (declare-const X_1 Real)
+        (declare-const Y_0 Real)
+        (assert (= X_0 0))
+        (assert (= X_1 0))
+        (assert (<= Y_0 0))
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            property_path = root / "xor_unsafe.vnnlib"
+            realtime_log = root / "realtime.jsonl"
+            realtime_image = root / "realtime.png"
+            solver_log = root / "solver.jsonl"
+            solver_realtime = root / "solver_realtime.png"
+            property_path.write_text(text, encoding="utf-8")
+
+            result = run_vnnlib_verification(
+                str(self.model_path),
+                str(property_path),
+                realtime_visualization=True,
+                realtime_panels=["relu"],
+                realtime_log_output=str(realtime_log),
+                realtime_split_output=str(realtime_image),
+                solver_progress_log_output=str(solver_log),
+                solver_realtime_output=str(solver_realtime),
+            )
+
+            self.assertTrue(realtime_log.exists())
+            self.assertTrue(realtime_image.exists())
+            self.assertTrue(realtime_image.with_suffix(".html").exists())
+            self.assertFalse(solver_log.exists())
+            for name in ("dpll_theory", "simplex"):
+                self.assertFalse(
+                    solver_realtime.with_name(
+                        f"{solver_realtime.stem}_{name}{solver_realtime.suffix}"
+                    ).exists()
+                )
+                self.assertFalse(
+                    solver_realtime.with_name(
+                        f"{solver_realtime.stem}_{name}.html"
+                    ).exists()
+                )
+            realtime_result = result["visualization"]["realtime"]
+            self.assertEqual(set(realtime_result["live_view_outputs"]), {"relu_split"})
+            self.assertNotIn("solver_progress", realtime_result)
 
 
 if __name__ == "__main__":

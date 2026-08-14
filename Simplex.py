@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from Automation.SolverStatus import SolverLimitReached, check_deadline
 
 
@@ -259,6 +259,8 @@ def simplex(
     *,
     deadline: Optional[float] = None,
     report_unknown: bool = False,
+    progress: Optional[Any] = None,
+    progress_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     Simplex 알고리즘 (Algorithm 3 스타일).
@@ -285,9 +287,36 @@ def simplex(
         (None, False)       — UNSAT
     """
     EPS = 1e-9
+    context = dict(progress_context or {})
+    call_id = None
+    iteration_count = 0
+    pivot_count = 0
+    if progress is not None:
+        call_id = progress.simplex_start(
+            round_index=context.get("round_index"),
+            depth=context.get("depth"),
+            origin=str(context.get("origin", "simplex")),
+            theory_atom_ids=context.get("theory_atom_ids", []),
+            row_count=len(tableau.rows),
+            variable_count=len(tableau.assign),
+        )
+
+    def _finish(result: str) -> None:
+        if progress is not None and call_id is not None:
+            progress.simplex_end(
+                call_id,
+                result,
+                iterations=iteration_count,
+                pivots=pivot_count,
+            )
 
     for iteration in range(max_iter):
-        check_deadline(deadline)
+        iteration_count = iteration + 1
+        try:
+            check_deadline(deadline)
+        except SolverLimitReached:
+            _finish("TIMEOUT")
+            raise
         if debug:
             _print_tableau(tableau, iteration)
 
@@ -308,6 +337,9 @@ def simplex(
 
         if violated_row is None:
             # 모든 기저변수가 범위 안 → SAT
+            if progress is not None and call_id is not None:
+                progress.simplex_iteration(call_id, iteration, violated_var=None)
+            _finish("SAT")
             return (dict(tableau.assign), True)
 
         # 위반한 기저 변수 xj와 피벗할 비기저변수 xi 탐색
@@ -315,6 +347,15 @@ def simplex(
         val = tableau.assign[xj]
         b_xj = tableau.bounds[xj]
         going_up = val < b_xj.lower  # True: xj를 올려야 함  False: upper보다 크다는 뜻 → xj를 내려야 함
+        if progress is not None and call_id is not None:
+            progress.simplex_iteration(
+                call_id,
+                iteration,
+                violated_var=xj,
+                value=val,
+                lower=b_xj.lower,
+                upper=b_xj.upper,
+            )
 
         # ── 피벗 가능한 비기저변수 xi 탐색 (Bland's rule: 인덱스 최소) ──
         pivot_xi = None
@@ -342,9 +383,19 @@ def simplex(
 
         if pivot_xi is None:
             # 피벗 가능한 변수 없음 → UNSAT
+            _finish("UNSAT")
             return (None, False)
 
         # ── 피벗 수행 ──
+        if progress is not None and call_id is not None:
+            progress.simplex_pivot(
+                call_id,
+                iteration,
+                entering=pivot_xi,
+                leaving=xj,
+                row=xj,
+            )
+        pivot_count += 1
         # 먼저 xj를 경계로 이동시키는 delta 계산
         a = violated_row.coeffs[pivot_xi]
         target = b_xj.lower if going_up else b_xj.upper
@@ -364,6 +415,7 @@ def simplex(
             tableau.assign[row.basic_var] = _compute_basic(tableau, row)
 
     # 반복 제한 초과는 논리적 UNSAT이 아니라 결론을 내리지 못한 UNKNOWN이다.
+    _finish("ITERATION_LIMIT")
     if report_unknown:
         raise SolverLimitReached("SIMPLEX_ITERATION_LIMIT")
     return (None, False)

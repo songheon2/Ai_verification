@@ -156,7 +156,16 @@ AI_VERIFICATION_DIR = Path(__file__).resolve().parent.parent
 if str(AI_VERIFICATION_DIR) not in sys.path:
     sys.path.insert(0, str(AI_VERIFICATION_DIR))
 
-from DPLL import AndProp, NotProp
+from DPLL import (
+    AndProp,
+    FalseProp,
+    ImplProp,
+    InequProp,
+    NotProp,
+    OrProp,
+    Prop,
+    TrueProp,
+)
 from DPLL_T import dpll_t_detailed
 from GenericNNEncoding import NNModel, encode_nn
 from Automation.ModelInspector import (
@@ -302,6 +311,191 @@ def _center_expected(
     model_center = transform_values_to_model_space(center, input_spec)
     outputs = forward_model(model, model_center)
     return infer_expected_from_outputs(output_spec, outputs), outputs
+
+
+class PropEvalUnsupported(Exception):
+    """반례 검증기가 다룰 줄 모르는 Prop 노드를 만났다."""
+
+
+def _evaluate_prop(prop: Prop, assignment: Mapping[str, float], tol: float = 0.0) -> bool:
+    """구체적인 할당에서 Prop이 참인지 평가한다.
+
+    tol > 0이면 각 부등식을 그만큼 느슨하게 본다. NotProp/ImplProp의 전건
+    아래에서는 완화 방향이 뒤집히므로 -tol을 넘긴다 (느슨하게 본 것이 부정을
+    통과하면서 오히려 엄격해지는 것을 막는다).
+    """
+
+    if isinstance(prop, TrueProp):
+        return True
+    if isinstance(prop, FalseProp):
+        return False
+    if isinstance(prop, AndProp):
+        return _evaluate_prop(prop.p, assignment, tol) and _evaluate_prop(
+            prop.q, assignment, tol
+        )
+    if isinstance(prop, OrProp):
+        return _evaluate_prop(prop.p, assignment, tol) or _evaluate_prop(
+            prop.q, assignment, tol
+        )
+    if isinstance(prop, NotProp):
+        return not _evaluate_prop(prop.p, assignment, -tol)
+    if isinstance(prop, ImplProp):
+        return (not _evaluate_prop(prop.p, assignment, -tol)) or _evaluate_prop(
+            prop.q, assignment, tol
+        )
+    if isinstance(prop, InequProp):
+        total = 0.0
+        for var, coeff in prop.coeffs:
+            if var not in assignment:
+                raise PropEvalUnsupported(f"할당에 없는 변수: {var}")
+            total += float(coeff) * float(assignment[var])
+        return total >= float(prop.b) - tol
+    raise PropEvalUnsupported(type(prop).__name__)
+
+
+def _input_box_from_formula(
+    formula: Prop, input_vars: Sequence[str]
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """최상위 conjunction에서 단일 변수 부등식만 모아 입력 박스를 복원한다.
+
+    Or/Not 아래의 제약은 무조건 성립하지 않으므로 AndProp만 타고 내려간다.
+    복원하지 못한 변수는 (-inf, inf)로 남고, 클리핑에서 그냥 통과된다.
+    """
+
+    lower = {name: float("-inf") for name in input_vars}
+    upper = {name: float("inf") for name in input_vars}
+    stack: List[Prop] = [formula]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, AndProp):
+            stack.append(node.p)
+            stack.append(node.q)
+            continue
+        if not isinstance(node, InequProp):
+            continue
+        items = list(node.coeffs)
+        if len(items) != 1:
+            continue
+        var, coeff = items[0]
+        if var not in lower or float(coeff) == 0.0:
+            continue
+        bound = float(node.b) / float(coeff)
+        if float(coeff) > 0:
+            lower[var] = max(lower[var], bound)
+        else:
+            upper[var] = min(upper[var], bound)
+    return lower, upper
+
+
+def _clip_to_box(
+    values: Sequence[float],
+    input_vars: Sequence[str],
+    box: Tuple[Mapping[str, float], Mapping[str, float]],
+) -> List[float]:
+    lower, upper = box
+    return [
+        min(upper.get(name, float("inf")), max(lower.get(name, float("-inf")), float(v)))
+        for name, v in zip(input_vars, values)
+    ]
+
+
+def _snap_near_integers(values: Sequence[float], tol: float) -> List[float]:
+    """정수에서 tol 이내인 좌표만 그 정수로 붙인다 (나머지는 그대로)."""
+
+    snapped = []
+    for v in values:
+        nearest = float(round(float(v)))
+        snapped.append(nearest if abs(float(v) - nearest) <= tol else float(v))
+    return snapped
+
+
+def _validate_counterexample(
+    formula: Prop,
+    model: NNModel,
+    input_vars: Sequence[str],
+    output_vars: Sequence[str],
+    model_inputs: Sequence[float],
+    *,
+    snap_tol: float = 1e-6,
+    accept_tol: float = 1e-6,
+) -> Dict[str, Any]:
+    """반례 후보를 VNNLIB 속성에 직접 대입해 검증하고, 실패하면 복구를 시도한다.
+
+    솔버가 내놓는 해는 '신경망을 인코딩한 선형 제약 시스템 + 허용오차'를 만족할
+    뿐이라, 입력만 뽑아 신경망을 다시 돌리면 속성을 어길 수 있다 (특히 반례가
+    경계에 딱 붙어 margin이 0인 경우 1 ULP 차이로 뒤집힌다). 그래서 여기서
+    forward 결과로 속성을 다시 검사하고, 실패하면 아래 후보들을 차례로 시도한다.
+    모든 후보는 채택 전에 반드시 검증을 통과해야 하므로, 공격적인 후보(정수
+    반올림 등)를 넣어도 안전하다.
+
+    반환 dict의 status:
+        valid          — 엄격하게(tol=0) 속성을 만족. repair가 어떤 후보였는지 함께 보고
+        tolerance_only — accept_tol 안에서만 만족. 반례로 쓰되 경고를 남길 것
+        invalid        — 어떤 후보도 만족 못 함. COUNTEREXAMPLE로 보고하면 안 된다
+        unavailable    — 평가할 수 없는 Prop 노드가 있어 검증 자체를 못 함
+    """
+
+    try:
+        box = _input_box_from_formula(formula, input_vars)
+    except PropEvalUnsupported as exc:
+        return {"status": "unavailable", "detail": str(exc)}
+
+    base = [float(v) for v in model_inputs]
+    candidates: List[Tuple[str, List[float]]] = [("as_is", base)]
+
+    def _add(label: str, values: List[float]) -> None:
+        if all(a == b for a, b in zip(values, base)) and label != "as_is":
+            return
+        for _, seen in candidates:
+            if all(a == b for a, b in zip(values, seen)):
+                return
+        candidates.append((label, values))
+
+    _add("clip", _clip_to_box(base, input_vars, box))
+    _add("snap", _clip_to_box(_snap_near_integers(base, snap_tol), input_vars, box))
+    _add(
+        "round",
+        _clip_to_box([float(round(v)) for v in base], input_vars, box),
+    )
+
+    evaluated: List[Tuple[str, List[float], List[float]]] = []
+    for label, values in candidates:
+        outputs = forward_model(model, values)
+        evaluated.append((label, values, outputs))
+
+    def _holds(values: Sequence[float], outputs: Sequence[float], tol: float) -> bool:
+        assignment: Dict[str, float] = {}
+        assignment.update({name: float(v) for name, v in zip(input_vars, values)})
+        assignment.update({name: float(v) for name, v in zip(output_vars, outputs)})
+        return _evaluate_prop(formula, assignment, tol)
+
+    try:
+        for label, values, outputs in evaluated:
+            if _holds(values, outputs, 0.0):
+                return {
+                    "status": "valid",
+                    "repair": label,
+                    "inputs": values,
+                    "outputs": outputs,
+                    "candidates_tried": [c[0] for c in evaluated],
+                }
+        for label, values, outputs in evaluated:
+            if _holds(values, outputs, accept_tol):
+                return {
+                    "status": "tolerance_only",
+                    "repair": label,
+                    "inputs": values,
+                    "outputs": outputs,
+                    "accept_tol": accept_tol,
+                    "candidates_tried": [c[0] for c in evaluated],
+                }
+    except PropEvalUnsupported as exc:
+        return {"status": "unavailable", "detail": str(exc)}
+
+    return {
+        "status": "invalid",
+        "candidates_tried": [c[0] for c in evaluated],
+    }
 
 
 def _counterexample(
@@ -458,14 +652,54 @@ def run_verification(
                 "simplex_max_iter": simplex_max_iter,
             }
             if solver_result.status == SolverStatus.SAT:
-                result["status"] = "COUNTEREXAMPLE"
-                result["counterexample"] = _counterexample(
+                counterexample = _counterexample(
                     solver_result.model or {},
                     input_vars,
                     output_vars,
                     input_spec,
                     model,
                 )
+                # 반례가 되려면 "입력 영역 안에 있으면서 스펙을 어겨야" 한다.
+                # nn_property는 인코딩이므로 검증에서는 forward_model로 대체한다.
+                check_formula = AndProp(precondition, NotProp(postcondition))
+                model_inputs = counterexample.get("input_model_space") or []
+                if model_inputs and all(v is not None for v in model_inputs):
+                    validation = _validate_counterexample(
+                        check_formula, model, input_vars, output_vars, model_inputs
+                    )
+                else:
+                    validation = {
+                        "status": "unavailable",
+                        "detail": "입력 할당이 불완전합니다",
+                    }
+                counterexample["validation"] = validation
+
+                if validation["status"] in {"valid", "tolerance_only"}:
+                    counterexample["input_model_space"] = validation["inputs"]
+                    counterexample["input_declared_space"] = _declared_space_values(
+                        validation["inputs"], input_spec
+                    )
+                    counterexample["recomputed_outputs"] = validation["outputs"]
+                    result["status"] = "COUNTEREXAMPLE"
+                    if validation.get("repair") != "as_is":
+                        result["note"] = (
+                            "솔버가 내놓은 점은 조건을 만족하지 않아 "
+                            f"'{validation['repair']}' 복구를 적용한 뒤 검증했습니다."
+                        )
+                elif validation["status"] == "unavailable":
+                    result["status"] = "COUNTEREXAMPLE"
+                    result["note"] = (
+                        "반례를 검증하지 못했습니다: "
+                        f"{validation.get('detail')}. 확인되지 않은 값입니다."
+                    )
+                else:
+                    result["status"] = "UNKNOWN"
+                    result["solver"]["reason"] = "COUNTEREXAMPLE_UNVALIDATED"
+                    result["note"] = (
+                        "솔버는 SAT을 반환했지만 그 입력으로 신경망을 다시 돌리면 "
+                        "조건을 만족하지 않습니다. 반례로 인정하지 않고 UNKNOWN으로 낮춥니다."
+                    )
+                result["counterexample"] = counterexample
             elif solver_result.status == SolverStatus.UNSAT:
                 result["status"] = "VERIFIED"
                 result["note"] = "반례 탐색식이 UNSAT으로 확정되었습니다."
@@ -915,14 +1149,74 @@ def run_vnnlib_verification(
         result["solver_progress_summary"] = solver_feedback["counts"]
 
     if solver_result.status == SolverStatus.SAT:
-        result["status"] = "COUNTEREXAMPLE"
-        result["counterexample"] = _counterexample(
+        input_spec = _vnnlib_input_spec(info)
+        counterexample = _counterexample(
             solver_result.model or {},
             input_vars,
             output_vars,
-            _vnnlib_input_spec(info),
+            input_spec,
             model,
         )
+
+        # 솔버 내부 Y와 실제 forward 결과의 괴리는 "이 반례를 믿지 말라"는 신호다.
+        # (솔버의 해는 인코딩 + 허용오차를 만족할 뿐 신경망 위의 점이 아닐 수 있다)
+        solver_outputs = counterexample.get("solver_outputs") or []
+        recomputed = counterexample.get("recomputed_outputs") or []
+        if solver_outputs and recomputed and len(solver_outputs) == len(recomputed):
+            counterexample["solver_vs_recomputed_max_diff"] = max(
+                abs(float(a) - float(b))
+                for a, b in zip(solver_outputs, recomputed)
+                if a is not None and b is not None
+            )
+
+        model_inputs = counterexample.get("input_model_space") or []
+        if all(v is not None for v in model_inputs) and model_inputs:
+            validation = _validate_counterexample(
+                document.formula, model, input_vars, output_vars, model_inputs
+            )
+        else:
+            validation = {"status": "unavailable", "detail": "입력 할당이 불완전합니다"}
+
+        counterexample["validation"] = validation
+        status = validation["status"]
+
+        if status in {"valid", "tolerance_only"}:
+            # 복구된 점이 원래 점보다 나으면 그것을 반례로 보고한다.
+            repaired_inputs = validation["inputs"]
+            counterexample["input_model_space"] = repaired_inputs
+            counterexample["input_declared_space"] = _declared_space_values(
+                repaired_inputs, input_spec
+            )
+            counterexample["recomputed_outputs"] = validation["outputs"]
+            result["status"] = "COUNTEREXAMPLE"
+            if validation.get("repair") != "as_is":
+                result["note"] = (
+                    "솔버가 내놓은 점은 속성을 만족하지 않아 "
+                    f"'{validation['repair']}' 복구를 적용한 뒤 검증했습니다."
+                )
+            if status == "tolerance_only":
+                result["note"] = (
+                    (result.get("note", "") + " ").strip()
+                    + f" 이 반례는 허용오차 {validation['accept_tol']:g} 안에서만 "
+                    "속성을 만족합니다 — 엄격한 판정에서는 반례로 인정되지 않을 수 있습니다."
+                ).strip()
+        elif status == "unavailable":
+            result["status"] = "COUNTEREXAMPLE"
+            result["note"] = (
+                "반례를 검증하지 못했습니다(속성을 평가할 수 없음): "
+                f"{validation.get('detail')}. 이 반례는 확인되지 않은 값입니다."
+            )
+        else:
+            # 어떤 복구로도 속성을 만족시키지 못했다 — 반례라고 보고하면 안 된다.
+            result["status"] = "UNKNOWN"
+            result["solver"]["reason"] = "COUNTEREXAMPLE_UNVALIDATED"
+            result["note"] = (
+                "솔버는 SAT을 반환했지만, 그 입력으로 신경망을 다시 돌리면 VNNLIB "
+                "속성을 만족하지 않습니다(시도한 복구: "
+                f"{', '.join(validation.get('candidates_tried', []))}). "
+                "반례로 인정하지 않고 UNKNOWN으로 낮춥니다."
+            )
+        result["counterexample"] = counterexample
     elif solver_result.status == SolverStatus.UNSAT:
         result["status"] = "VERIFIED"
         result["note"] = "VNNLIB unsafe 영역과 신경망의 교집합이 UNSAT입니다."
@@ -956,6 +1250,11 @@ def _print_verification(result: Mapping[str, Any]) -> None:
         if counterexample:
             print(f"  input : {counterexample['input_declared_space']}")
             print(f"  output: {counterexample['recomputed_outputs']}")
+            validation = counterexample.get("validation") or {}
+            if validation:
+                repair = validation.get("repair")
+                suffix = f" (복구: {repair})" if repair and repair != "as_is" else ""
+                print(f"  검증  : {validation.get('status')}{suffix}")
         if case.get("note"):
             print(f"  note  : {case['note']}")
         solver = case.get("solver")
@@ -977,6 +1276,20 @@ def _print_vnnlib_verification(result: Mapping[str, Any]) -> None:
     if counterexample:
         print(f"  input : {counterexample['input_declared_space']}")
         print(f"  output: {counterexample['recomputed_outputs']}")
+        validation = counterexample.get("validation") or {}
+        if validation:
+            label = {
+                "valid": "속성 만족 확인됨",
+                "tolerance_only": "허용오차 안에서만 만족 (주의)",
+                "invalid": "속성 불만족 — 반례 아님",
+                "unavailable": "검증 불가",
+            }.get(validation.get("status"), validation.get("status"))
+            repair = validation.get("repair")
+            suffix = f" (복구: {repair})" if repair and repair != "as_is" else ""
+            print(f"  검증  : {label}{suffix}")
+        diff = counterexample.get("solver_vs_recomputed_max_diff")
+        if diff is not None:
+            print(f"  solver Y vs forward Y 최대 차이: {diff:.3e}")
     if result.get("note"):
         print(f"  note  : {result['note']}")
     solver = result.get("solver")

@@ -535,6 +535,7 @@ def run_verification(
     debug: bool = False,
     timeout_seconds_override: Optional[float] = None,
     simplex_max_iter_override: Optional[int] = None,
+    max_recursion_override: Optional[int] = None,
     profile_stages: bool = False,
 ) -> Dict[str, Any]:
     model, info = load_model_for_verification(model_path)
@@ -576,6 +577,13 @@ def run_verification(
     )
     if simplex_max_iter <= 0:
         raise ValueError("solver.simplex_max_iter must be positive")
+    max_recursion = int(
+        max_recursion_override
+        if max_recursion_override is not None
+        else solver_spec.get("max_recursion", 50)
+    )
+    if max_recursion <= 0:
+        raise ValueError("solver.max_recursion must be positive")
     safe_relu_limit = int(solver_spec.get("max_relus_without_override", 50))
     if (
         not dry_run
@@ -643,6 +651,7 @@ def run_verification(
                 debug=debug,
                 timeout_seconds=timeout_seconds,
                 simplex_max_iter=simplex_max_iter,
+                max_recursion=max_recursion,
                 profile_stages=profile_stages,
             )
             result["solver"] = {
@@ -650,6 +659,7 @@ def run_verification(
                 "max_rounds": max_rounds,
                 "timeout_seconds": timeout_seconds,
                 "simplex_max_iter": simplex_max_iter,
+                "max_recursion": max_recursion,
             }
             if solver_result.status == SolverStatus.SAT:
                 counterexample = _counterexample(
@@ -787,6 +797,7 @@ def run_vnnlib_verification(
     strict_epsilon: float = 1e-6,
     timeout_seconds: Optional[float] = 300.0,
     simplex_max_iter: int = 10000,
+    max_recursion: int = 50,
     trace: Optional[SolveTrace] = None,
     visualization_mode: str = "off",
     realtime_visualization: bool = False,
@@ -881,6 +892,8 @@ def run_vnnlib_verification(
         raise ValueError("max_rounds must be positive")
     if timeout_seconds is not None and timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive or null")
+    if max_recursion <= 0:
+        raise ValueError("max_recursion must be positive")
     if simplex_max_iter <= 0:
         raise ValueError("simplex_max_iter must be positive")
     if max_relus_without_override < 0:
@@ -1061,6 +1074,7 @@ def run_vnnlib_verification(
         timeout_seconds=timeout_seconds,
         trace=trace,
         simplex_max_iter=simplex_max_iter,
+        max_recursion=max_recursion,
         profile_stages=profile_stages,
         split_mode="realtime" if realtime_relu_enabled else "off",
         split_log_path=realtime_log_output,
@@ -1074,6 +1088,7 @@ def run_vnnlib_verification(
         "max_rounds": max_rounds,
         "timeout_seconds": timeout_seconds,
         "simplex_max_iter": simplex_max_iter,
+        "max_recursion": max_recursion,
     }
     if progress_visualizer is not None:
         progress_visualizer.flush()
@@ -1263,6 +1278,13 @@ def _print_verification(result: Mapping[str, Any]) -> None:
                 f"  solver: {solver['status']} | reason={solver['reason']} | "
                 f"rounds={solver['rounds']} | elapsed={solver['elapsed_seconds']:.3f}s"
             )
+            hits = (solver.get("theory_stats") or {}).get("RELUPLEX_RECURSION_LIMIT", 0)
+            if hits:
+                print(
+                    f"  depth : ReLU 분기 깊이 상한(max_recursion="
+                    f"{solver.get('max_recursion')})에 {hits}번 막혔습니다 "
+                    "- --max-recursion을 올려보세요."
+                )
 
 
 def _print_vnnlib_verification(result: Mapping[str, Any]) -> None:
@@ -1298,6 +1320,13 @@ def _print_vnnlib_verification(result: Mapping[str, Any]) -> None:
             f"  solver: {solver['status']} | reason={solver['reason']} | "
             f"rounds={solver['rounds']} | elapsed={solver['elapsed_seconds']:.3f}s"
         )
+        hits = (solver.get("theory_stats") or {}).get("RELUPLEX_RECURSION_LIMIT", 0)
+        if hits:
+            print(
+                f"  depth : ReLU 분기 깊이 상한(max_recursion="
+                f"{solver.get('max_recursion')})에 {hits}번 막혔습니다 "
+                "- --max-recursion을 올려보세요."
+            )
     split_summary = result.get("split_summary")
     if split_summary:
         print(
@@ -1370,6 +1399,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="encode_nn/tseitin_cnf/dpll() 각 단계의 소요시간을 [profile] 접두어로 출력 "
              "(어느 단계에서 멈춰있는지 진단할 때 켤 것, 평소엔 꺼둘 것)",
     )
+    verify_parser.add_argument(
+        "--max-recursion",
+        type=int,
+        help="override solver.max_recursion from the spec (기본 50). 은닉 ReLU가 이 값보다 "
+             "많으면 탐색이 끝까지 못 내려가 UNKNOWN이 된다 - recursion_limit_hits 참고",
+    )
     verify_parser.add_argument("--json-output", help="write detailed results as JSON")
 
     vnnlib_parser = subparsers.add_parser(
@@ -1393,6 +1428,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reluplex 내부 Simplex 호출당 반복 상한. SIMPLEX_ITERATION_LIMIT으로 "
              "UNKNOWN이 자주 나면 크게 올릴 것 (예: 1000000) - 이때 --timeout-seconds도 "
              "넉넉히 잡을 것, 실질적인 안전장치는 timeout이다.",
+    )
+    vnnlib_parser.add_argument(
+        "--max-recursion", type=int, default=50,
+        help="Reluplex ReLU 분기 재귀 깊이 상한 (기본 50). 한 경로에서 split은 매번 다른 "
+             "뉴런을 고정하므로 은닉 ReLU 개수보다 크게 잡을 필요는 없다. 은닉 ReLU가 이 "
+             "값보다 많으면 UNKNOWN이 된다 - 결과의 recursion_limit_hits가 0이 아니면 올릴 것",
     )
     vnnlib_parser.add_argument("--json-output")
     vnnlib_parser.add_argument(
@@ -1488,6 +1529,7 @@ def main() -> int:
                 strict_epsilon=args.strict_epsilon,
                 timeout_seconds=args.timeout_seconds,
                 simplex_max_iter=args.simplex_max_iter,
+                max_recursion=args.max_recursion,
                 visualization_mode=args.visualization_mode,
                 open_realtime_view=args.visualization_mode in ("realtime", "both"),
                 realtime_panels=args.realtime_panels,
@@ -1520,6 +1562,7 @@ def main() -> int:
             debug=args.debug,
             timeout_seconds_override=args.timeout_seconds,
             simplex_max_iter_override=args.simplex_max_iter,
+            max_recursion_override=args.max_recursion,
             profile_stages=args.profile_stages,
         )
         _print_verification(result)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from time import monotonic
 from typing import Any, Dict, Optional
@@ -23,6 +23,9 @@ class SolverResult:
     reason: Optional[str] = None
     rounds: int = 0
     elapsed_seconds: float = 0.0
+    # 이론 솔버가 남긴 부가 정보 (예: recursion_limit_hits).
+    # UNKNOWN 사유가 TIMEOUT으로 뭉뚱그려질 때 진짜 병목을 구분하는 용도.
+    theory_stats: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -30,6 +33,7 @@ class SolverResult:
             "reason": self.reason,
             "rounds": self.rounds,
             "elapsed_seconds": self.elapsed_seconds,
+            "theory_stats": dict(self.theory_stats),
         }
 
 

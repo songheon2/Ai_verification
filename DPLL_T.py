@@ -60,6 +60,8 @@ def _dpll_t_run(
     deadline: Optional[float],
     trace: Optional[SolveTrace] = None,
     simplex_max_iter: int = 10000,
+    max_recursion: int = 50,
+    stats: Optional[Dict[str, int]] = None,
     profile_stages: bool = False,
     split_logger=None,
     progress=None,
@@ -164,6 +166,8 @@ def _dpll_t_run(
             report_unknown=True,
             trace=trace,
             simplex_max_iter=simplex_max_iter,
+            max_recursion=max_recursion,
+            stats=stats,
             split_logger=split_logger,
             relu_metadata=active_relu_metadata,
             progress=progress,
@@ -206,6 +210,7 @@ def dpll_t_detailed(
     timeout_seconds: Optional[float] = None,
     trace: Optional[SolveTrace] = None,
     simplex_max_iter: int = 10000,
+    max_recursion: int = 50,
     profile_stages: bool = False,
     split_mode: str = "off",
     split_log_path: Optional[str] = None,
@@ -269,6 +274,7 @@ def dpll_t_detailed(
         # split이 한 번도 발생하지 않아도 0개 상태의 실시간 화면을 만든다.
         split_logger.request_update()
 
+    theory_stats: Dict[str, int] = {}
     started_at = monotonic()
     deadline = (
         started_at + float(timeout_seconds)
@@ -284,6 +290,8 @@ def dpll_t_detailed(
                 deadline=deadline,
                 trace=trace,
                 simplex_max_iter=simplex_max_iter,
+                max_recursion=max_recursion,
+                stats=theory_stats,
                 profile_stages=profile_stages,
                 split_logger=split_logger,
                 progress=progress,
@@ -301,6 +309,7 @@ def dpll_t_detailed(
             reason=reason,
             rounds=rounds,
             elapsed_seconds=monotonic() - started_at,
+            theory_stats=theory_stats,
         )
         if progress is not None:
             progress.solver_end(result.status.value, result.reason, result.rounds)
@@ -317,6 +326,7 @@ def dpll_t(
     debug: bool = False,
     trace: Optional[SolveTrace] = None,
     simplex_max_iter: int = 10000,
+    max_recursion: int = 50,
     profile_stages: bool = False,
     split_mode: str = "off",
     split_log_path: Optional[str] = None,
@@ -333,6 +343,7 @@ def dpll_t(
         timeout_seconds=None,
         trace=trace,
         simplex_max_iter=simplex_max_iter,
+        max_recursion=max_recursion,
         profile_stages=profile_stages,
         split_mode=split_mode,
         split_log_path=split_log_path,

@@ -135,6 +135,7 @@ def reluplex(
     progress_context: Optional[Dict[str, Any]] = None,
     warm_start: bool = True,
     seed: Optional[int] = 0,
+    stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
 
     repair_count: Dict[Tuple[str, str], int] = {}
@@ -148,6 +149,10 @@ def reluplex(
     rng = random.Random(seed)
 
     def _limit(reason: str) -> Tuple[Optional[Dict[str, float]], bool]:
+        if stats is not None:
+            # 사유별로 몇 번 걸렸는지 센다. UNKNOWN이 TIMEOUT으로 뭉뚱그려질 때
+            # 진짜 병목(깊이 상한인지 Simplex 반복 상한인지)을 구분하는 근거가 된다.
+            stats[reason] = stats.get(reason, 0) + 1
         if report_unknown:
             raise SolverLimitReached(reason)
         return None, False

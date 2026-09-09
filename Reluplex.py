@@ -51,10 +51,18 @@ def reluplex(
     relu_metadata: Optional[Dict[Tuple[str, str], Tuple[Optional[int], Optional[int]]]] = None,
     progress: Optional[Any] = None,
     progress_context: Optional[Dict[str, Any]] = None,
+    seed: Optional[int] = 0,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
 
     repair_count: Dict[Tuple[str, str], int] = {}
     base_progress_context = dict(progress_context or {})
+    # 전역 random 대신 이 호출 전용 RNG를 쓴다. 예전에는 module-level
+    # random.shuffle을 써서 같은 입력도 실행마다 repair 방향 순서가 달라졌고,
+    # 그 결과 탐색 경로가 통째로 바뀌어 실행 시간이 3배 이상 흔들렸다
+    # (같은 인스턴스가 57초에 끝나기도 하고 200초를 넘기기도 했다).
+    # 성능 비교나 버그 재현이 불가능해지므로 기본값을 고정 시드로 둔다.
+    # seed=None을 넘기면 예전처럼 비결정적으로 동작한다.
+    rng = random.Random(seed)
 
     def _limit(reason: str) -> Tuple[Optional[Dict[str, float]], bool]:
         if report_unknown:
@@ -178,7 +186,7 @@ def reluplex(
 
             best_assign = None
             directions = [0, 1]
-            random.shuffle(directions)
+            rng.shuffle(directions)
             for direction in directions:
                 try:
                     with span(trace, "reluplex_repair", depth=depth, branch_x=x):

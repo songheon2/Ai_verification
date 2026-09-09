@@ -133,6 +133,7 @@ def reluplex(
     relu_metadata: Optional[Dict[Tuple[str, str], Tuple[Optional[int], Optional[int]]]] = None,
     progress: Optional[Any] = None,
     progress_context: Optional[Dict[str, Any]] = None,
+    branch_rule: str = "violated",
     warm_start: bool = True,
     seed: Optional[int] = 0,
     stats: Optional[Dict[str, int]] = None,
@@ -312,20 +313,40 @@ def reluplex(
             if repair_count.get(_select_violation(violations), 0) >= branch_tau:
                 break
 
-        # [누락되었던 부분 복구] 분기 변수(branch_x) 선택 로직!
-        branch_x = None
-        for pair in sorted(repair_count, key=lambda p: -repair_count[p]):
-            px, _ = pair
+        # ── 분기 변수(branch_x) 선택 ──
+        # 원래 Reluplex 규칙은 "repair로 여러 번 고쳐봤는데 계속 말썽인 ReLU를
+        # 분기하라"이다. 그런데 후보를 repair_count에 등록된 쌍 전체에서 골라서
+        # 두 가지가 어긋나 있었다:
+        #   (a) 지금 위반하지도 않는 ReLU를 분기할 수 있다 — 충돌과 무관한 곳을
+        #       쪼개므로 그 분기는 대체로 헛일이다.
+        #   (b) 반대로 지금 위반 중인데 repair에 한 번도 안 뽑힌 ReLU는 후보에서
+        #       빠진다. 그래서 쪼갤 게 남아있는데도 branch_x=None으로 포기하는
+        #       경우가 생긴다.
+        # 후보를 "지금 위반 중이면서 아직 고정되지 않은 ReLU"로 좁힌다. 순위는
+        # repair_count 내림차순(원 규칙)을 유지하되, 동점은 이름순으로 끊어
+        # 실행을 결정적으로 만든다 — 예전에는 repair_count가 금세 포화돼서
+        # sorted()가 사실상 삽입 순서(=뉴런 번호순)를 돌려주고 있었다.
+        def _splittable(px: str) -> bool:
             lo, hi = bounds_now.get(px, (float('-inf'), float('inf')))
-            if lo < 0 and hi > 0:
-                branch_x = px
-                break
+            return lo < 0 and hi > 0
 
+        branch_x = None
         relu_y = None
-        for px, py in relus:
-            if px == branch_x:
-                relu_y = py
-                break
+        if branch_rule == "violated":
+            candidates = [p for p in violations if _splittable(p[0])]
+            if candidates:
+                branch_x, relu_y = min(
+                    candidates, key=lambda p: (-repair_count.get(p, 0), p[0])
+                )
+        if branch_x is None:
+            # legacy 경로 겸 폴백: 위반 중인 후보가 하나도 못 쪼개질 때는
+            # 예전처럼 repair 이력 전체에서 고른다.
+            order = sorted(repair_count, key=lambda p: (-repair_count[p], p[0]))
+            for pair in order:
+                if _splittable(pair[0]):
+                    branch_x, relu_y = pair
+                    break
+
 
         if branch_x is not None and depth < max_recursion:
             neuron_key = None

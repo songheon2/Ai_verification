@@ -4,9 +4,18 @@
 사진의 Algorithm 4(간단화된 Reluplex)의 재귀적 구현을 따릅니다.
 """
 from typing import Any, Dict, List, Tuple, Optional
-from Simplex import build_tableau, simplex, _pivot, _compute_basic, SimplexTableau
+from Simplex import (
+    Bound,
+    Row,
+    SimplexTableau,
+    _compute_basic,
+    _pivot,
+    build_tableau,
+    simplex,
+)
 from Automation.SolverStatus import SolverLimitReached, check_deadline
 from visualization.SolveTrace import SolveTrace, span
+import copy
 import random
 import re
 
@@ -16,6 +25,79 @@ _NEURON_VAR_RE = re.compile(r"^[zh](\d+)_(\d+)(?:_.*)?$")
 def _parse_neuron_var(name: str) -> Optional[Tuple[int, int]]:
     match = _NEURON_VAR_RE.match(name)
     return (int(match.group(1)), int(match.group(2))) if match is not None else None
+
+def _express_in_nonbasic(
+    tableau: SimplexTableau, terms: Dict[str, float]
+) -> Dict[str, float]:
+    """terms(변수->계수)를 현재 비기저변수만으로 다시 표현한다.
+
+    tableau의 row 우변은 정의상 전부 비기저변수이므로, terms에 등장하는
+    기저변수를 자기 row로 한 번만 치환하면 된다.
+    """
+
+    basic_rows = {row.basic_var: row for row in tableau.rows}
+    out: Dict[str, float] = {}
+    for var, coeff in terms.items():
+        coeff = float(coeff)
+        row = basic_rows.get(var)
+        if row is None:
+            out[var] = out.get(var, 0.0) + coeff
+        else:
+            for nv, cc in row.coeffs.items():
+                out[nv] = out.get(nv, 0.0) + coeff * cc
+    return {v: c for v, c in out.items() if c != 0.0}
+
+
+def _sync_bounds(
+    tableau: SimplexTableau, bounds_now: Dict[str, Tuple[float, float]]
+) -> None:
+    """tableau의 bound를 bounds_now에 맞추고 DdM 불변식을 복구한다.
+
+    불변식은 "비기저변수는 항상 범위 안"이다. 범위가 좁아져서 비기저변수가
+    밖으로 나가면 새 경계로 당겨온다(DdM의 assertBound와 같은 처리).
+    기저변수는 건드리지 않는다 — 범위를 벗어나도 되고, 그건 simplex가
+    피벗으로 해결할 일이다. 마지막에 모든 기저변수를 row 식으로 재계산한다.
+    """
+
+    basic = {row.basic_var for row in tableau.rows}
+    for var, (lo, hi) in bounds_now.items():
+        if var not in tableau.assign:
+            continue
+        tableau.bounds[var] = Bound(lower=lo, upper=hi)
+        if var in basic:
+            continue
+        value = tableau.assign[var]
+        if value < lo:
+            tableau.assign[var] = lo
+        elif value > hi:
+            tableau.assign[var] = hi
+    for row in tableau.rows:
+        tableau.assign[row.basic_var] = _compute_basic(tableau, row)
+
+
+def _child_tableau(
+    parent: SimplexTableau,
+    new_rows: List[Tuple[str, Dict[str, float], Tuple[float, float]]],
+) -> SimplexTableau:
+    """부모의 (이미 푼) tableau를 복사하고 새 제약 row를 기저변수로 얹는다.
+
+    분기할 때마다 build_tableau로 처음부터 다시 만들면 부모가 이미 한 피벗을
+    전부 다시 하게 되어 비용이 depth에 비례해 커진다(전체 O(depth^2)).
+    자식은 부모와 row 하나 + bound 몇 개만 다르므로, 부모의 basis를 그대로
+    물려받고 달라진 부분만 반영한 뒤 이어서 푼다.
+
+    새 row의 우변은 기저변수를 포함할 수 있으므로 _express_in_nonbasic으로
+    비기저변수 표현으로 바꿔서 넣는다.
+    """
+
+    child = copy.deepcopy(parent)
+    for name, terms, (lo, hi) in new_rows:
+        row = Row(basic_var=name, coeffs=_express_in_nonbasic(child, terms))
+        child.rows.append(row)
+        child.bounds[name] = Bound(lower=lo, upper=hi)
+        child.assign[name] = _compute_basic(child, row)
+    return child
+
 
 def relu(v: float) -> float:
     """ReLU 함수: 음수일 경우 0, 양수일 경우 자기 자신을 반환."""
@@ -51,6 +133,7 @@ def reluplex(
     relu_metadata: Optional[Dict[Tuple[str, str], Tuple[Optional[int], Optional[int]]]] = None,
     progress: Optional[Any] = None,
     progress_context: Optional[Dict[str, Any]] = None,
+    warm_start: bool = True,
     seed: Optional[int] = 0,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
 
@@ -130,9 +213,10 @@ def reluplex(
         return min(violations, key=lambda p: repair_count.get(p, 0))
 
     def _rec(
-        bounds_now: Dict[str, Tuple[float, float]], 
-        depth: int, 
-        current_row_defs: Optional[List[Tuple[str, Dict[str, float]]]] = None
+        bounds_now: Dict[str, Tuple[float, float]],
+        depth: int,
+        current_row_defs: Optional[List[Tuple[str, Dict[str, float]]]] = None,
+        warm: Optional[SimplexTableau] = None,
     ) -> Tuple[Optional[Dict[str, float]], bool]:
         check_deadline(deadline)
         
@@ -153,7 +237,13 @@ def reluplex(
                 
             bounds_now[y] = (new_lo, hi)
 
-        tableau = build_tableau(current_row_defs, bounds_now)
+        if warm is not None:
+            # 부모의 basis를 물려받고, 좁아진 bound만 반영해 이어서 푼다.
+            # bounds_now 기준으로 한 번 맞춰주므로 부모와 어긋날 여지가 없다.
+            tableau = warm
+            _sync_bounds(tableau, bounds_now)
+        else:
+            tableau = build_tableau(current_row_defs, bounds_now)
         with span(trace, "simplex", depth=depth):
             sol, sat = simplex(
                 tableau,
@@ -263,9 +353,18 @@ def reluplex(
                 if split_logger is not None:
                     # global_split_count 증가 및 '+' 기록: 첫 Reluplex 재귀 호출 직전.
                     split_id = split_logger.begin(branch_x, layer, index)
+                warm1 = None
+                if warm_start:
+                    new_rows1 = []
+                    if relu_y is not None:
+                        new_rows1.append(
+                            (slack_name, {relu_y: 1.0, branch_x: -1.0}, (0.0, 0.0))
+                        )
+                    warm1 = _child_tableau(tableau, new_rows1)
+
                 try:
                     try:
-                        r1, sat1 = _rec(bounds1, depth + 1, row_defs1)
+                        r1, sat1 = _rec(bounds1, depth + 1, row_defs1, warm1)
                     except SolverLimitReached as exc:
                         if exc.reason == "TIMEOUT":
                             raise
@@ -273,6 +372,9 @@ def reluplex(
                         r1, sat1 = None, False
                     if sat1:
                         return r1, True
+                    # 자식이 끝났으므로 참조를 놓아준다 (depth만큼 tableau가
+                    # 동시에 살아있지 않도록)
+                    warm1 = None
 
                     # 2. x <= 0 분기
                     bounds2 = dict(bounds_now)
@@ -290,8 +392,9 @@ def reluplex(
                     if inactive_bounds_conflict:
                         r2, sat2 = None, False
                     else:
+                        warm2 = _child_tableau(tableau, []) if warm_start else None
                         try:
-                            r2, sat2 = _rec(bounds2, depth + 1, row_defs2)
+                            r2, sat2 = _rec(bounds2, depth + 1, row_defs2, warm2)
                         except SolverLimitReached as exc:
                             if exc.reason == "TIMEOUT":
                                 raise

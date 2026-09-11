@@ -1,5 +1,5 @@
 from time import monotonic
-from typing import Any, Callable, List, Dict, Tuple, Optional
+from typing import Any, Callable, Iterable, List, Dict, Tuple, Optional
 from DPLL import parse_prop, tseitin_cnf, dpll, neg
 from Reluplex import reluplex
 from DPLL import InequProp, ReLUProp
@@ -9,7 +9,7 @@ from Automation.SolverStatus import (
     SolverStatus,
     check_deadline,
 )
-from visualization.SolveTrace import SolveTrace
+from visualization.SolveTrace import SolveTrace, span
 
 
 def inequ_list_to_reluplex(
@@ -53,6 +53,26 @@ def _theory_atom_description(atom, theory, polarity: bool) -> Dict[str, Any]:
     }
 
 
+def _inequality_detail(original: InequProp, effective: InequProp) -> Dict[str, Any]:
+    """Structured definition kept in memory and logged only on first violation."""
+    return {
+        "original": {
+            "coefficients": sorted(
+                ([str(var), float(coefficient)] for var, coefficient in original.coeffs),
+                key=lambda item: item[0],
+            ),
+            "bound": float(original.b),
+        },
+        "effective": {
+            "coefficients": sorted(
+                ([str(var), float(coefficient)] for var, coefficient in effective.coeffs),
+                key=lambda item: item[0],
+            ),
+            "bound": float(effective.b),
+        },
+    }
+
+
 def _dpll_t_run(
     formula,
     max_rounds: int,
@@ -93,6 +113,10 @@ def _dpll_t_run(
 
     for round_idx in range(max_rounds):
         round_number = round_idx + 1
+        with span(trace, "dpll_round_start", round_index=round_number):
+            pass
+        if split_logger is not None:
+            split_logger.round_start(round_number)
         if progress is not None:
             progress.round_start(round_number)
         check_deadline(deadline)
@@ -115,21 +139,38 @@ def _dpll_t_run(
 
             if model[atom] is True:
                 active_theory_literals.append(atom)
-                selected_theory_atoms.append(_theory_atom_description(atom, th, True))
+                description = _theory_atom_description(atom, th, True)
                 if isinstance(th, InequProp):
+                    slack_name = f"ineq_slack_{len(active_ineqs)}"
+                    description.update(
+                        {
+                            "constraint_id": str(atom),
+                            "slack_name": slack_name,
+                            "constraint_detail": _inequality_detail(th, th),
+                        }
+                    )
                     active_ineqs.append(th)
                 elif isinstance(th, ReLUProp):
                     active_relus.append((th.x, th.y))
                     active_relu_metadata[(th.x, th.y)] = (th.layer, th.index)
+                selected_theory_atoms.append(description)
             elif model[atom] is False:
                 active_theory_literals.append(neg(atom))
-                selected_theory_atoms.append(_theory_atom_description(atom, th, False))
+                description = _theory_atom_description(atom, th, False)
                 if isinstance(th, InequProp):
                     coeffs_dict = dict(th.coeffs)
                     neg_coeffs = {v: -c for v, c in coeffs_dict.items()}
                     neg_ineq = InequProp(
                         coeffs=frozenset(neg_coeffs.items()),
                         b=-th.b + 1e-6,
+                    )
+                    slack_name = f"ineq_slack_{len(active_ineqs)}"
+                    description.update(
+                        {
+                            "constraint_id": str(atom),
+                            "slack_name": slack_name,
+                            "constraint_detail": _inequality_detail(th, neg_ineq),
+                        }
                     )
                     active_ineqs.append(neg_ineq)
                 elif isinstance(th, ReLUProp):
@@ -140,6 +181,7 @@ def _dpll_t_run(
                     # 비선형 complement를 정확히 지원할 때까지 UNKNOWN으로
                     # 중단해 잘못된 UNSAT 판정을 방지한다.
                     raise SolverLimitReached("NEGATED_RELU_UNSUPPORTED")
+                selected_theory_atoms.append(description)
 
         if progress is not None:
             progress.theory_selection(round_number, selected_theory_atoms)
@@ -180,7 +222,12 @@ def _dpll_t_run(
         )
         if th_sat:
             if progress is not None:
-                progress.theory_result(round_number, "THEORY_SAT")
+                progress.theory_result(
+                    round_number, "THEORY_SAT",
+                    inequalities=[{"coeffs": dict(item.coeffs), "lower": item.b}
+                                  for item in active_ineqs],
+                    relu_count=len(active_relus),
+                )
                 progress.round_end(round_number, "THEORY_SAT")
             return th_model, SolverStatus.SAT, "THEORY_SAT", round_number
 
@@ -218,6 +265,8 @@ def dpll_t_detailed(
     realtime_output_path: Optional[str] = None,
     realtime_open_view: bool = False,
     realtime_playback_ms: int = 0,
+    realtime_window_seconds: float = 300.0,
+    model_layer_sizes: Optional[Iterable[int]] = None,
     progress=None,
 ) -> SolverResult:
     """Run DPLL(T), distinguishing SAT, UNSAT, and UNKNOWN.
@@ -257,6 +306,8 @@ def dpll_t_detailed(
                 live_view=realtime_open_view,
                 open_live_view=realtime_open_view,
                 playback_interval_ms=realtime_playback_ms,
+                window_seconds=realtime_window_seconds,
+                model_layer_sizes=model_layer_sizes,
             )
             if update_callback is None:
                 update_callback = visualizer.request_update
@@ -270,6 +321,7 @@ def dpll_t_detailed(
             resolved_split_log_path,
             update_callback=update_callback,
             reset_log=True,
+            model_layer_sizes=model_layer_sizes,
         )
         # split이 한 번도 발생하지 않아도 0개 상태의 실시간 화면을 만든다.
         split_logger.request_update()
@@ -312,7 +364,9 @@ def dpll_t_detailed(
             theory_stats=theory_stats,
         )
         if progress is not None:
-            progress.solver_end(result.status.value, result.reason, result.rounds)
+            progress.solver_end(
+                result.status.value, result.reason, result.rounds, model=result.model,
+            )
         return result
     finally:
         if visualizer is not None:
@@ -334,6 +388,8 @@ def dpll_t(
     realtime_output_path: Optional[str] = None,
     realtime_open_view: bool = False,
     realtime_playback_ms: int = 0,
+    realtime_window_seconds: float = 300.0,
+    model_layer_sizes: Optional[Iterable[int]] = None,
     progress=None,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     result = dpll_t_detailed(
@@ -351,6 +407,8 @@ def dpll_t(
         realtime_output_path=realtime_output_path,
         realtime_open_view=realtime_open_view,
         realtime_playback_ms=realtime_playback_ms,
+        realtime_window_seconds=realtime_window_seconds,
+        model_layer_sizes=model_layer_sizes,
         progress=progress,
     )
     if result.status == SolverStatus.UNKNOWN:

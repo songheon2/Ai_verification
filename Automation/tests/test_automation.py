@@ -603,8 +603,12 @@ class AutomationIntegrationTests(unittest.TestCase):
             self.assertFalse(solver_feedback.with_suffix(".json").exists())
             self.assertIn("realtime", result["visualization"])
             self.assertEqual(
-                set(result["visualization"]["realtime"]["live_view_outputs"]),
-                {"relu_split"},
+                set(result["visualization"]["realtime"]["panel_outputs"]),
+                {"relu"},
+            )
+            self.assertEqual(
+                result["visualization"]["realtime"]["dashboard_output"],
+                str(realtime_image.with_suffix(".html")),
             )
             self.assertEqual(
                 result["visualization"]["realtime"]["opened_panels"], ["relu"]
@@ -663,7 +667,7 @@ class AutomationIntegrationTests(unittest.TestCase):
                     ).exists()
                 )
             realtime_result = result["visualization"]["realtime"]
-            self.assertEqual(set(realtime_result["live_view_outputs"]), {"relu_split"})
+            self.assertEqual(set(realtime_result["panel_outputs"]), {"relu"})
             self.assertNotIn("solver_progress", realtime_result)
 
 

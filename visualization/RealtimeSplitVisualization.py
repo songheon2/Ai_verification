@@ -16,9 +16,33 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from time import sleep, time_ns
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from visualization.RenderLock import serialized_render
+from visualization.RenderProcess import (
+    REALTIME_RENDER_INTERVAL_SECONDS,
+    submit_relu_render,
+)
 
 DEFAULT_SPLIT_LOG_PATH = Path(__file__).resolve().parent / "outputs" / "log.txt"
+
+
+def split_metadata_path(path: str | Path) -> Path:
+    """split JSONL과 함께 보관하는 실행/모델 메타데이터 경로를 반환한다."""
+    log_path = Path(path)
+    return log_path.with_name(f"{log_path.stem}_meta.json")
+
+
+def read_split_metadata(path: str | Path) -> Dict:
+    metadata_path = split_metadata_path(path)
+    if not metadata_path.exists():
+        return {}
+    try:
+        value = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        warnings.warn(f"{metadata_path}의 split 메타데이터를 읽을 수 없습니다")
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 @dataclass(frozen=True)
@@ -65,6 +89,38 @@ def read_split_events(path: str | Path) -> List[SplitLogEvent]:
     return events
 
 
+def split_events_from_trace(trace) -> List[SplitLogEvent]:
+    """feedback-only 실행의 in-memory split span을 로그 이벤트로 변환한다."""
+    events: List[SplitLogEvent] = []
+    sequence = 0
+    for trace_event in trace.events:
+        if trace_event.component != "reluplex_split":
+            continue
+        sequence += 1
+        split_id = f"trace-{sequence}"
+        layer = trace_event.meta.get("layer")
+        index = trace_event.meta.get("index")
+        common = {
+            "timestamp": "",
+            "split_id": split_id,
+            "layer": None if layer is None else int(layer),
+            "index": None if index is None else int(index),
+            "variable": str(trace_event.branch_x or ""),
+        }
+        events.append(SplitLogEvent(
+            time_ns=int(trace_event.t_start * 1_000_000_000),
+            event="+",
+            **common,
+        ))
+        if trace_event.t_end is not None:
+            events.append(SplitLogEvent(
+                time_ns=int(trace_event.t_end * 1_000_000_000),
+                event="-",
+                **common,
+            ))
+    return sorted(events, key=lambda event: event.time_ns)
+
+
 def active_split_events(events: Iterable[SplitLogEvent]) -> List[SplitLogEvent]:
     """마지막 상태가 ``+``인 split을 시작 순서대로 반환한다."""
     active: Dict[str, SplitLogEvent] = {}
@@ -109,13 +165,27 @@ class SplitEventLogger:
         update_callback: Optional[Callable[[], None]] = None,
         *,
         reset_log: bool = False,
+        model_layer_sizes: Optional[Sequence[int]] = None,
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if reset_log:
             self.path.write_text("", encoding="utf-8")
+            metadata_path = split_metadata_path(self.path)
+            if model_layer_sizes is None and metadata_path.exists():
+                metadata_path.unlink()
         else:
             self.path.touch(exist_ok=True)
+        if model_layer_sizes is not None:
+            normalized_sizes = [int(size) for size in model_layer_sizes]
+            split_metadata_path(self.path).write_text(
+                json.dumps(
+                    {"model_layer_sizes": normalized_sizes},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
         self.update_callback = update_callback
         self.global_split_count = 0
         self._sequence = 0
@@ -128,6 +198,18 @@ class SplitEventLogger:
             self.global_split_count += 1
             self._append(split_id, variable, layer, index, "+")
             return split_id
+
+    def round_start(self, round_index: int) -> None:
+        """Record boundaries separately from neuron +/- events."""
+        with self._lock:
+            metadata = read_split_metadata(self.path)
+            rounds = metadata.setdefault("round_starts", [])
+            rounds.append({"round": round_index, "time_ns": time_ns()})
+            destination = split_metadata_path(self.path)
+            temporary = destination.with_suffix(".tmp")
+            temporary.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+            os.replace(temporary, destination)
+        self.request_update()
 
     def end(self, split_id: str, variable: str, layer: Optional[int], index: Optional[int]) -> None:
         with self._lock:
@@ -167,12 +249,36 @@ class SplitEventLogger:
                 warnings.warn(f"실시간 split visualizer 업데이트 실패: {exc}")
 
 
+def _draw_round_boundaries(ax, rounds, origin_ns, unit_seconds=1.0):
+    """Draw full-height boundaries only after more than one round began."""
+    rounds = sorted({item["round"]: item for item in rounds}.values(),
+                    key=lambda item: item["time_ns"])
+    if len(rounds) < 2:
+        return
+    left, right = ax.get_xlim()
+    for index, item in enumerate(rounds):
+        x = (item["time_ns"] - origin_ns) / 1e9 / unit_seconds
+        end = ((rounds[index + 1]["time_ns"] - origin_ns) / 1e9 / unit_seconds
+               if index + 1 < len(rounds) else right)
+        if left <= x <= right:
+            ax.axvline(x, ymin=0, ymax=1, color="#374151",
+                       linestyle="--", linewidth=1.1, zorder=4)
+        if end > left and x < right:
+            ax.text(max(left, x) + (right - left) * 0.006, 0.98,
+                    f"D{item['round']}", transform=ax.get_xaxis_transform(),
+                    ha="left", va="top", fontsize=8, color="#111827",
+                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8},
+                    clip_on=True, zorder=5)
+
+
 def _draw_realtime_split_history(
     events: List[SplitLogEvent],
     *,
     ax,
     title: Optional[str] = None,
-    window_seconds: float = 30.0,
+    window_seconds: float = 300.0,
+    current_time_ns: Optional[int] = None,
+    round_starts=(),
 ):
     if window_seconds <= 0:
         raise ValueError("window_seconds는 양수여야 합니다")
@@ -183,20 +289,23 @@ def _draw_realtime_split_history(
     completed_count = sum(event.event == "-" for event in events)
     ax.clear()
 
-    now_ns = time_ns()
+    now_ns = time_ns() if current_time_ns is None else int(current_time_ns)
     window_ns = int(window_seconds * 1_000_000_000)
     window_start_ns = now_ns - window_ns
     count = 0
+    for event in events:
+        if event.time_ns >= window_start_ns:
+            break
+        if event.time_ns <= now_ns:
+            count = count + 1 if event.event == "+" else max(0, count - 1)
+
     xs = [-window_seconds]
-    ys = [0]
+    ys = [count]
     for event in events:
         if event.time_ns < window_start_ns:
-            count = count + 1 if event.event == "+" else max(0, count - 1)
-            xs[0] = -window_seconds
-            ys[0] = count
             continue
         if event.time_ns > now_ns:
-            continue
+            break
         count = count + 1 if event.event == "+" else max(0, count - 1)
         xs.append((event.time_ns - now_ns) / 1_000_000_000)
         ys.append(count)
@@ -210,10 +319,18 @@ def _draw_realtime_split_history(
     ax.set_xlim(-window_seconds, 0)
     ax.set_ylim(0, max(1, max_count + 1))
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    tick_count = 6
+    fixed_ticks = [
+        -window_seconds + window_seconds * index / tick_count
+        for index in range(tick_count + 1)
+    ]
+    ax.set_xticks(fixed_ticks)
+    ax.set_xticklabels([f"{tick:g}" for tick in fixed_ticks])
     ax.grid(True, color="#d1d5db", linewidth=0.7, alpha=0.7)
     ax.set_ylabel("Active ReLU splits")
     ax.set_xlabel(
-        f"Last {window_seconds:g}s  |  started: {started_count}  |  completed: {completed_count}"
+        f"Time from now (s), fixed {window_seconds:g}s window  |  "
+        f"started: {started_count}  |  completed: {completed_count}"
     )
     ax.set_title(title or "Realtime ReLU splits")
     ax.text(
@@ -230,14 +347,91 @@ def _draw_realtime_split_history(
     return ax
 
 
+def _draw_full_split_history(
+    events: List[SplitLogEvent],
+    *,
+    ax,
+    title: Optional[str] = None,
+    round_starts=(),
+):
+    """첫 split부터 마지막 split까지 잘리지 않는 사후 시간 이력을 그린다."""
+    from matplotlib.ticker import MaxNLocator
+
+    ordered = sorted(events, key=lambda event: event.time_ns)
+    started_count = sum(event.event == "+" for event in ordered)
+    completed_count = sum(event.event == "-" for event in ordered)
+    ax.clear()
+
+    if ordered:
+        first_ns = ordered[0].time_ns
+        last_ns = ordered[-1].time_ns
+        duration_seconds = max(0.0, (last_ns - first_ns) / 1_000_000_000)
+    else:
+        first_ns = 0
+        duration_seconds = 0.0
+
+    if duration_seconds >= 2 * 24 * 60 * 60:
+        unit_seconds, unit_label = 24 * 60 * 60, "days"
+    elif duration_seconds >= 2 * 60 * 60:
+        unit_seconds, unit_label = 60 * 60, "hours"
+    elif duration_seconds >= 2 * 60:
+        unit_seconds, unit_label = 60, "minutes"
+    else:
+        unit_seconds, unit_label = 1, "seconds"
+
+    count = 0
+    xs = [0.0]
+    ys = [0]
+    for event in ordered:
+        count = count + 1 if event.event == "+" else max(0, count - 1)
+        xs.append(
+            (event.time_ns - first_ns) / 1_000_000_000 / unit_seconds
+        )
+        ys.append(count)
+
+    duration_units = duration_seconds / unit_seconds
+    xs.append(duration_units)
+    ys.append(count)
+
+    line_color = "#2563eb"
+    ax.step(xs, ys, where="post", linewidth=2.2, color=line_color)
+    ax.fill_between(xs, ys, step="post", color=line_color, alpha=0.16)
+    max_count = max(ys, default=0)
+    ax.set_xlim(0, max(1.0, duration_units))
+    ax.set_ylim(0, max(1, max_count + 1))
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=8))
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.grid(True, color="#d1d5db", linewidth=0.7, alpha=0.7)
+    ax.set_ylabel("Active ReLU splits")
+    ax.set_xlabel(
+        f"Elapsed time from first split ({unit_label}), full period  |  "
+        f"started: {started_count}  |  completed: {completed_count}"
+    )
+    ax.set_title(title or "Full active split history")
+    _draw_round_boundaries(ax, round_starts, first_ns, unit_seconds)
+    ax.text(
+        0.985,
+        0.93,
+        f"ACTIVE  {count}",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+        color=line_color,
+    )
+    return ax
+
+
 def draw_realtime_split_history(
     path: str | Path,
     *,
     ax=None,
     title: Optional[str] = None,
-    window_seconds: float = 30.0,
+    window_seconds: float = 300.0,
+    current_time_ns: Optional[int] = None,
 ):
-    """최근 구간의 활성 split 개수를 시간축 계단형 선으로 그린다."""
+    """현재를 오른쪽 0에 둔 고정 폭 시간창에 활성 split 수를 그린다."""
     import matplotlib.pyplot as plt
 
     events = read_split_events(path)
@@ -251,6 +445,7 @@ def draw_realtime_split_history(
         ax=ax,
         title=title,
         window_seconds=window_seconds,
+        current_time_ns=current_time_ns,
     )
     return (fig, ax) if own_figure else ax
 
@@ -259,9 +454,13 @@ def draw_realtime_split_dashboard(
     path: str | Path,
     *,
     title: str = "Realtime ReLU Split Dashboard",
-    window_seconds: float = 30.0,
+    window_seconds: float = 300.0,
     events: Optional[List[SplitLogEvent]] = None,
     playback: bool = False,
+    full_history: bool = False,
+    current_time_ns: Optional[int] = None,
+    model_layer_sizes: Optional[Sequence[int]] = None,
+    round_starts=None,
 ):
     """시간 이력과 ``(layer, index)``별 활성/누적 split을 함께 그린다."""
     import matplotlib.pyplot as plt
@@ -270,17 +469,29 @@ def draw_realtime_split_dashboard(
 
     if events is None:
         events = read_split_events(path)
+    if full_history and round_starts is None:
+        round_starts = read_split_metadata(path).get("round_starts", [])
     active_counts, total_counts, unknown_active = split_neuron_counts(events)
     fig = plt.figure(figsize=(10.5, 7.2))
     grid = fig.add_gridspec(2, 1, height_ratios=(1.0, 1.65), hspace=0.42)
     history_ax = fig.add_subplot(grid[0, 0])
     neuron_ax = fig.add_subplot(grid[1, 0])
-    _draw_realtime_split_history(
-        events,
-        ax=history_ax,
-        title="Active split history",
-        window_seconds=window_seconds,
-    )
+    if full_history:
+        _draw_full_split_history(
+            events,
+            ax=history_ax,
+            title="Full active split history",
+            round_starts=round_starts,
+        )
+    else:
+        _draw_realtime_split_history(
+            events,
+            ax=history_ax,
+            title="Active split history",
+            window_seconds=window_seconds,
+            current_time_ns=current_time_ns,
+            round_starts=round_starts,
+        )
 
     observed = sorted(total_counts)
     if observed:
@@ -306,13 +517,21 @@ def draw_realtime_split_dashboard(
         for (layer, index), active_count in zip(observed, active):
             if active_count:
                 neuron_ax.annotate(
-                    str(active_count),
+                    str(index),
                     (layer, index),
-                    ha="center",
+                    xytext=(8, 0),
+                    textcoords="offset points",
+                    ha="left",
                     va="center",
                     fontsize=8,
                     fontweight="bold",
-                    color="#eff6ff",
+                    color="#1e3a8a",
+                    bbox={
+                        "boxstyle": "round,pad=0.15",
+                        "fc": "white",
+                        "ec": "none",
+                        "alpha": 0.8,
+                    },
                 )
         colorbar = fig.colorbar(points, ax=neuron_ax, fraction=0.035, pad=0.03)
         colorbar.set_label("Cumulative split starts")
@@ -353,8 +572,34 @@ def draw_realtime_split_dashboard(
     neuron_ax.set_xlabel("Layer")
     neuron_ax.set_ylabel("Neuron index")
     neuron_ax.grid(True, color="#d1d5db", linewidth=0.6, alpha=0.55)
+    if model_layer_sizes:
+        sizes = [int(size) for size in model_layer_sizes]
+        layer_parts = []
+        for layer, size in enumerate(sizes):
+            if layer == 0:
+                role = "Input"
+            elif layer == len(sizes) - 1:
+                role = "Output"
+            else:
+                role = "Hidden"
+            layer_parts.append(f"{role} L{layer}: {size}")
+        relu_total = sum(sizes[1:-1])
+        fig.text(
+            0.5,
+            0.018,
+            "Network  |  " + "  |  ".join(layer_parts) + f"  |  Total ReLU: {relu_total}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            color="#374151",
+        )
     fig.suptitle(title, fontsize=16, fontweight="bold")
-    fig.subplots_adjust(left=0.09, right=0.94, top=0.92, bottom=0.09)
+    fig.subplots_adjust(
+        left=0.09,
+        right=0.94,
+        top=0.92,
+        bottom=0.12 if model_layer_sizes else 0.09,
+    )
     return fig, {"history": history_ax, "neurons": neuron_ax}
 
 
@@ -380,17 +625,27 @@ class RealtimeSplitVisualizer:
         open_live_view: bool = False,
         refresh_interval_ms: int = 500,
         playback_interval_ms: int = 0,
+        window_seconds: float = 300.0,
+        model_layer_sizes: Optional[Sequence[int]] = None,
     ) -> None:
         if refresh_interval_ms <= 0:
             raise ValueError("refresh_interval_ms는 양수여야 합니다")
         if playback_interval_ms < 0:
             raise ValueError("playback_interval_ms는 음수일 수 없습니다")
+        if window_seconds <= 0:
+            raise ValueError("window_seconds는 양수여야 합니다")
         self.log_path = Path(log_path)
         self.output_path = Path(output_path)
         self.live_view = live_view or open_live_view
         self.open_live_view = open_live_view
         self.refresh_interval_ms = refresh_interval_ms
         self.playback_interval_ms = playback_interval_ms
+        self.window_seconds = float(window_seconds)
+        self.model_layer_sizes = (
+            [int(size) for size in model_layer_sizes]
+            if model_layer_sizes is not None
+            else None
+        )
         self.live_view_path = self.output_path.with_suffix(".html")
         self._view_opened = False
         self._state_lock = threading.Lock()
@@ -418,7 +673,7 @@ class RealtimeSplitVisualizer:
 <body>
   <main>
     <h1>Realtime ReLU splits</h1>
-    <p>활성 split 시간 이력과 layer/index별 활성·누적 split을 {self.refresh_interval_ms}ms 간격으로 자동 갱신합니다.</p>
+    <p>이미지 약 {REALTIME_RENDER_INTERVAL_SECONDS:g}초 주기 생성 · 브라우저 {self.refresh_interval_ms}ms 간격 확인</p>
     <img id="split-view" alt="Realtime ReLU split visualization">
   </main>
   <script>
@@ -436,13 +691,28 @@ class RealtimeSplitVisualizer:
         self.live_view_path.parent.mkdir(parents=True, exist_ok=True)
         self.live_view_path.write_text(html, encoding="utf-8")
 
-    def _render_once(self, events: Optional[List[SplitLogEvent]] = None) -> None:
+    @serialized_render
+    def _render_once(
+        self,
+        events: Optional[List[SplitLogEvent]] = None,
+        *,
+        current_time_ns: Optional[int] = None,
+    ) -> None:
         import matplotlib.pyplot as plt
 
+        layer_sizes = self.model_layer_sizes
+        if layer_sizes is None:
+            metadata = read_split_metadata(self.log_path)
+            raw_sizes = metadata.get("model_layer_sizes")
+            if isinstance(raw_sizes, list):
+                layer_sizes = [int(size) for size in raw_sizes]
         fig, _ = draw_realtime_split_dashboard(
             self.log_path,
             events=events,
             playback=self.playback_interval_ms > 0,
+            window_seconds=self.window_seconds,
+            current_time_ns=current_time_ns,
+            model_layer_sizes=layer_sizes,
         )
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_output = self.output_path.with_name(
@@ -467,14 +737,23 @@ class RealtimeSplitVisualizer:
 
     def _run_live_updates(self) -> None:
         while True:
+            started = time_ns()
             with self._state_lock:
                 self._pending = False
-            self._render_once()
+            submit_relu_render(
+                self.log_path,
+                self.output_path,
+                self.window_seconds,
+                self.model_layer_sizes,
+            ).result()
             with self._state_lock:
-                if self._pending:
-                    continue
-                self._worker = None
-                return
+                if not self._pending:
+                    self._worker = None
+                    return
+            # At most one new frame every three seconds. Rendering time counts
+            # toward the interval rather than being added on top of it.
+            elapsed = (time_ns() - started) / 1_000_000_000
+            sleep(max(0.0, REALTIME_RENDER_INTERVAL_SECONDS - elapsed))
 
     def _run_playback_updates(self) -> None:
         """로그 이벤트를 하나씩 재생하되 solver thread는 지연시키지 않는다."""
@@ -485,7 +764,11 @@ class RealtimeSplitVisualizer:
                     self._pending = False
                 self._rendered_event_count += 1
                 self._initial_frame_rendered = True
-                self._render_once(events[: self._rendered_event_count])
+                frame_events = events[: self._rendered_event_count]
+                self._render_once(
+                    frame_events,
+                    current_time_ns=frame_events[-1].time_ns,
+                )
                 sleep(self.playback_interval_ms / 1000.0)
                 continue
 
@@ -534,3 +817,27 @@ class RealtimeSplitVisualizer:
             if worker is None:
                 return
             worker.join()
+
+
+def replay_split_log(
+    log_path: str | Path,
+    output_path: str | Path,
+    *,
+    interval_ms: int = 250,
+    window_seconds: float = 300.0,
+    open_live_view: bool = False,
+) -> Tuple[Path, Path]:
+    """저장된 전체 split JSONL을 첫 이벤트부터 순서대로 다시 그린다."""
+    if interval_ms <= 0:
+        raise ValueError("interval_ms는 양수여야 합니다")
+    visualizer = RealtimeSplitVisualizer(
+        log_path,
+        output_path,
+        live_view=True,
+        open_live_view=open_live_view,
+        playback_interval_ms=interval_ms,
+        window_seconds=window_seconds,
+    )
+    visualizer.request_update()
+    visualizer.flush()
+    return visualizer.output_path, visualizer.live_view_path

@@ -1,97 +1,84 @@
-"""ReLU split과 DPLL/Simplex progress를 하나의 realtime HTML로 표시한다."""
+"""선택된 ReLU/DPLL/Simplex 패널을 하나의 realtime HTML로 표시한다."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from typing import Mapping
+from urllib.parse import quote
+
+from visualization.RenderProcess import REALTIME_RENDER_INTERVAL_SECONDS
 import webbrowser
 
 
-class DedicatedRealtimeView:
-    """하나의 실시간 PNG만 자동 갱신하는 전용 브라우저 화면."""
-
-    def __init__(
-        self,
-        image_path: str | Path,
-        output_path: str | Path,
-        *,
-        title: str,
-        description: str,
-        refresh_interval_ms: int = 500,
-    ) -> None:
-        if refresh_interval_ms <= 0:
-            raise ValueError("refresh_interval_ms는 양수여야 합니다")
-        self.image_path = Path(image_path)
-        self.output_path = Path(output_path)
-        self.title = title
-        self.description = description
-        self.refresh_interval_ms = refresh_interval_ms
-
-    def write(self, *, open_browser: bool = False) -> Path:
-        image_uri = json.dumps(self.image_path.resolve().as_uri())
-        title = json.dumps(self.title, ensure_ascii=False)[1:-1]
-        description = json.dumps(self.description, ensure_ascii=False)[1:-1]
-        html = f"""<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{title}</title>
-  <style>
-    :root {{ color-scheme: dark; }}
-    body {{ margin: 0; background: #0f172a; color: #f8fafc; font-family: Arial, sans-serif; }}
-    header {{ position: sticky; top: 0; padding: 14px 20px; background: #111827ee; }}
-    h1 {{ margin: 0; font-size: 22px; }}
-    p {{ margin: 4px 0 0; color: #94a3b8; }}
-    main {{ max-width: 1550px; margin: 0 auto; padding: 18px; }}
-    img {{ display: block; width: 100%; min-height: 120px; object-fit: contain; background: white; border-radius: 8px; }}
-    #status {{ color: #22c55e; font-weight: bold; }}
-  </style>
-</head>
-<body>
-  <header>
-    <h1>{title}</h1>
-    <p><span id="status">LIVE</span> · {self.refresh_interval_ms}ms 간격 자동 갱신 · {description}</p>
-  </header>
-  <main><img id="dashboard" alt="{title}"></main>
-  <script>
-    const imageUri = {image_uri};
-    const image = document.getElementById("dashboard");
-    function refresh() {{ image.src = imageUri + "?t=" + Date.now(); }}
-    refresh();
-    setInterval(refresh, {self.refresh_interval_ms});
-  </script>
-</body>
-</html>
-"""
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.output_path.write_text(html, encoding="utf-8")
-        if open_browser:
-            webbrowser.open(self.output_path.resolve().as_uri())
-        return self.output_path
+PANEL_SPECS = {
+    "dpll-theory": (
+        "DPLL Rounds &amp; Theory Flow",
+        "DPLL rounds and theory flow dashboard",
+    ),
+    "simplex": (
+        "Simplex Internals",
+        "Simplex internal progress dashboard",
+    ),
+    "relu": (
+        "Realtime ReLU Split History",
+        "Realtime ReLU split history",
+    ),
+}
 
 
 class UnifiedRealtimeDashboard:
+    """하나 이상의 선택 패널을 단일 자동 갱신 HTML로 묶는다."""
+
     def __init__(
         self,
-        split_image_path: str | Path,
-        dpll_theory_image_path: str | Path,
-        simplex_image_path: str | Path,
+        panel_images: Mapping[str, str | Path],
         output_path: str | Path,
         *,
         refresh_interval_ms: int = 500,
     ) -> None:
         if refresh_interval_ms <= 0:
             raise ValueError("refresh_interval_ms는 양수여야 합니다")
-        self.split_image_path = Path(split_image_path)
-        self.dpll_theory_image_path = Path(dpll_theory_image_path)
-        self.simplex_image_path = Path(simplex_image_path)
+        unknown = set(panel_images) - set(PANEL_SPECS)
+        if unknown:
+            raise ValueError(f"지원하지 않는 realtime panel: {sorted(unknown)}")
+        if not panel_images:
+            raise ValueError("하나 이상의 realtime panel이 필요합니다")
+        self.panel_images = {
+            name: Path(panel_images[name])
+            for name in PANEL_SPECS
+            if name in panel_images
+        }
         self.output_path = Path(output_path)
         self.refresh_interval_ms = refresh_interval_ms
 
     def write(self, *, open_browser: bool = False) -> Path:
-        split_uri = json.dumps(self.split_image_path.resolve().as_uri())
-        dpll_theory_uri = json.dumps(self.dpll_theory_image_path.resolve().as_uri())
-        simplex_uri = json.dumps(self.simplex_image_path.resolve().as_uri())
+        sections = []
+        browser_panels = []
+        dashboard_directory = self.output_path.parent.resolve()
+        for name, image_path in self.panel_images.items():
+            title, alt = PANEL_SPECS[name]
+            element_id = f"{name}-dashboard"
+            sections.append(
+                "    <section>\n"
+                f"      <h2>{title}</h2>\n"
+                f'      <img id="{element_id}" alt="{alt}">\n'
+                "    </section>"
+            )
+            try:
+                relative_path = os.path.relpath(
+                    image_path.resolve(), dashboard_directory
+                )
+            except ValueError:
+                # Windows paths on different drives cannot be represented with
+                # a relative path.  Keep an absolute file URI in that rare case.
+                image_uri = image_path.resolve().as_uri()
+            else:
+                image_uri = quote(Path(relative_path).as_posix(), safe="/.")
+            browser_panels.append({"id": element_id, "uri": image_uri})
+
+        selected_names = " + ".join(self.panel_images)
+        panel_json = json.dumps(browser_panels, ensure_ascii=False)
         html = f"""<!doctype html>
 <html lang="ko">
 <head>
@@ -114,34 +101,18 @@ class UnifiedRealtimeDashboard:
 <body>
   <header>
     <h1>AI Verification Realtime Dashboard</h1>
-    <p><span id="status">LIVE</span> · {self.refresh_interval_ms}ms 간격 자동 갱신 · DPLL + Theory + Simplex + ReLU</p>
+    <p><span id="status">LIVE</span> · 이미지 약 {REALTIME_RENDER_INTERVAL_SECONDS:g}초 주기 생성 · 브라우저 {self.refresh_interval_ms}ms 간격 확인 · {selected_names}</p>
   </header>
   <main>
-    <section>
-      <h2>DPLL Rounds &amp; Theory Flow</h2>
-      <img id="dpll-theory-dashboard" alt="DPLL rounds and theory flow dashboard">
-    </section>
-    <section>
-      <h2>Simplex Internals</h2>
-      <img id="simplex-dashboard" alt="Simplex internal progress dashboard">
-    </section>
-    <section>
-      <h2>Realtime ReLU Split History</h2>
-      <img id="split-dashboard" alt="Realtime ReLU split history">
-    </section>
+{chr(10).join(sections)}
   </main>
   <script>
-    const dpllTheoryUri = {dpll_theory_uri};
-    const simplexUri = {simplex_uri};
-    const splitUri = {split_uri};
-    const dpllTheoryImage = document.getElementById("dpll-theory-dashboard");
-    const simplexImage = document.getElementById("simplex-dashboard");
-    const splitImage = document.getElementById("split-dashboard");
+    const panels = {panel_json};
     function refresh() {{
       const cacheBuster = "?t=" + Date.now();
-      dpllTheoryImage.src = dpllTheoryUri + cacheBuster;
-      simplexImage.src = simplexUri + cacheBuster;
-      splitImage.src = splitUri + cacheBuster;
+      for (const panel of panels) {{
+        document.getElementById(panel.id).src = panel.uri + cacheBuster;
+      }}
     }}
     refresh();
     setInterval(refresh, {self.refresh_interval_ms});

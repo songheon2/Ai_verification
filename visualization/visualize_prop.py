@@ -7,19 +7,12 @@ Prop AST를 Graphviz DOT 형식으로 시각화하는 유틸리티.
 출력:
   visualization/outputs/precise_prop/neg_spec_tree.dot
   visualization/outputs/precise_prop/neg_spec_tree.png
-
-Graphviz 설치 안내:
-    Ubuntu/Debian: sudo apt install graphviz
-    macOS:         brew install graphviz
-    Windows:       https://graphviz.org/download/
-
-Graphviz 설치 후, 명령줄에서 직접 렌더링 가능:
-    dot -Tpng visualization/outputs/precise_prop/neg_spec_tree.dot -o visualization/outputs/precise_prop/neg_spec_tree.png
+  
 """
 from __future__ import annotations
 import itertools
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from DPLL import (
     Prop, TrueProp, FalseProp, VarProp, InequProp, ReLUProp,
@@ -278,7 +271,34 @@ def show_atom_map(
     return "\n".join(lines)
 
 
-def _show_abbrev(prop: Prop, abbrev: Dict[Prop, str]) -> str:
+class _IdentityAbbrev:
+    """구조적 Prop hash를 호출하지 않는 시각화 전용 identity map."""
+
+    def __init__(self) -> None:
+        self._entries: Dict[int, tuple[Prop, str]] = {}
+
+    def __contains__(self, prop: object) -> bool:
+        entry = self._entries.get(id(prop))
+        return entry is not None and entry[0] is prop
+
+    def __getitem__(self, prop: Prop) -> str:
+        entry = self._entries.get(id(prop))
+        if entry is None or entry[0] is not prop:
+            raise KeyError(prop)
+        return entry[1]
+
+    def __setitem__(self, prop: Prop, alias: str) -> None:
+        self._entries[id(prop)] = (prop, alias)
+
+    def pop(self, prop: Prop, default: Any = None) -> Any:
+        entry = self._entries.get(id(prop))
+        if entry is None or entry[0] is not prop:
+            return default
+        del self._entries[id(prop)]
+        return entry[1]
+
+
+def _show_abbrev(prop: Prop, abbrev: _IdentityAbbrev) -> str:
     """show()와 동일하되, abbrev에 등록된 부분식은 변수 이름으로 대체."""
     if prop in abbrev:
         return abbrev[prop]
@@ -300,9 +320,9 @@ def _show_abbrev(prop: Prop, abbrev: Dict[Prop, str]) -> str:
 def _build_abbrev(
     atom_map: Dict[Prop, str],
     memo: Dict[Prop, str] | None,
-) -> Dict[Prop, str]:
-    """memo와 atom_map의 Prop → 변수명 매핑을 통합한 dict."""
-    abbrev: Dict[Prop, str] = {}
+) -> _IdentityAbbrev:
+    """memo와 atom_map을 구조적 hash 없이 통합한 identity map."""
+    abbrev = _IdentityAbbrev()
     for prop, alias in atom_map.items():
         abbrev[prop] = alias
     if memo:
@@ -314,7 +334,7 @@ def _build_abbrev(
 def _desc_abbrev(
     prop: Prop,
     alias: str,
-    abbrev: Dict[Prop, str],
+    abbrev: _IdentityAbbrev,
 ) -> str:
     """alias 자신은 abbrev에서 제외하고 1단계만 전개한 설명을 반환."""
     saved = abbrev.pop(prop, None)

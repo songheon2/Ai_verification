@@ -11,20 +11,23 @@ import inspect
 import math
 import os
 import threading
-import uuid
 import warnings
 import webbrowser
 from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 from time import monotonic, sleep, time_ns
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, TextIO
 
 import matplotlib
 
 matplotlib.use("Agg")
 
-_RENDER_LOCK = threading.Lock()
+from visualization.RenderLock import render_turn
+from visualization.RenderProcess import (
+    REALTIME_RENDER_INTERVAL_SECONDS,
+    submit_solver_render,
+)
 
 
 def _json_safe(value: Any) -> Any:
@@ -69,6 +72,11 @@ class SolverProgressLogger:
         reset_log: bool = False,
         refresh_interval_seconds: float = 0.3,
         enabled_panels: Optional[Iterable[str]] = None,
+        simplex_detail_stride: int = 1,
+        compact_simplex_calls: bool = False,
+        flush_interval_seconds: float = 1.0,
+        flush_bytes: int = 256 * 1024,
+        witness_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         allowed_panels = {"dpll_theory", "simplex"}
         selected_panels = (
@@ -78,13 +86,21 @@ class SolverProgressLogger:
         if unknown_panels:
             names = ", ".join(sorted(unknown_panels))
             raise ValueError(f"지원하지 않는 solver progress panel: {names}")
+        if simplex_detail_stride <= 0:
+            raise ValueError("simplex_detail_stride must be positive")
+        if flush_interval_seconds <= 0:
+            raise ValueError("flush_interval_seconds must be positive")
+        if flush_bytes <= 0:
+            raise ValueError("flush_bytes must be positive")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if reset_log:
-            self.path.write_text("", encoding="utf-8")
-        else:
-            self.path.touch(exist_ok=True)
+        self._stream: Optional[TextIO] = self.path.open(
+            "w" if reset_log else "a",
+            encoding="utf-8",
+            buffering=1024 * 1024,
+        )
         self.update_callback = update_callback
+        self.witness_context = dict(witness_context or {})
         self._contextual_update_callback = False
         if update_callback is not None:
             try:
@@ -97,15 +113,67 @@ class SolverProgressLogger:
                 pass
         self.refresh_interval_seconds = refresh_interval_seconds
         self.enabled_panels = frozenset(selected_panels)
+        self.simplex_detail_stride = simplex_detail_stride
+        self.compact_simplex_calls = compact_simplex_calls
+        self.flush_interval_seconds = flush_interval_seconds
+        self.flush_bytes = flush_bytes
         self._lock = threading.RLock()
         self._last_update = 0.0
+        self._last_flush = monotonic()
+        self._unflushed_bytes = 0
         self._round_started: Dict[int, int] = {}
         self._round_simplex_calls: Counter[int] = Counter()
         self._active_round: Optional[int] = None
         self._simplex_started: Dict[str, int] = {}
-        self._closed_simplex: set[str] = set()
+        self._simplex_numbers: Dict[str, int] = {}
+        self._simplex_rounds: Dict[str, Optional[int]] = {}
+        self._simplex_metadata: Dict[str, Dict[str, Any]] = {}
+        self._simplex_sequence = 0
+        self._constraint_details: Dict[tuple[int, str], Dict[str, Any]] = {}
+        self._emitted_constraint_details: set[tuple[str, bool]] = set()
 
-    def _append(self, event: str, *, force_update: bool = False, **payload: Any) -> None:
+    def _flush_locked(self) -> None:
+        if self._stream is None:
+            return
+        self._stream.flush()
+        self._unflushed_bytes = 0
+        self._last_flush = monotonic()
+
+    def flush(self) -> None:
+        """Make every buffered record visible to readers without closing the log."""
+        with self._lock:
+            self._flush_locked()
+
+    def close(self) -> None:
+        """Flush and close the persistent JSONL stream. Safe to call repeatedly."""
+        with self._lock:
+            if self._stream is None:
+                return
+            self._flush_locked()
+            self._stream.close()
+            self._stream = None
+
+    def __enter__(self) -> "SolverProgressLogger":
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            # Interpreter shutdown may have already torn down I/O internals.
+            pass
+
+    def _append(
+        self,
+        event: str,
+        *,
+        force_update: bool = False,
+        force_flush: bool = False,
+        **payload: Any,
+    ) -> None:
         panel = "simplex" if event.startswith("simplex_") else "dpll_theory"
         if event != "solver_end" and panel not in self.enabled_panels:
             return
@@ -115,18 +183,32 @@ class SolverProgressLogger:
             "event": event,
             **_json_safe(payload),
         }
+        encoded = json.dumps(
+            record,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ) + "\n"
         with self._lock:
-            with self.path.open("a", encoding="utf-8") as stream:
-                stream.write(
-                    json.dumps(
-                        record,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    )
-                    + "\n"
+            if self._stream is None:
+                raise RuntimeError("solver progress log is closed")
+            self._stream.write(encoded)
+            # Exact byte accounting would encode the JSON a second time. The
+            # character count is a cheap conservative-enough flush trigger for
+            # the overwhelmingly ASCII progress schema.
+            self._unflushed_bytes += len(encoded)
+            now = monotonic()
+            if (
+                force_flush
+                or force_update
+                or self._unflushed_bytes >= self.flush_bytes
+                or now - self._last_flush >= self.flush_interval_seconds
+                or (
+                    self.update_callback is not None
+                    and now - self._last_flush >= self.refresh_interval_seconds
                 )
-                stream.flush()
+            ):
+                self._flush_locked()
             self.request_update(force=force_update, panel=panel, event=event)
 
     def request_update(
@@ -182,11 +264,28 @@ class SolverProgressLogger:
             self.round_end(round_index, reason)
 
     def theory_selection(self, round_index: int, atoms: List[Mapping[str, Any]]) -> None:
+        compact_atoms = []
+        with self._lock:
+            for raw_atom in atoms:
+                atom = dict(raw_atom)
+                detail = atom.pop("constraint_detail", None)
+                slack_name = atom.get("slack_name")
+                if detail is not None and slack_name is not None:
+                    self._constraint_details[(round_index, str(slack_name))] = {
+                        "round": round_index,
+                        "slack_name": str(slack_name),
+                        "constraint_id": atom.get("constraint_id", atom.get("atom_id")),
+                        "atom_id": atom.get("atom_id"),
+                        "polarity": atom.get("polarity"),
+                        **dict(detail),
+                    }
+                compact_atoms.append(atom)
         self._append(
             "theory_selection",
             round=round_index,
-            atom_count=len(atoms),
-            atoms=[dict(atom) for atom in atoms],
+            selection_id=f"round-{round_index}",
+            atom_count=len(compact_atoms),
+            atoms=compact_atoms,
             force_update=False,
         )
 
@@ -205,26 +304,52 @@ class SolverProgressLogger:
         round_index: Optional[int],
         depth: Optional[int],
         origin: str,
-        theory_atom_ids: Iterable[str],
         row_count: int,
         variable_count: int,
+        theory_atom_ids: Iterable[str] = (),
+        selection_id: Optional[str] = None,
     ) -> str:
-        call_id = f"simplex-{uuid.uuid4().hex}"
+        atom_ids = [] if self.compact_simplex_calls else list(theory_atom_ids)
         with self._lock:
-            self._simplex_started[call_id] = time_ns()
+            self._simplex_sequence += 1
+            call_number = self._simplex_sequence
+            # A monotonic number is already unique within one reset log and is
+            # substantially smaller than a UUID in million-call feedback runs.
+            call_id = f"simplex-{call_number}"
+            started = time_ns()
+            self._simplex_started[call_id] = started
+            self._simplex_numbers[call_id] = call_number
+            self._simplex_rounds[call_id] = round_index
+            if self.compact_simplex_calls:
+                self._simplex_metadata[call_id] = {
+                    "round": round_index,
+                    "depth": depth,
+                    "origin": origin,
+                    "selection_id": selection_id,
+                    # theory atoms are already stored once by theory_selection;
+                    # selection_id links the call without repeating the same
+                    # potentially large id list hundreds of thousands of times.
+                    "row_count": row_count,
+                    "variable_count": variable_count,
+                }
             if round_index is not None:
                 self._round_simplex_calls[round_index] += 1
-        self._append(
-            "simplex_start",
-            call_id=call_id,
-            round=round_index,
-            depth=depth,
-            origin=origin,
-            theory_atom_ids=list(theory_atom_ids),
-            row_count=row_count,
-            variable_count=variable_count,
-            force_update=False,
-        )
+        if not self.compact_simplex_calls:
+            self._append(
+                "simplex_start",
+                call_id=call_id,
+                call_number=call_number,
+                round=round_index,
+                depth=depth,
+                origin=origin,
+                selection_id=selection_id,
+                **(
+                    {"theory_atom_ids": atom_ids} if atom_ids else {}
+                ),
+                row_count=row_count,
+                variable_count=variable_count,
+                force_update=False,
+            )
         return call_id
 
     def simplex_iteration(
@@ -237,9 +362,47 @@ class SolverProgressLogger:
         lower: Optional[float] = None,
         upper: Optional[float] = None,
     ) -> None:
+        if self.compact_simplex_calls and violated_var is None:
+            # The completed call record already carries the exact iteration
+            # total; an extra terminal iteration record adds no feedback data.
+            return
+        if violated_var is not None and iteration % self.simplex_detail_stride != 0:
+            return
+        with self._lock:
+            call_number = self._simplex_numbers.get(call_id)
+            round_index = self._simplex_rounds.get(call_id)
+            detail_key = (
+                (round_index, str(violated_var))
+                if round_index is not None and violated_var is not None
+                else None
+            )
+            detail = self._constraint_details.get(detail_key) if detail_key else None
+            definition_key = (
+                (str(detail.get("constraint_id")), bool(detail.get("polarity")))
+                if detail is not None
+                else None
+            )
+            should_emit_detail = (
+                definition_key is not None
+                and detail is not None
+                and definition_key not in self._emitted_constraint_details
+            )
+            if should_emit_detail:
+                self._emitted_constraint_details.add(definition_key)
+        if should_emit_detail:
+            self._append(
+                "constraint_detail",
+                force_update=False,
+                **{
+                    key: value
+                    for key, value in detail.items()
+                    if key not in {"round", "slack_name"}
+                },
+            )
         self._append(
             "simplex_iteration",
             call_id=call_id,
+            call_number=call_number,
             iteration=iteration,
             violated_var=violated_var,
             value=value,
@@ -257,9 +420,14 @@ class SolverProgressLogger:
         leaving: str,
         row: str,
     ) -> None:
+        if iteration % self.simplex_detail_stride != 0:
+            return
+        with self._lock:
+            call_number = self._simplex_numbers.get(call_id)
         self._append(
             "simplex_pivot",
             call_id=call_id,
+            call_number=call_number,
             iteration=iteration,
             entering=entering,
             leaving=leaving,
@@ -276,28 +444,45 @@ class SolverProgressLogger:
         pivots: int,
     ) -> None:
         with self._lock:
-            if call_id in self._closed_simplex:
+            # Active-call membership is sufficient for idempotence and avoids
+            # retaining every completed call id during week-long runs.
+            if call_id not in self._simplex_started:
                 return
-            self._closed_simplex.add(call_id)
-            started = self._simplex_started.pop(call_id, time_ns())
+            started = self._simplex_started.pop(call_id)
+            call_number = self._simplex_numbers.pop(call_id, None)
+            self._simplex_rounds.pop(call_id, None)
+            metadata = self._simplex_metadata.pop(call_id, {})
+        terminal_event = "simplex_call" if self.compact_simplex_calls else "simplex_end"
         self._append(
-            "simplex_end",
+            terminal_event,
             call_id=call_id,
+            call_number=call_number,
+            **(metadata if self.compact_simplex_calls else {}),
             result=result,
             duration_seconds=max(0.0, (time_ns() - started) / 1_000_000_000),
             iterations=iterations,
             pivots=pivots,
+            force_flush=result not in {"SAT", "UNSAT"},
             force_update=False,
         )
 
-    def solver_end(self, status: str, reason: Optional[str], rounds: int) -> None:
-        self._append(
-            "solver_end",
-            status=status,
-            reason=reason,
-            rounds=rounds,
-            force_update=True,
-        )
+    def solver_end(
+        self, status: str, reason: Optional[str], rounds: int,
+        *, model: Optional[Dict[str, float]] = None,
+    ) -> None:
+        try:
+            self._append(
+                "solver_end",
+                status=status,
+                reason=reason,
+                rounds=rounds,
+                model=model if status == "SAT" else None,
+                witness_context=self.witness_context,
+                force_update=True,
+                force_flush=True,
+            )
+        finally:
+            self.close()
 
 
 def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -307,6 +492,9 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
     entering: Counter[str] = Counter()
     leaving: Counter[str] = Counter()
     pivot_rows: Counter[str] = Counter()
+    violation_refs: Counter[tuple[Optional[int], str]] = Counter()
+    constraint_details: Dict[tuple[str, bool], Dict[str, Any]] = {}
+    slack_references: Dict[tuple[int, str], Dict[str, Any]] = {}
     theory_links: List[Dict[str, Any]] = []
     solver_result: Dict[str, Any] = {}
 
@@ -329,6 +517,16 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
             index = int(event["round"])
             atoms = list(event.get("atoms", []))
             rounds.setdefault(index, {"round": index})["theory_atoms"] = atoms
+            for atom in atoms:
+                slack_name = atom.get("slack_name")
+                if slack_name is not None:
+                    slack_references[(index, str(slack_name))] = {
+                        "constraint_id": atom.get(
+                            "constraint_id", atom.get("atom_id")
+                        ),
+                        "atom_id": atom.get("atom_id"),
+                        "polarity": atom.get("polarity"),
+                    }
         elif kind == "theory_result":
             index = int(event["round"])
             result = event.get("result")
@@ -338,10 +536,13 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
             call_id = str(event["call_id"])
             calls[call_id] = {
                 "call_id": call_id,
+                "call_number": event.get("call_number"),
+                "start_timestamp": event.get("timestamp"),
                 "start_time_ns": event.get("time_ns"),
                 "round": event.get("round"),
                 "depth": event.get("depth"),
                 "origin": event.get("origin"),
+                "selection_id": event.get("selection_id"),
                 "theory_atom_ids": list(event.get("theory_atom_ids", [])),
                 "row_count": event.get("row_count"),
                 "variable_count": event.get("variable_count"),
@@ -355,6 +556,15 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
             variable = event.get("violated_var")
             if variable:
                 violations[str(variable)] += 1
+                violation_refs[(calls.get(call_id, {}).get("round"), str(variable))] += 1
+        elif kind == "constraint_detail":
+            constraint_id = event.get("constraint_id", event.get("atom_id"))
+            if constraint_id is not None:
+                constraint_details[(str(constraint_id), bool(event.get("polarity")))] = {
+                    key: value
+                    for key, value in event.items()
+                    if key not in {"event", "timestamp", "time_ns"}
+                }
         elif kind == "simplex_pivot":
             call_id = str(event.get("call_id"))
             call = calls.setdefault(call_id, {"call_id": call_id})
@@ -362,21 +572,38 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
             entering[str(event.get("entering"))] += 1
             leaving[str(event.get("leaving"))] += 1
             pivot_rows[str(event.get("row"))] += 1
-        elif kind == "simplex_end":
+        elif kind in {"simplex_end", "simplex_call"}:
             call_id = str(event["call_id"])
-            calls.setdefault(call_id, {"call_id": call_id}).update(
-                {
-                    "result": event.get("result"),
-                    "duration_seconds": float(event.get("duration_seconds", 0.0)),
-                    "iterations": int(event.get("iterations", 0)),
-                    "pivots": int(event.get("pivots", 0)),
-                }
-            )
+            completed = {
+                "result": event.get("result"),
+                "call_number": event.get(
+                    "call_number", calls.get(call_id, {}).get("call_number")
+                ),
+                "end_timestamp": event.get("timestamp"),
+                "duration_seconds": float(event.get("duration_seconds", 0.0)),
+                "iterations": int(event.get("iterations", 0)),
+                "pivots": int(event.get("pivots", 0)),
+            }
+            if kind == "simplex_call":
+                completed.update(
+                    {
+                        "round": event.get("round"),
+                        "depth": event.get("depth"),
+                        "origin": event.get("origin"),
+                        "selection_id": event.get("selection_id"),
+                        "theory_atom_ids": list(event.get("theory_atom_ids", [])),
+                        "row_count": event.get("row_count"),
+                        "variable_count": event.get("variable_count"),
+                    }
+                )
+            calls.setdefault(call_id, {"call_id": call_id}).update(completed)
         elif kind == "solver_end":
             solver_result = {
                 "status": event.get("status"),
                 "reason": event.get("reason"),
                 "rounds": event.get("rounds"),
+                "model": event.get("model"),
+                "witness_context": event.get("witness_context", {}),
             }
 
     ordered_rounds = [rounds[index] for index in sorted(rounds)]
@@ -400,6 +627,47 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
             call.setdefault("result", "RUNNING")
             call.setdefault("iterations", 0)
             call.setdefault("pivots", 0)
+    resolved_by_constraint: Dict[tuple[Any, Any], Dict[str, Any]] = {}
+    for (round_index, slack_name), count in violation_refs.items():
+        reference = (
+            slack_references.get((int(round_index), slack_name), {})
+            if round_index is not None
+            else {}
+        )
+        constraint_id = reference.get(
+            "constraint_id", f"round-{round_index}:{slack_name}"
+        )
+        polarity = bool(reference.get("polarity"))
+        detail = constraint_details.get((str(constraint_id), polarity), {})
+        key = (constraint_id, polarity)
+        item = resolved_by_constraint.setdefault(
+            key,
+            {
+                "constraint_id": constraint_id,
+                "atom_id": reference.get("atom_id", detail.get("atom_id")),
+                "polarity": reference.get("polarity", detail.get("polarity")),
+                "slack_name": slack_name,
+                "count": 0,
+                "rounds": [],
+                "occurrences": [],
+                **{
+                    name: detail[name]
+                    for name in ("original", "effective")
+                    if name in detail
+                },
+            },
+        )
+        item["count"] += count
+        if round_index not in item["rounds"]:
+            item["rounds"].append(round_index)
+        item["occurrences"].append(
+            {"round": round_index, "slack_name": slack_name, "count": count}
+        )
+    resolved_constraints = sorted(
+        resolved_by_constraint.values(),
+        key=lambda item: (-int(item["count"]), str(item["constraint_id"])),
+    )[:20]
+
     return {
         "solver": solver_result,
         "rounds": ordered_rounds,
@@ -411,6 +679,7 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
             "simplex_pivots": sum(int(call.get("pivots", 0)) for call in ordered_calls),
         },
         "top_violated_variables": dict(violations.most_common(20)),
+        "top_violated_constraints": resolved_constraints,
         "top_entering_variables": dict(entering.most_common(20)),
         "top_leaving_variables": dict(leaving.most_common(20)),
         "top_pivot_rows": dict(pivot_rows.most_common(20)),
@@ -423,7 +692,19 @@ def _result_color(result: Optional[str]) -> str:
         return "#16a34a"
     if result in {"UNSAT", "THEORY_UNSAT", "BOOLEAN_UNSAT"}:
         return "#dc2626"
-    if result in {"TIMEOUT", "ITERATION_LIMIT", "SIMPLEX_ITERATION_LIMIT"}:
+    if result in {
+        "TIMEOUT",
+        "ITERATION_LIMIT",
+        "SIMPLEX_ITERATION_LIMIT",
+        "STALLED",
+        "SIMPLEX_STALLED",
+        "NUMERICAL_FAILURE",
+        "SIMPLEX_NUMERICAL_FAILURE",
+        "VALIDATION_INCONCLUSIVE",
+        "SIMPLEX_VALIDATION_INCONCLUSIVE",
+        "RELUPLEX_VALIDATION_INCONCLUSIVE",
+        "STRICT_INEQUALITY_INCONCLUSIVE",
+    }:
         return "#f59e0b"
     return "#2563eb"
 
@@ -434,6 +715,58 @@ def _set_integer_ticks(axis, direction: str) -> None:
 
     target = axis.xaxis if direction == "x" else axis.yaxis
     target.set_major_locator(MaxNLocator(integer=True, min_n_ticks=1))
+
+
+def _set_duration_ylim(axis, durations: Iterable[float]) -> None:
+    """시간축을 실제 최장 duration에 맞추고 자동 눈금의 과도한 여백을 막는다."""
+    from matplotlib.ticker import LinearLocator
+
+    maximum = max(
+        (float(value) for value in durations if math.isfinite(float(value))),
+        default=0.0,
+    )
+    axis.set_ylim(0.0, maximum if maximum > 0.0 else 1.0)
+    axis.yaxis.set_major_locator(LinearLocator(numticks=6))
+
+
+def _completed_call_durations(calls: Iterable[Mapping[str, Any]]) -> List[float]:
+    """Return final durations only, so a running call cannot rescale every frame."""
+    return [
+        max(0.0, float(item.get("duration_seconds", 0.0)))
+        for item in calls
+        if item.get("result") not in (None, "RUNNING")
+    ]
+
+
+def _constraint_label(item: Mapping[str, Any]) -> str:
+    """Return a compact one-line label; expressions remain in feedback JSON."""
+    slack = str(item.get("slack_name", "?"))
+    raw_constraint_id = item.get("constraint_id", item.get("atom_id"))
+    if raw_constraint_id is None or str(raw_constraint_id).startswith("round-"):
+        return slack
+    constraint_id = str(raw_constraint_id)
+    rounds = item.get("rounds") or [item.get("round")]
+    round_text = ",".join(str(value) for value in rounds if value is not None)
+    label = f"{slack} · {constraint_id}"
+    if round_text:
+        label += f" (R{round_text})"
+    return label
+
+
+def _annotate_violation_variable_types(axis) -> None:
+    """Explain generated variable names without competing with the chart data."""
+    axis.text(
+        0.0,
+        -0.16,
+        "h: ReLU output  ·  z: value before ReLU  ·  ineq_slack: inequality auxiliary variable",
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=7,
+        color="#64748b",
+        alpha=0.8,
+        clip_on=False,
+    )
 
 
 def _theory_outcome(round_item: Mapping[str, Any]) -> Optional[str]:
@@ -474,18 +807,18 @@ def draw_solver_dashboard(
     )
     feedback = build_solver_feedback(events)
     rounds = feedback["rounds"][-20:]
-    calls = feedback["simplex_calls"][-20:]
+    # Simplex 통계는 최근 일부 호출만 자르지 않고 실행 시작 이후의
+    # 모든 call을 누적해서 보여준다.
+    calls = feedback["simplex_calls"]
 
-    fig = plt.figure(figsize=(15, 13))
-    grid = fig.add_gridspec(4, 2, height_ratios=[1, 1, 1, 0.9])
+    fig = plt.figure(figsize=(15, 10.5))
+    grid = fig.add_gridspec(3, 2, height_ratios=[1, 1, 0.9])
     ax_round = fig.add_subplot(grid[0, 0])
     ax_duration = fig.add_subplot(grid[0, 1])
     ax_work = fig.add_subplot(grid[1, 0])
     ax_vars = fig.add_subplot(grid[1, 1])
-    ax_choices = fig.add_subplot(grid[2, 0])
-    ax_rows = fig.add_subplot(grid[2, 1])
-    ax_links = fig.add_subplot(grid[3, :])
-    axes = [ax_round, ax_duration, ax_work, ax_vars, ax_choices, ax_rows, ax_links]
+    ax_links = fig.add_subplot(grid[2, :])
+    axes = [ax_round, ax_duration, ax_work, ax_vars, ax_links]
     fig.suptitle(title, fontsize=16, fontweight="bold")
 
     round_ids = [int(item["round"]) for item in rounds]
@@ -522,72 +855,39 @@ def draw_solver_dashboard(
         [f"{number}\n{item.get('result', 'RUNNING')}" for number, item in zip(call_numbers, calls)],
         fontsize=7,
     )
-    ax_duration.set_title("Simplex call duration (latest 20)")
-    ax_duration.set_xlabel("Simplex call")
+    ax_duration.set_title("Simplex call duration (all calls)")
+    ax_duration.set_xlabel("Simplex call order")
     ax_duration.set_ylabel("Duration (s)")
-    ax_duration.set_ylim(bottom=0)
+    # Keep the cumulative completed-call maximum.  A RUNNING call's elapsed
+    # time changes on every refresh, but its final duration is not known yet.
+    _set_duration_ylim(ax_duration, _completed_call_durations(calls))
     ax_duration.grid(axis="y", alpha=0.3)
 
-    iterations = [int(item.get("iterations", 0)) for item in calls]
     pivots = [int(item.get("pivots", 0)) for item in calls]
-    ax_work.plot(call_numbers, iterations, marker="o", label="iterations", color="#2563eb")
-    ax_work.plot(call_numbers, pivots, marker="s", label="pivots", color="#9333ea")
+    marker_stride = max(1, (len(call_numbers) + 79) // 80)
+    ax_work.plot(
+        call_numbers, pivots, marker="s", markevery=marker_stride,
+        markersize=2.0, markeredgewidth=0, linewidth=0.75, alpha=0.9,
+        color="#9333ea",
+    )
     ax_work.set_xticks(call_numbers)
     _set_integer_ticks(ax_work, "y")
-    ax_work.set_title("Simplex work per call")
-    ax_work.set_xlabel("Simplex call")
-    ax_work.set_ylabel("Count")
-    ax_work.legend()
+    ax_work.set_title("Simplex pivots per call")
+    ax_work.set_xlabel("Simplex call order")
+    ax_work.set_ylabel("Pivots within call")
     ax_work.grid(alpha=0.3)
 
-    violated = Counter(feedback["top_violated_variables"])
-    selected = violated.most_common(8)
+    selected = feedback.get("top_violated_constraints", [])[:8]
     if selected:
-        labels = [name for name, _ in reversed(selected)]
-        values = [value for _, value in reversed(selected)]
+        labels = [_constraint_label(item) for item in reversed(selected)]
+        values = [int(item.get("count", 0)) for item in reversed(selected)]
         ax_vars.barh(labels, values, color="#ef4444")
+        ax_vars.tick_params(axis="y", labelsize=7)
     ax_vars.set_title("Repeated bound violations")
     ax_vars.set_xlabel("Selections")
+    _annotate_violation_variable_types(ax_vars)
     _set_integer_ticks(ax_vars, "x")
     ax_vars.grid(axis="x", alpha=0.3)
-
-    entering_counts = Counter(feedback["top_entering_variables"])
-    leaving_counts = Counter(feedback["top_leaving_variables"])
-    choice_names = [
-        name for name, _ in (entering_counts + leaving_counts).most_common(8)
-    ]
-    choice_positions = list(range(len(choice_names)))
-    ax_choices.barh(
-        [position - 0.2 for position in choice_positions],
-        [entering_counts[name] for name in choice_names],
-        height=0.4,
-        color="#16a34a",
-        label="entering",
-    )
-    ax_choices.barh(
-        [position + 0.2 for position in choice_positions],
-        [leaving_counts[name] for name in choice_names],
-        height=0.4,
-        color="#f97316",
-        label="leaving",
-    )
-    ax_choices.set_yticks(choice_positions)
-    ax_choices.set_yticklabels(choice_names)
-    ax_choices.set_title("Entering / leaving variable frequency")
-    ax_choices.set_xlabel("Selections")
-    _set_integer_ticks(ax_choices, "x")
-    ax_choices.legend()
-    ax_choices.grid(axis="x", alpha=0.3)
-
-    pivot_rows = Counter(feedback["top_pivot_rows"]).most_common(8)
-    if pivot_rows:
-        row_labels = [name for name, _ in reversed(pivot_rows)]
-        row_values = [value for _, value in reversed(pivot_rows)]
-        ax_rows.barh(row_labels, row_values, color="#9333ea")
-    ax_rows.set_title("Repeatedly pivoted rows")
-    ax_rows.set_xlabel("Pivots")
-    _set_integer_ticks(ax_rows, "x")
-    ax_rows.grid(axis="x", alpha=0.3)
 
     ax_links.axis("off")
     ax_links.set_title("DPLL → theory atoms → Simplex calls → theory result", loc="left")
@@ -632,7 +932,6 @@ def draw_solver_dashboard(
             [
                 f"rounds={feedback['counts']['rounds']}",
                 f"simplex calls={feedback['counts']['simplex_calls']}",
-                f"iterations={feedback['counts']['simplex_iterations']}",
                 f"pivots={feedback['counts']['simplex_pivots']}",
                 f"latest round result={latest_round.get('result', 'RUNNING')}",
                 f"solver={solver.get('status', 'RUNNING')} / {solver.get('reason', '-')}",
@@ -660,6 +959,8 @@ def solver_panel_paths(base_path: str | Path) -> Dict[str, Path]:
 
 
 def _feedback_from(events_or_path) -> Dict[str, Any]:
+    if isinstance(events_or_path, dict) and "simplex_calls" in events_or_path:
+        return events_or_path
     events = (
         read_solver_progress(events_or_path)
         if isinstance(events_or_path, (str, Path))
@@ -788,6 +1089,64 @@ def draw_theory_panel(events_or_path, *, title: str = "DPLL ↔ Theory Flow"):
     return fig, (ax_results, ax_links)
 
 
+def _sat_witness_lines(feedback: Dict[str, Any]) -> List[str]:
+    """Only the selected output conditions of a final SAT branch."""
+    solver = feedback.get("solver", {})
+    if solver.get("status") != "SAT":
+        return []
+    outputs = solver.get("witness_context", {}).get("outputs", {})
+    aliases = {var: name for name, var in outputs.items()}
+    links = [item for item in feedback.get("theory_links", [])
+             if item.get("result") == "THEORY_SAT"]
+    if not links or not aliases:
+        return []
+    conditions = []
+    for item in links[-1].get("inequalities", []):
+        coeffs = item.get("coeffs", {})
+        if not coeffs or not set(coeffs) <= set(aliases):
+            continue
+        terms = []
+        for var, coefficient in sorted(coeffs.items()):
+            sign = "-" if coefficient < 0 else "+"
+            magnitude = abs(coefficient)
+            term = aliases[var] if magnitude == 1 else f"{magnitude:.7g}*{aliases[var]}"
+            terms.append((sign, term))
+        expression = " ".join(
+            (("-" if sign == "-" else "") + term) if index == 0 else f"{sign} {term}"
+            for index, (sign, term) in enumerate(terms)
+        )
+        conditions.append(f"{expression} >= {item['lower']:.7g}")
+    return list(dict.fromkeys(conditions))
+
+
+def _sat_solution_values(feedback: Dict[str, Any]) -> Dict[str, str]:
+    """Format input/output values of the final counterexample by section."""
+    solver = feedback.get("solver", {})
+    model = solver.get("model")
+    if solver.get("status") != "SAT" or not isinstance(model, dict):
+        return {}
+    context = solver.get("witness_context", {})
+
+    inputs = []
+    for name, expression in context.get("inputs", {}).items():
+        coeffs = expression.get("coeffs", {})
+        if all(var in model for var in coeffs):
+            value = math.fsum(coefficient * model[var]
+                              for var, coefficient in coeffs.items())
+            value += expression.get("constant", 0.0)
+            inputs.append(f"{name} = {value:.7g}")
+
+    outputs = [
+        f"{name} = {model[var]:.7g}"
+        for name, var in context.get("outputs", {}).items()
+        if var in model
+    ]
+    return {
+        "inputs": ", ".join(inputs),
+        "outputs": ", ".join(outputs),
+    }
+
+
 def draw_dpll_theory_panel(
     events_or_path, *, title: str = "DPLL Rounds & Theory Flow"
 ):
@@ -867,44 +1226,109 @@ def draw_dpll_theory_panel(
         f"rounds={feedback['counts']['rounds']} | solver={solver.get('status', 'RUNNING')} / {solver.get('reason', '-')}",
         fontsize=9,
     )
-    fig.subplots_adjust(left=0.07, right=0.98, top=0.91, bottom=0.08, hspace=0.38, wspace=0.28)
+    witness_lines = _sat_witness_lines(feedback)
+    if witness_lines:
+        import textwrap
+        formula = " AND ".join(f"({line})" for line in witness_lines)
+        solution = _sat_solution_values(feedback)
+        sections = [
+            ("VNNLIB", formula),
+            ("Counter example input", solution.get("inputs", "unavailable")),
+            ("Network output", solution.get("outputs", "unavailable")),
+        ]
+        cursor = max(0.18, 0.90 - 0.065 * len(link_lines))
+        for label, value in sections:
+            value_lines = textwrap.wrap(value, width=75) or ["unavailable"]
+            # Keep long counterexamples inside the existing flow area.
+            value_lines = value_lines[:4]
+            ax_links.text(
+                0.01, cursor, label, transform=ax_links.transAxes,
+                va="top", family="monospace", fontsize=9,
+                color="#111827", fontweight="bold",
+            )
+            cursor -= 0.052
+            ax_links.text(
+                0.01, cursor, "\n".join(value_lines),
+                transform=ax_links.transAxes, va="top",
+                family="monospace", fontsize=9, color="#166534",
+            )
+            cursor -= 0.052 * len(value_lines) + 0.035
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.91, bottom=0.08, hspace=0.38, wspace=0.5)
     return fig, axes
 
 
-def draw_simplex_panel(events_or_path, *, title: str = "Simplex Progress"):
+def _annotate_simplex_rounds(axes, calls):
+    if len({call.get("round") for call in calls if call.get("round") is not None}) < 2:
+        return
+    previous = None
+    for number, call in enumerate(calls, 1):
+        round_index = call.get("round")
+        if round_index is not None and round_index != previous:
+            for ax in axes:
+                # Boundary before the first call belonging to the new round.
+                ax.axvline(number - 0.5, color="#374151", linestyle="--",
+                           linewidth=1.1, zorder=4)
+                ax.annotate(f"D{round_index}\ncall {number}",
+                            xy=(number - 0.5, 0.98),
+                            xycoords=ax.get_xaxis_transform(),
+                            xytext=(3, 0), textcoords="offset points",
+                            ha="left", va="top", fontsize=8, color="#111827",
+                            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8},
+                            zorder=5)
+        previous = round_index
+
+
+def draw_simplex_panel(
+    events_or_path, *, title: str = "Simplex Progress", show_round_boundaries: bool = False,
+):
     import matplotlib.pyplot as plt
 
     feedback = _feedback_from(events_or_path)
-    calls = feedback["simplex_calls"][-20:]
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8.5))
+    calls = feedback["simplex_calls"]
+    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+    ax_duration, ax_work, ax_results, ax_violations = axes.flat
     fig.suptitle(title, fontsize=16, fontweight="bold")
-    ax_duration, ax_work, ax_results, ax_violations, ax_choices, ax_rows = axes.flat
-    call_numbers = list(
-        range(
-            max(1, len(feedback["simplex_calls"]) - len(calls) + 1),
-            len(feedback["simplex_calls"]) + 1,
-        )
-    )
+    call_numbers = list(range(1, len(calls) + 1))
     durations = [
         max(0.0, float(item.get("duration_seconds", 0.0))) for item in calls
     ]
-    ax_duration.bar(call_numbers, durations, color=[_result_color(item.get("result")) for item in calls])
-    ax_duration.set_xticks(call_numbers)
-    ax_duration.set_title("Call duration")
-    ax_duration.set_xlabel("Simplex call")
+    # One collection retains every call without thousands of Rectangle artists.
+    ax_duration.vlines(call_numbers, 0, durations,
+                       colors=[_result_color(item.get("result")) for item in calls],
+                       linewidth=1.0)
+    _set_integer_ticks(ax_duration, "x")
+    ax_duration.set_xlim(0.5, max(1.5, len(calls) + 0.5))
+    ax_duration.set_title("Call duration (all calls)")
+    ax_duration.set_xlabel("Simplex call order")
     ax_duration.set_ylabel("Seconds")
-    ax_duration.set_ylim(bottom=0)
+    _set_duration_ylim(ax_duration, _completed_call_durations(calls))
     ax_duration.grid(axis="y", alpha=0.3)
 
-    iterations = [int(item.get("iterations", 0)) for item in calls]
     pivots = [int(item.get("pivots", 0)) for item in calls]
-    ax_work.plot(call_numbers, iterations, marker="o", label="iterations")
-    ax_work.plot(call_numbers, pivots, marker="s", label="pivots")
-    ax_work.set_xticks(call_numbers)
+    # 수백~수천 call에서도 선 자체는 모든 값을 연결하되 마커는 최대 약
+    # 80개만 보이게 한다.
+    marker_stride = max(1, (len(call_numbers) + 79) // 80)
+    ax_work.plot(
+        call_numbers,
+        pivots,
+        marker="s",
+        markevery=marker_stride,
+        markersize=2.0,
+        markeredgewidth=0,
+        linewidth=0.75,
+        alpha=0.9,
+        color="#ff7f0e",
+    )
+    _set_integer_ticks(ax_work, "x")
+    ax_work.set_xlim(0.5, max(1.5, len(calls) + 0.5))
     _set_integer_ticks(ax_work, "y")
-    ax_work.set_title("Iterations / pivots per call")
-    ax_work.legend()
+    ax_work.set_title("Pivots per call")
+    ax_work.set_xlabel("Simplex call order")
+    ax_work.set_ylabel("Pivots within call")
     ax_work.grid(alpha=0.3)
+
+    if show_round_boundaries:
+        _annotate_simplex_rounds((ax_duration, ax_work), calls)
 
     result_counts = Counter(item.get("result", "RUNNING") for item in calls)
     result_labels = list(result_counts)
@@ -913,63 +1337,30 @@ def draw_simplex_panel(events_or_path, *, title: str = "Simplex Progress"):
         [result_counts[label] for label in result_labels],
         color=[_result_color(label) for label in result_labels],
     )
-    ax_results.set_title("Call results")
+    ax_results.set_title("Call results (all calls)")
     _set_integer_ticks(ax_results, "y")
     ax_results.tick_params(axis="x", labelrotation=20)
 
-    violated = Counter(feedback["top_violated_variables"]).most_common(8)
+    violated = feedback.get("top_violated_constraints", [])[:8]
     if violated:
         ax_violations.barh(
-            [name for name, _ in reversed(violated)],
-            [value for _, value in reversed(violated)],
+            [_constraint_label(item) for item in reversed(violated)],
+            [int(item.get("count", 0)) for item in reversed(violated)],
             color="#ef4444",
         )
+        ax_violations.tick_params(axis="y", labelsize=7)
     ax_violations.set_title("Repeated bound violations")
+    _annotate_violation_variable_types(ax_violations)
     _set_integer_ticks(ax_violations, "x")
     ax_violations.grid(axis="x", alpha=0.3)
 
-    entering = Counter(feedback["top_entering_variables"])
-    leaving = Counter(feedback["top_leaving_variables"])
-    names = [name for name, _ in (entering + leaving).most_common(8)]
-    positions = list(range(len(names)))
-    ax_choices.barh(
-        [position - 0.2 for position in positions],
-        [entering[name] for name in names],
-        height=0.4,
-        label="entering",
-        color="#16a34a",
-    )
-    ax_choices.barh(
-        [position + 0.2 for position in positions],
-        [leaving[name] for name in names],
-        height=0.4,
-        label="leaving",
-        color="#f97316",
-    )
-    ax_choices.set_yticks(positions)
-    ax_choices.set_yticklabels(names)
-    ax_choices.set_title("Entering / leaving frequency")
-    _set_integer_ticks(ax_choices, "x")
-    ax_choices.legend()
-    ax_choices.grid(axis="x", alpha=0.3)
-
-    rows = Counter(feedback["top_pivot_rows"]).most_common(8)
-    if rows:
-        ax_rows.barh(
-            [name for name, _ in reversed(rows)],
-            [value for _, value in reversed(rows)],
-            color="#9333ea",
-        )
-    ax_rows.set_title("Repeatedly pivoted rows")
-    _set_integer_ticks(ax_rows, "x")
-    ax_rows.grid(axis="x", alpha=0.3)
     fig.text(
         0.01,
         0.01,
-        f"calls={feedback['counts']['simplex_calls']} | iterations={feedback['counts']['simplex_iterations']} | pivots={feedback['counts']['simplex_pivots']}",
+        f"calls={feedback['counts']['simplex_calls']} | pivots={feedback['counts']['simplex_pivots']}",
         fontsize=9,
     )
-    fig.subplots_adjust(left=0.08, right=0.98, top=0.91, bottom=0.08, hspace=0.38, wspace=0.3)
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.91, bottom=0.08, hspace=0.38, wspace=0.62)
     return fig, axes
 
 
@@ -1002,7 +1393,7 @@ class SolverProgressVisualizer:
 body{{margin:0;background:#111827;color:#f9fafb;font-family:sans-serif}}main{{max-width:1500px;margin:auto;padding:18px}}
 h1{{margin:0 0 4px}}p{{margin:0 0 12px;color:#9ca3af}}img{{width:100%;display:block;background:white;border-radius:8px}}
 </style></head><body><main><h1>DPLL(T) / Simplex progress</h1>
-<p>{self.refresh_interval_ms}ms 간격 자동 갱신</p><img id="dashboard" alt="solver progress dashboard"></main>
+<p>이미지 약 {REALTIME_RENDER_INTERVAL_SECONDS:g}초 주기 생성 · 브라우저 {self.refresh_interval_ms}ms 간격 확인</p><img id="dashboard" alt="solver progress dashboard"></main>
 <script>const name={image_name},img=document.getElementById('dashboard');
 function refresh(){{img.src=name+'?t='+Date.now()}}refresh();setInterval(refresh,{self.refresh_interval_ms});</script>
 </body></html>"""
@@ -1012,7 +1403,7 @@ function refresh(){{img.src=name+'?t='+Date.now()}}refresh();setInterval(refresh
     def _render_once(self) -> None:
         import matplotlib.pyplot as plt
 
-        with _RENDER_LOCK:
+        with render_turn():
             fig, _ = draw_solver_dashboard(self.log_path)
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.output_path.with_name(f"{self.output_path.stem}.tmp{self.output_path.suffix}")
@@ -1104,6 +1495,7 @@ class SolverProgressPanelVisualizer(SolverProgressVisualizer):
         }
         self._pending_panels: set[str] = set()
         self._preserved_frames = deque()
+        self._round_active = False
 
     def _render_once(
         self,
@@ -1116,16 +1508,19 @@ class SolverProgressPanelVisualizer(SolverProgressVisualizer):
             "dpll_theory": draw_dpll_theory_panel,
             "simplex": draw_simplex_panel,
         }
-        with _RENDER_LOCK:
+        with render_turn():
             selected = self.panel_paths if panels is None else panels
+            feedback = build_solver_feedback(
+                read_solver_progress(self.log_path) if events is None else events
+            )
             for name in selected:
                 renderer = renderers[name]
                 output = self.panel_paths[name]
                 output.parent.mkdir(parents=True, exist_ok=True)
                 temporary = output.with_name(f"{output.stem}.tmp{output.suffix}")
-                fig, _ = renderer(self.log_path if events is None else events)
+                fig, _ = renderer(feedback)
                 try:
-                    fig.savefig(temporary, dpi=110, bbox_inches="tight")
+                    fig.savefig(temporary, dpi=100)
                     os.replace(temporary, output)
                 finally:
                     plt.close(fig)
@@ -1137,20 +1532,19 @@ class SolverProgressPanelVisualizer(SolverProgressVisualizer):
     ) -> None:
         selected = set(self.panel_paths) if panel is None else {panel}
         selected &= set(self.panel_paths)
+        # Terminal frames include every panel, even if a callback was throttled.
+        if event == "solver_end":
+            selected = set(self.panel_paths)
         if not selected:
             return
-
-        preserve = panel == "dpll_theory" and event in {
-            "round_start",
-            "round_end",
-            "solver_end",
-        }
-        snapshot = read_solver_progress(self.log_path) if preserve else None
         with self._state_lock:
-            if preserve:
-                self._preserved_frames.append((tuple(selected), snapshot))
-            else:
-                self._pending_panels.update(selected)
+            if event == "round_start":
+                self._round_active = True
+            elif event in {"round_end", "solver_end"}:
+                self._round_active = False
+            # Keep only the latest request; never parse the growing log on the
+            # solver thread or build a backlog of obsolete round snapshots.
+            self._pending_panels.update(selected)
             if self._worker is not None:
                 return
             self._worker = threading.Thread(
@@ -1163,23 +1557,27 @@ class SolverProgressPanelVisualizer(SolverProgressVisualizer):
     def _run_updates(self) -> None:
         try:
             while True:
-                preserved = False
+                started = time_ns()
                 with self._state_lock:
-                    if self._preserved_frames:
-                        panels, events = self._preserved_frames.popleft()
-                        preserved = True
-                    elif self._pending_panels:
-                        panels = tuple(sorted(self._pending_panels))
-                        self._pending_panels.clear()
-                        events = None
-                    else:
+                    selected = set(self._pending_panels)
+                    self._pending_panels.clear()
+                    if self._round_active:
+                        selected.update(self.panel_paths)
+                    if not selected:
                         self._worker = None
                         return
-                self._render_once(panels, events)
-                if preserved:
-                    # polling 직전에 파일이 바뀐 경우에도 다음 polling에서 이
-                    # 프레임을 읽을 수 있도록 한 주기보다 조금 오래 유지한다.
-                    sleep(self.refresh_interval_ms / 1000.0 * 1.25)
+                submit_solver_render(
+                    self.log_path, self.panel_paths, tuple(sorted(selected))
+                ).result()
+                with self._state_lock:
+                    more = bool(self._pending_panels) or self._round_active
+                    if not more:
+                        self._worker = None
+                        return
+                # Browser polling is independent of expensive PNG generation.
+                # A real cooldown applies even under continuous solver events.
+                elapsed = (time_ns() - started) / 1_000_000_000
+                sleep(max(0.0, REALTIME_RENDER_INTERVAL_SECONDS - elapsed))
         except Exception as exc:
             warnings.warn(f"solver progress background render 실패: {exc}")
             with self._state_lock:
@@ -1197,13 +1595,16 @@ def write_solver_feedback(
     feedback = build_solver_feedback(events)
     image = Path(image_path)
     image.parent.mkdir(parents=True, exist_ok=True)
-    with _RENDER_LOCK:
+    with render_turn():
         fig, _ = draw_solver_dashboard(events, title="DPLL(T) / Simplex Feedback")
         fig.savefig(image, dpi=150, bbox_inches="tight")
         plt.close(fig)
     resolved_json = Path(json_path) if json_path is not None else image.with_suffix(".json")
     resolved_json.parent.mkdir(parents=True, exist_ok=True)
-    resolved_json.write_text(json.dumps(feedback, ensure_ascii=False, indent=2), encoding="utf-8")
+    resolved_json.write_text(
+        json.dumps(feedback, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
     return feedback
 
 
@@ -1236,12 +1637,13 @@ def write_solver_feedback_panels(
         "dpll_theory": "DPLL Rounds & Theory Flow Feedback",
         "simplex": "Simplex Feedback",
     }
-    with _RENDER_LOCK:
+    with render_turn():
         for name in paths:
             renderer = renderers[name]
             output = paths[name]
             output.parent.mkdir(parents=True, exist_ok=True)
-            fig, _ = renderer(events, title=titles[name])
+            options = {"show_round_boundaries": True} if name == "simplex" else {}
+            fig, _ = renderer(feedback, title=titles[name], **options)
             fig.savefig(output, dpi=150, bbox_inches="tight")
             plt.close(fig)
     resolved_json = (
@@ -1249,6 +1651,7 @@ def write_solver_feedback_panels(
     )
     resolved_json.parent.mkdir(parents=True, exist_ok=True)
     resolved_json.write_text(
-        json.dumps(feedback, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(feedback, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
     )
     return feedback, paths

@@ -38,7 +38,16 @@ def disj(props: List[Prop]) -> Prop:
 # ============================================================
 def ge_lin(terms: Dict[str, float], b: float) -> Prop:
     # sum(terms[var]*var) >= b
-    return InequProp(coeffs=frozenset(terms.items()), b=float(b))
+    # 정확히 0인 계수는 부등식의 의미를 바꾸지 않으므로 저장하지 않는다
+    # (호출자가 0을 넣어도 theory tableau가 부풀지 않게 하는 방어).
+    return InequProp(
+        coeffs=frozenset(
+            (var, coefficient)
+            for var, coefficient in terms.items()
+            if coefficient != 0.0
+        ),
+        b=float(b),
+    )
 
 def eq_lin(terms: Dict[str, float], b: float) -> Prop:
     # sum(terms[var]*var) == b

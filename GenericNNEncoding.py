@@ -95,7 +95,15 @@ def encode_nn(
             # eq_lin 형식으로:  z - sum_k W[j][k]*cur_vars[k] == b[j]
             terms: Dict[str, float] = {z: 1.0}
             for k, xk in enumerate(cur_vars):
-                terms[xk] = terms.get(xk, 0.0) - W[j][k]
+                w = W[j][k]
+                # 정확히 0인 weight는 수식에 아무 영향이 없다. 그런데 항으로
+                # 남겨두면 Simplex tableau의 row마다 0-계수가 그대로 쌓인다
+                # (희소 신경망은 weight의 90% 이상이 exact zero인 경우가 많아
+                # coefficient 수십만 개가 무의미하게 순회 대상이 된다).
+                # -0.0도 0이므로 `w == 0.0`이 둘 다 걸러낸다.
+                if w == 0.0:
+                    continue
+                terms[xk] = terms.get(xk, 0.0) - w
             constraints.append(eq_lin(terms, b[j]))
 
             if is_last:

@@ -30,7 +30,13 @@ def inequ_list_to_reluplex(
 
     for i, ineq in enumerate(ineqs, start=start_idx):
         sname = f"ineq_slack_{i}"
-        coeffs_dict = dict(ineq.coeffs)
+        # 호출자가 InequProp을 직접 만들면서 0 계수를 명시한 경우에도
+        # theory tableau는 희소하게 유지한다.
+        coeffs_dict = {
+            var: coefficient
+            for var, coefficient in ineq.coeffs
+            if coefficient != 0.0
+        }
         row_defs.append((sname, coeffs_dict))
         bounds[sname] = (ineq.b, float("inf"))
 
@@ -85,6 +91,7 @@ def _dpll_t_run(
     profile_stages: bool = False,
     split_logger=None,
     progress=None,
+    round_state: Optional[Dict[str, int]] = None,
 ) -> Tuple[Optional[Dict[str, float]], SolverStatus, str, int]:
     """
     DPLL(T) main loop.
@@ -117,6 +124,8 @@ def _dpll_t_run(
             pass
         if split_logger is not None:
             split_logger.round_start(round_number)
+        if round_state is not None:
+            round_state["current"] = round_number
         if progress is not None:
             progress.round_start(round_number)
         check_deadline(deadline)
@@ -328,6 +337,7 @@ def dpll_t_detailed(
 
     theory_stats: Dict[str, int] = {}
     started_at = monotonic()
+    round_state = {"current": 0}
     deadline = (
         started_at + float(timeout_seconds)
         if timeout_seconds is not None
@@ -347,6 +357,7 @@ def dpll_t_detailed(
                 profile_stages=profile_stages,
                 split_logger=split_logger,
                 progress=progress,
+                round_state=round_state,
             )
         except SolverLimitReached as exc:
             if progress is not None:
@@ -354,7 +365,10 @@ def dpll_t_detailed(
             model = None
             status = SolverStatus.UNKNOWN
             reason = exc.reason
-            rounds = 0
+            # 이론 솔버 안에서 한도에 걸렸어도 그 작업은 현재 활성 DPLL(T)
+            # 라운드에서 일어난 것이다. 0을 보고하면 몇 시간짜리 진행이
+            # 결과에서 사라진다.
+            rounds = int(round_state["current"])
         result = SolverResult(
             status=status,
             model=model,

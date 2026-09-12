@@ -3,13 +3,16 @@
 이 모듈은 `reluplex(row_defs, bounds, relus)`를 제공하며,
 사진의 Algorithm 4(간단화된 Reluplex)의 재귀적 구현을 따릅니다.
 """
+from math import isfinite
 from typing import Any, Dict, List, Tuple, Optional
 from Simplex import (
     Bound,
+    DEFAULT_TOL,
     Row,
     SimplexTableau,
     _compute_basic,
     _pivot,
+    _scaled_tol,
     build_tableau,
     simplex,
 )
@@ -116,6 +119,53 @@ def _check_relu_violations(assign: Dict[str, float], relus: List[Tuple[str, str]
     return viol
 
 
+def _solution_satisfies(
+    row_defs: List[Tuple[str, Dict[str, float]]],
+    bounds: Dict[str, Tuple[float, float]],
+    relus: List[Tuple[str, str]],
+    assign: Optional[Dict[str, float]],
+    tol: float = DEFAULT_TOL,
+) -> bool:
+    """반환할 모델이 현재 하위문제를 실제로 만족하는지 독립적으로 확인한다.
+
+    Simplex의 일관성 검사는 "피벗된 현재 tableau"의 내부 불변식을 보는 것이고,
+    이 검사는 "원래 문제 표현"(row_defs/bounds/ReLU 의미)을 직접 본다. 둘은
+    대상이 다르므로 한쪽만으로는 tableau 변환 과정의 오류를 잡지 못한다.
+    """
+    if assign is None:
+        return False
+
+    required = set(bounds)
+    for basic_var, coeffs in row_defs:
+        required.add(basic_var)
+        required.update(coeffs)
+    for x, y in relus:
+        required.update((x, y))
+
+    if any(var not in assign or not isfinite(assign[var]) for var in required):
+        return False
+
+    for var, (lower, upper) in bounds.items():
+        value = assign[var]
+        if value < lower - _scaled_tol(lower, tol) or value > upper + _scaled_tol(upper, tol):
+            return False
+
+    for basic_var, coeffs in row_defs:
+        try:
+            expected = sum(
+                coefficient * assign[var]
+                for var, coefficient in coeffs.items()
+            )
+        except (OverflowError, ValueError):
+            return False
+        actual = assign[basic_var]
+        scale = max(1.0, abs(expected), abs(actual))
+        if not isfinite(expected) or abs(actual - expected) > tol * scale:
+            return False
+
+    return not _check_relu_violations(assign, relus, tol=tol)
+
+
 def reluplex(
     row_defs: List[Tuple[str, Dict[str, float]]],
     bounds: Dict[str, Tuple[float, float]],
@@ -139,6 +189,13 @@ def reluplex(
     stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
 
+    missing_relu_bounds = {
+        var for pair in relus for var in pair if var not in bounds
+    }
+    if missing_relu_bounds:
+        missing = ", ".join(sorted(missing_relu_bounds))
+        raise ValueError(f"ReLU 변수의 bound가 없습니다: {missing}")
+
     repair_count: Dict[Tuple[str, str], int] = {}
     base_progress_context = dict(progress_context or {})
     # 전역 random 대신 이 호출 전용 RNG를 쓴다. 예전에는 module-level
@@ -157,6 +214,16 @@ def reluplex(
         if report_unknown:
             raise SolverLimitReached(reason)
         return None, False
+
+    def _validated_sat(
+        assign: Optional[Dict[str, float]],
+        rows_now: List[Tuple[str, Dict[str, float]]],
+        bounds_now: Dict[str, Tuple[float, float]],
+    ) -> Tuple[Optional[Dict[str, float]], bool]:
+        """SAT 후보를 원래 문제 표현으로 다시 검산한 뒤에만 SAT으로 인정한다."""
+        if _solution_satisfies(rows_now, bounds_now, relus, assign):
+            return assign, True
+        return _limit("RELUPLEX_MODEL_INVALID")
 
     def _try_repair(
         tableau: SimplexTableau,
@@ -271,7 +338,7 @@ def reluplex(
         assign = sol
         violations = _check_relu_violations(assign, relus)
         if not violations:
-            return assign, True
+            return _validated_sat(assign, current_row_defs, bounds_now)
 
         repair_unknown_reason = None
         for _ in range(local_repair_max_iter):
@@ -297,7 +364,7 @@ def reluplex(
 
                 violations2 = _check_relu_violations(sol2, relus)
                 if not violations2:
-                    return sol2, True
+                    return _validated_sat(sol2, current_row_defs, bounds_now)
 
                 if best_assign is None or len(violations2) < len(_check_relu_violations(best_assign, relus)):
                     best_assign = sol2
@@ -308,7 +375,7 @@ def reluplex(
             assign = best_assign
             violations = _check_relu_violations(assign, relus)
             if not violations:
-                return assign, True
+                return _validated_sat(assign, current_row_defs, bounds_now)
 
             if repair_count.get(_select_violation(violations), 0) >= branch_tau:
                 break

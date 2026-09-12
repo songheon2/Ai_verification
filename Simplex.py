@@ -1,6 +1,15 @@
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any, Dict, List, Optional, Tuple
 from Automation.SolverStatus import SolverLimitReached, check_deadline
+
+
+DEFAULT_TOL = 1e-9
+
+
+def _scaled_tol(value: float, tol: float = DEFAULT_TOL) -> float:
+    """값 크기에 비례한 허용오차 (Simplex/Reluplex 검증이 공유)."""
+    return tol if not isfinite(value) else tol * max(1.0, abs(value))
 
 
 # ─────────────────────────────────────────────
@@ -81,9 +90,46 @@ def build_tableau(
 
     Returns:
         SimplexTableau
+
+    Raises:
+        ValueError: 중복 basic variable, bound 누락, row 우변이 다른 basic
+            variable을 직접 참조하는 비정규 tableau. 이런 입력은 피벗 규칙의
+            전제를 깨서 조용히 잘못된 SAT/UNSAT을 만들 수 있으므로 여기서 막는다.
     """
-    # row_defs를 이용해서 rows를 Row 객체들로 채우기
-    rows = [Row(basic_var=name, coeffs=dict(coeffs))
+    basic_names = [name for name, _ in row_defs]
+    if len(set(basic_names)) != len(basic_names):
+        raise ValueError("tableau의 basic variable 이름은 중복될 수 없습니다")
+
+    missing_bounds = {name for name, _coeffs in row_defs if name not in bounds}
+    missing_bounds.update(
+        var
+        for _name, coeffs in row_defs
+        for var, coefficient in coeffs.items()
+        if coefficient != 0.0 and var not in bounds
+    )
+    if missing_bounds:
+        missing = ", ".join(sorted(missing_bounds))
+        raise ValueError(f"tableau 변수의 bound가 없습니다: {missing}")
+
+    basic_set_input = set(basic_names)
+    basic_dependencies = {
+        var
+        for _name, coeffs in row_defs
+        for var, coefficient in coeffs.items()
+        if coefficient != 0.0 and var in basic_set_input
+    }
+    if basic_dependencies:
+        variables = ", ".join(sorted(basic_dependencies))
+        raise ValueError(
+            "row 우변에는 nonbasic variable만 올 수 있습니다: " + variables
+        )
+
+    # row_defs를 이용해서 rows를 Row 객체들로 채우기.
+    # 정확히 0인 계수는 수식에 영향이 없으므로 저장하지 않는다 (희소 신경망은
+    # weight의 대부분이 exact zero라 이 항목들이 tableau를 통째로 부풀린다).
+    rows = [Row(basic_var=name,
+                coeffs={var: coefficient for var, coefficient in coeffs.items()
+                        if coefficient != 0.0})
             for name, coeffs in row_defs]
 
     bound_map: Dict[str, Bound] = {}
@@ -111,9 +157,14 @@ def build_tableau(
 
     # 기저변수 초기화: row 방정식으로 계산
     for row in rows:
-        assign[row.basic_var] = sum(
-            c * assign[nv] for nv, c in row.coeffs.items()
-        )
+        try:
+            assign[row.basic_var] = sum(
+                c * assign[nv] for nv, c in row.coeffs.items()
+            )
+        except (OverflowError, ValueError):
+            # overflow나 inf-inf는 유효한 tableau 값이 아니다. NaN으로 남겨두면
+            # SAT 직전 일관성 검사가 이를 UNKNOWN으로 승격한다.
+            assign[row.basic_var] = float("nan")
 
     return SimplexTableau(rows=rows, bounds=bound_map, assign=assign)
 
@@ -124,7 +175,55 @@ def build_tableau(
 
 def _compute_basic(tableau: SimplexTableau, row: Row) -> float:
     """row 방정식으로 기저변수의 현재값을 계산"""
-    return sum(c * tableau.assign[nv] for nv, c in row.coeffs.items())
+    try:
+        return sum(c * tableau.assign[nv] for nv, c in row.coeffs.items())
+    except (OverflowError, ValueError):
+        # inf와 -inf의 상쇄나 중간 overflow는 유효한 tableau 값이 아니다.
+        # NaN으로 표시하면 SAT 직전 일관성 검사가 이를 UNKNOWN으로 승격한다.
+        return float("nan")
+
+
+def _tableau_is_consistent(
+    tableau: SimplexTableau,
+    tol: float = DEFAULT_TOL,
+    *,
+    check_bounds: bool = True,
+) -> bool:
+    """SAT 반환 직전 tableau의 구조·방정식·(선택적으로) bound를 검증한다.
+
+    피벗을 수백 번 거친 tableau는 나눗셈 오차가 누적되면서 row 식과 assignment가
+    서로 어긋나거나 inf/nan이 섞일 수 있다. 그 상태의 assignment를 SAT 모델로
+    내보내면 "솔버는 SAT이라는데 실제로는 제약을 만족하지 않는" 결과가 된다.
+    여기서 걸리면 SAT이 아니라 수치 실패(UNKNOWN)로 보고한다.
+    """
+    basic_vars = tableau.basic_vars
+    if len(set(basic_vars)) != len(basic_vars):
+        return False
+
+    basic_set = set(basic_vars)
+    if set(tableau.assign) != set(tableau.bounds):
+        return False
+
+    for var, value in tableau.assign.items():
+        if not isfinite(value):
+            return False
+        if check_bounds:
+            bound = tableau.bounds[var]
+            lower_tol = _scaled_tol(bound.lower, tol)
+            upper_tol = _scaled_tol(bound.upper, tol)
+            if value < bound.lower - lower_tol or value > bound.upper + upper_tol:
+                return False
+
+    for row in tableau.rows:
+        if any(var in basic_set or var not in tableau.assign for var in row.coeffs):
+            return False
+        expected = _compute_basic(tableau, row)
+        actual = tableau.assign[row.basic_var]
+        scale = max(1.0, abs(expected), abs(actual))
+        if not isfinite(expected) or abs(actual - expected) > tol * scale:
+            return False
+
+    return True
 
 
 def _pivot(tableau: SimplexTableau, xi: str, xj: str) -> None:
@@ -374,7 +473,14 @@ def simplex(
                     violated_row = row
 
         if violated_row is None:
-            # 모든 기저변수가 범위 안 → SAT
+            # 모든 기저변수가 범위 안 → SAT.
+            # 단, 여기까지의 피벗으로 tableau 자체가 깨졌다면(row 식과 assignment
+            # 불일치, inf/nan) SAT이라고 내보내면 안 된다 — 수치 실패로 구분한다.
+            if not _tableau_is_consistent(tableau):
+                _finish("NUMERICAL_FAILURE")
+                if report_unknown:
+                    raise SolverLimitReached("SIMPLEX_NUMERICAL_FAILURE")
+                return (None, False)
             if progress is not None and call_id is not None:
                 progress.simplex_iteration(call_id, iteration, violated_var=None)
             _finish("SAT")

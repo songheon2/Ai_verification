@@ -107,6 +107,13 @@ def show(prop: Prop) -> str:
 # ============================================================
 
 def simplify(p: Prop) -> Prop:
+    """논리식을 단순화한다.
+
+    자식이 하나도 안 바뀌었으면 같은 구조의 새 객체를 만들지 않고 원본을 그대로
+    돌려준다. 공유 부분식의 object identity가 유지되므로 불필요한 AST 재생성이
+    사라지고, identity 기반 memo를 쓰는 소비자(예: 시각화)도 깊은 구조를
+    해시하지 않고 캐시를 재사용할 수 있다.
+    """
     if isinstance(p, (VarProp, InequProp, ReLUProp, TrueProp, FalseProp)):
         return p
 
@@ -115,38 +122,45 @@ def simplify(p: Prop) -> Prop:
         if isinstance(inner, TrueProp):  return FalseProp()
         if isinstance(inner, FalseProp): return TrueProp()
         if isinstance(inner, NotProp):   return simplify(inner.p)
-        return NotProp(inner)
+        return p if inner is p.p else NotProp(inner)
 
     if isinstance(p, AndProp):
         a, b = simplify(p.p), simplify(p.q)
         if isinstance(a, FalseProp) or isinstance(b, FalseProp): return FalseProp()
         if isinstance(a, TrueProp):  return b
         if isinstance(b, TrueProp):  return a
-        return AndProp(a, b)
+        return p if (a is p.p and b is p.q) else AndProp(a, b)
 
     if isinstance(p, OrProp):
         a, b = simplify(p.p), simplify(p.q)
         if isinstance(a, TrueProp) or isinstance(b, TrueProp): return TrueProp()
         if isinstance(a, FalseProp): return b
         if isinstance(b, FalseProp): return a
-        return OrProp(a, b)
+        return p if (a is p.p and b is p.q) else OrProp(a, b)
 
     if isinstance(p, ImplProp):
-        return ImplProp(simplify(p.p), simplify(p.q))
+        a, b = simplify(p.p), simplify(p.q)
+        return p if (a is p.p and b is p.q) else ImplProp(a, b)
 
     raise TypeError(p)
 
 
 def elim_impl(p: Prop) -> Prop:
-    """(p -> q) == (~p or q) 로 바꿔 ImplProp 제거"""
+    """(p -> q) == (~p or q) 로 바꿔 ImplProp 제거.
+
+    simplify()와 같은 이유로, 자식이 안 바뀌면 원본 객체를 그대로 돌려준다.
+    """
     if isinstance(p, (VarProp, InequProp, ReLUProp, TrueProp, FalseProp)):
         return p
     if isinstance(p, NotProp):
-        return NotProp(elim_impl(p.p))
+        inner = elim_impl(p.p)
+        return p if inner is p.p else NotProp(inner)
     if isinstance(p, AndProp):
-        return AndProp(elim_impl(p.p), elim_impl(p.q))
+        a, b = elim_impl(p.p), elim_impl(p.q)
+        return p if (a is p.p and b is p.q) else AndProp(a, b)
     if isinstance(p, OrProp):
-        return OrProp(elim_impl(p.p), elim_impl(p.q))
+        a, b = elim_impl(p.p), elim_impl(p.q)
+        return p if (a is p.p and b is p.q) else OrProp(a, b)
     if isinstance(p, ImplProp):
         return OrProp(NotProp(elim_impl(p.p)), elim_impl(p.q))
     raise TypeError(p)
@@ -163,16 +177,20 @@ def to_nnf(p: Prop) -> Prop:
             return x
 
         if isinstance(x, AndProp):
-            return simplify(AndProp(nnf(x.p), nnf(x.q)))
+            a, b = nnf(x.p), nnf(x.q)
+            # 자식이 그대로면 같은 AndProp을 새로 만들지 않는다 (공유 부분식의
+            # identity 유지).
+            return x if (a is x.p and b is x.q) else simplify(AndProp(a, b))
 
         if isinstance(x, OrProp):
-            return simplify(OrProp(nnf(x.p), nnf(x.q)))
+            a, b = nnf(x.p), nnf(x.q)
+            return x if (a is x.p and b is x.q) else simplify(OrProp(a, b))
 
         if isinstance(x, NotProp):
             a = simplify(x.p)
 
             if isinstance(a, (VarProp, InequProp, ReLUProp)):
-                return NotProp(a)
+                return x if a is x.p else NotProp(a)
 
             if isinstance(a, TrueProp):  return FalseProp()
             if isinstance(a, FalseProp): return TrueProp()

@@ -16,6 +16,7 @@ from Simplex import (
     build_tableau,
     simplex,
 )
+from BoundDerivation import derive_bounds, apply_fixed_relus
 from Automation.SolverStatus import SolverLimitReached, check_deadline
 from visualization.SolveTrace import SolveTrace, span
 import copy
@@ -187,6 +188,7 @@ def reluplex(
     warm_start: bool = True,
     seed: Optional[int] = 0,
     stats: Optional[Dict[str, int]] = None,
+    derive_bound: bool = True,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
 
     missing_relu_bounds = {
@@ -509,7 +511,35 @@ def reluplex(
         return _limit(repair_unknown_reason or "RELUPLEX_REPAIR_INCONCLUSIVE")
 
     # [누락되었던 부분 복구] reluplex 함수의 마지막 반환문!
-    return _rec(dict(bounds), 0, row_defs)
+    # ── 경계 유도 (논문 4절 Tighter Bound Derivation) ──
+    # 탐색을 시작하기 전에 구간 전파로 변수 경계를 좁히고, 그 결과 항상 켜짐/
+    # 항상 꺼짐이 확정된 ReLU를 선형 제약으로 바꿔 넣는다. 확정된 ReLU는
+    # relus 목록에서 빠지므로 위반 검사·repair·분기 대상에서 모두 제외된다.
+    # 이게 없으면 모든 ReLU의 pre-activation bound가 (-inf, inf)라
+    # _splittable()이 항상 True를 돌려주고, 안정인 뉴런까지 전부 분기 후보가 된다.
+    active_row_defs = row_defs
+    active_bounds = dict(bounds)
+    if derive_bound and relus:
+        tightened, fixed, infeasible = derive_bounds(row_defs, bounds, relus)
+        if infeasible:
+            # 전파만으로 l > u 모순이 드러났다 — 분기할 것도 없이 UNSAT
+            if stats is not None:
+                stats['DERIVE_INFEASIBLE'] = stats.get('DERIVE_INFEASIBLE', 0) + 1
+            return None, False
+        if fixed:
+            active_row_defs, active_bounds = apply_fixed_relus(
+                row_defs, tightened, fixed
+            )
+            # relus 자체를 다시 묶는다. _rec와 _check_relu_violations가 이 이름을
+            # 클로저로 참조하므로, 확정된 ReLU는 위반 검사·repair·분기에서 모두 빠진다.
+            relus = [p for p in relus if p not in fixed]
+        else:
+            active_bounds = tightened
+        if stats is not None:
+            stats['DERIVE_FIXED_RELUS'] = len(fixed)
+            stats['DERIVE_REMAINING_RELUS'] = len(relus)
+
+    return _rec(active_bounds, 0, active_row_defs)
 
 
 # ─────────────────────────────────────────────

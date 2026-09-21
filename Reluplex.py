@@ -429,10 +429,15 @@ def reluplex(
             # 이 with 블록이 열려있는 동안(양쪽 분기가 다 끝날 때까지)이
             # "지금 branch_x에서 split이 진행 중"인 구간이다 — 시각화에서
             # "현재 열려있는 branch_x 스택"을 그대로 이 이벤트들로 재구성한다.
-            with span(trace, "reluplex_split", depth=depth, branch_x=branch_x):
+            with span(
+                trace, "reluplex_split", depth=depth, branch_x=branch_x
+            ) as split_trace_event:
                 lo, hi = bounds_now.get(branch_x, (float('-inf'), float('inf')))
                 layer = neuron_key[0] if neuron_key is not None else None
                 index = neuron_key[1] if neuron_key is not None else None
+                if split_trace_event is not None:
+                    split_trace_event.meta["layer"] = layer
+                    split_trace_event.meta["index"] = index
 
                 # 1. x >= 0 분기
                 bounds1 = dict(bounds_now)
@@ -458,13 +463,57 @@ def reluplex(
                     warm1 = _child_tableau(tableau, new_rows1)
 
                 try:
-                    try:
-                        r1, sat1 = _rec(bounds1, depth + 1, row_defs1, warm1)
-                    except SolverLimitReached as exc:
-                        if exc.reason == "TIMEOUT":
-                            raise
-                        branch_unknown_reason = exc.reason
-                        r1, sat1 = None, False
+                    active_branch_log_id = None
+                    if split_logger is not None and hasattr(split_logger, "branch_begin"):
+                        active_branch_log_id = split_logger.branch_begin(
+                            branch_x,
+                            layer,
+                            index,
+                            phase="+",
+                            depth=depth + 1,
+                            bound=f"[{max(0.0, lo)}, {hi}]",
+                            split_id=split_id,
+                        )
+                    with span(
+                        trace,
+                        "reluplex_branch",
+                        depth=depth + 1,
+                        branch_x=branch_x,
+                        phase="+",
+                        layer=layer,
+                        index=index,
+                        bound=f"[{max(0.0, lo)}, {hi}]",
+                    ) as active_branch_event:
+                        try:
+                            r1, sat1 = _rec(bounds1, depth + 1, row_defs1, warm1)
+                        except SolverLimitReached as exc:
+                            if active_branch_event is not None:
+                                active_branch_event.meta["result"] = (
+                                    "TIMEOUT" if exc.reason == "TIMEOUT" else "UNKNOWN"
+                                )
+                                active_branch_event.meta["reason"] = exc.reason
+                            if active_branch_log_id is not None:
+                                split_logger.branch_end(
+                                    active_branch_log_id,
+                                    result=("TIMEOUT" if exc.reason == "TIMEOUT" else "UNKNOWN"),
+                                    reason=exc.reason,
+                                )
+                                active_branch_log_id = None
+                            if exc.reason == "TIMEOUT":
+                                raise
+                            branch_unknown_reason = exc.reason
+                            r1, sat1 = None, False
+                        else:
+                            if active_branch_event is not None:
+                                active_branch_event.meta["result"] = (
+                                    "SAT" if sat1 else "UNSAT"
+                                )
+                            if active_branch_log_id is not None:
+                                split_logger.branch_end(
+                                    active_branch_log_id,
+                                    result=("SAT" if sat1 else "UNSAT"),
+                                )
+                                active_branch_log_id = None
                     if sat1:
                         return r1, True
                     # 자식이 끝났으므로 참조를 놓아준다 (depth만큼 tableau가
@@ -484,17 +533,71 @@ def reluplex(
                         if not inactive_bounds_conflict:
                             bounds2[relu_y] = (max(y_lo, 0.0), min(y_hi, 0.0))
 
-                    if inactive_bounds_conflict:
-                        r2, sat2 = None, False
-                    else:
-                        warm2 = _child_tableau(tableau, []) if warm_start else None
-                        try:
-                            r2, sat2 = _rec(bounds2, depth + 1, row_defs2, warm2)
-                        except SolverLimitReached as exc:
-                            if exc.reason == "TIMEOUT":
-                                raise
-                            branch_unknown_reason = branch_unknown_reason or exc.reason
+                    inactive_branch_log_id = None
+                    if split_logger is not None and hasattr(split_logger, "branch_begin"):
+                        inactive_branch_log_id = split_logger.branch_begin(
+                            branch_x,
+                            layer,
+                            index,
+                            phase="-",
+                            depth=depth + 1,
+                            bound=f"[{lo}, {min(0.0, hi)}]",
+                            split_id=split_id,
+                        )
+                    with span(
+                        trace,
+                        "reluplex_branch",
+                        depth=depth + 1,
+                        branch_x=branch_x,
+                        phase="-",
+                        layer=layer,
+                        index=index,
+                        bound=f"[{lo}, {min(0.0, hi)}]",
+                    ) as inactive_branch_event:
+                        if inactive_bounds_conflict:
                             r2, sat2 = None, False
+                            if inactive_branch_event is not None:
+                                inactive_branch_event.meta["result"] = "UNSAT"
+                                inactive_branch_event.meta["reason"] = "BOUNDS_CONFLICT"
+                            if inactive_branch_log_id is not None:
+                                split_logger.branch_end(
+                                    inactive_branch_log_id,
+                                    result="UNSAT",
+                                    reason="BOUNDS_CONFLICT",
+                                )
+                                inactive_branch_log_id = None
+                        else:
+                            warm2 = _child_tableau(tableau, []) if warm_start else None
+                            try:
+                                r2, sat2 = _rec(bounds2, depth + 1, row_defs2, warm2)
+                            except SolverLimitReached as exc:
+                                if inactive_branch_event is not None:
+                                    inactive_branch_event.meta["result"] = (
+                                        "TIMEOUT" if exc.reason == "TIMEOUT" else "UNKNOWN"
+                                    )
+                                    inactive_branch_event.meta["reason"] = exc.reason
+                                if inactive_branch_log_id is not None:
+                                    split_logger.branch_end(
+                                        inactive_branch_log_id,
+                                        result=("TIMEOUT" if exc.reason == "TIMEOUT" else "UNKNOWN"),
+                                        reason=exc.reason,
+                                    )
+                                    inactive_branch_log_id = None
+                                if exc.reason == "TIMEOUT":
+                                    raise
+                                branch_unknown_reason = branch_unknown_reason or exc.reason
+                                r2, sat2 = None, False
+                            else:
+                                if inactive_branch_event is not None:
+                                    inactive_branch_event.meta["result"] = (
+                                        "SAT" if sat2 else "UNSAT"
+                                    )
+                                if inactive_branch_log_id is not None:
+                                    split_logger.branch_end(
+                                        inactive_branch_log_id,
+                                        result=("SAT" if sat2 else "UNSAT"),
+                                    )
+                                    inactive_branch_log_id = None
                     if sat2:
                         return r2, True
 

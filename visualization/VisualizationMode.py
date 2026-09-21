@@ -39,6 +39,7 @@ class VisualizationPaths:
     realtime_image: Path
     feedback_heatmap: Path
     feedback_history: Path
+    feedback_search_tree: Path
     solver_progress_log: Path
     solver_realtime_image: Path
     solver_feedback_image: Path
@@ -65,20 +66,23 @@ def create_visualization_run_directory(
     output_root: str | Path | None = None,
     stable_path: bool = False,
 ) -> Path:
-    """Create a run folder; browser sessions use a stable, status-neutral URL."""
+    """Create ``outputs/YYYY-MM-DD/<run>/<model>`` for one verification run."""
     root = (
         Path(output_root)
         if output_root is not None
         else Path(__file__).resolve().parent / "outputs"
     )
     root.mkdir(parents=True, exist_ok=True)
-    start_text = started_at.astimezone().strftime("%Y%m%d_%H%M%S")
+    local_started_at = started_at.astimezone()
+    date_directory = root / local_started_at.strftime("%Y-%m-%d")
+    date_directory.mkdir(parents=True, exist_ok=True)
+    start_text = local_started_at.strftime("%Y%m%d_%H%M%S")
     model_name = _safe_folder_component(_artifact_stem(model_path))
     base_name = start_text if stable_path else f"{start_text}~running"
-    group_directory = root / base_name
+    group_directory = date_directory / base_name
     suffix = 2
     while group_directory.exists():
-        group_directory = root / f"{base_name}_{suffix}"
+        group_directory = date_directory / f"{base_name}_{suffix}"
         suffix += 1
     group_directory.mkdir()
     run_directory = group_directory / model_name
@@ -125,6 +129,7 @@ def default_visualization_paths(
             realtime_image=resolved_output_dir / "relu_realtime.png",
             feedback_heatmap=resolved_output_dir / "relu_feedback_heatmap.png",
             feedback_history=resolved_output_dir / "relu_feedback_history.png",
+            feedback_search_tree=resolved_output_dir / "relu_search_tree.html",
             solver_progress_log=resolved_output_dir / "solver_progress.jsonl",
             solver_realtime_image=resolved_output_dir / "solver_realtime.png",
             solver_feedback_image=resolved_output_dir / "solver_feedback.png",
@@ -135,6 +140,7 @@ def default_visualization_paths(
         realtime_image=resolved_output_dir / f"{stem}_realtime.png",
         feedback_heatmap=resolved_output_dir / f"{stem}_feedback.png",
         feedback_history=resolved_output_dir / f"{stem}_feedback_history.png",
+        feedback_search_tree=resolved_output_dir / f"{stem}_search_tree.html",
         solver_progress_log=resolved_output_dir / f"{stem}_solver_progress.jsonl",
         solver_realtime_image=resolved_output_dir / f"{stem}_solver_realtime.png",
         solver_feedback_image=resolved_output_dir / f"{stem}_solver_feedback.png",

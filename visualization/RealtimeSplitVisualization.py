@@ -19,6 +19,7 @@ from time import sleep, time_ns
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from visualization.RenderLock import serialized_render
+from visualization.ReluSearchTree import branch_log_path
 from visualization.RenderProcess import (
     REALTIME_RENDER_INTERVAL_SECONDS,
     submit_relu_render,
@@ -91,6 +92,8 @@ def read_split_events(path: str | Path) -> List[SplitLogEvent]:
 
 def split_events_from_trace(trace) -> List[SplitLogEvent]:
     """feedback-only 실행의 in-memory split span을 로그 이벤트로 변환한다."""
+    from visualization.NetworkLayout import parse_neuron_var
+
     events: List[SplitLogEvent] = []
     sequence = 0
     for trace_event in trace.events:
@@ -100,6 +103,10 @@ def split_events_from_trace(trace) -> List[SplitLogEvent]:
         split_id = f"trace-{sequence}"
         layer = trace_event.meta.get("layer")
         index = trace_event.meta.get("index")
+        if layer is None or index is None:
+            parsed = parse_neuron_var(str(trace_event.branch_x or ""))
+            if parsed is not None:
+                layer, index = parsed
         common = {
             "timestamp": "",
             "split_id": split_id,
@@ -168,9 +175,11 @@ class SplitEventLogger:
         model_layer_sizes: Optional[Sequence[int]] = None,
     ) -> None:
         self.path = Path(path)
+        self.branch_path = branch_log_path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if reset_log:
             self.path.write_text("", encoding="utf-8")
+            self.branch_path.write_text("", encoding="utf-8")
             metadata_path = split_metadata_path(self.path)
             if model_layer_sizes is None and metadata_path.exists():
                 metadata_path.unlink()
@@ -189,12 +198,14 @@ class SplitEventLogger:
         self.update_callback = update_callback
         self.global_split_count = 0
         self._sequence = 0
+        self._split_orders: Dict[str, int] = {}
         self._lock = threading.Lock()
 
     def begin(self, variable: str, layer: Optional[int], index: Optional[int]) -> str:
         with self._lock:
             self._sequence += 1
             split_id = f"{uuid.uuid4().hex}-{self._sequence}"
+            self._split_orders[split_id] = self._sequence
             self.global_split_count += 1
             self._append(split_id, variable, layer, index, "+")
             return split_id
@@ -215,6 +226,60 @@ class SplitEventLogger:
         with self._lock:
             self.global_split_count = max(0, self.global_split_count - 1)
             self._append(split_id, variable, layer, index, "-")
+            self._split_orders.pop(split_id, None)
+
+    def branch_begin(
+        self,
+        variable: str,
+        layer: Optional[int],
+        index: Optional[int],
+        *,
+        phase: str,
+        depth: int,
+        bound: str,
+        split_id: Optional[str] = None,
+    ) -> str:
+        """Record entry into one active (+) or inactive (-) ReLU branch."""
+        branch_id = uuid.uuid4().hex
+        self._append_branch({
+            "event": "branch_start",
+            "branch_id": branch_id,
+            "variable": variable,
+            "layer": layer,
+            "index": index,
+            "phase": phase,
+            "depth": depth,
+            "bound": bound,
+            "split_number": self._split_orders.get(split_id) if split_id else None,
+        })
+        return branch_id
+
+    def branch_end(
+        self,
+        branch_id: str,
+        *,
+        result: str,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Record the result of a previously entered ReLU branch."""
+        self._append_branch({
+            "event": "branch_end",
+            "branch_id": branch_id,
+            "result": result,
+            "reason": reason,
+        })
+
+    def _append_branch(self, values: Dict) -> None:
+        with self._lock:
+            record = {
+                "timestamp": datetime.now().astimezone().isoformat(timespec="microseconds"),
+                "time_ns": time_ns(),
+                **values,
+            }
+            with self.branch_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+                stream.flush()
+        self.request_update()
 
     def _append(
         self,

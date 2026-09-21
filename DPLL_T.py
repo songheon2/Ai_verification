@@ -272,6 +272,7 @@ def dpll_t_detailed(
     split_log_path: Optional[str] = None,
     split_update_callback: Optional[Callable[[], None]] = None,
     realtime_output_path: Optional[str] = None,
+    realtime_tree_output_path: Optional[str] = None,
     realtime_open_view: bool = False,
     realtime_playback_ms: int = 0,
     realtime_window_seconds: float = 300.0,
@@ -299,11 +300,16 @@ def dpll_t_detailed(
     # SplitHeatmap이 담당하므로 solver 실행 모드로 취급하지 않는다.
     split_logger = None
     visualizer = None
+    tree_visualizer = None
     if split_mode == "realtime":
         from visualization.RealtimeSplitVisualization import (
             DEFAULT_SPLIT_LOG_PATH,
             RealtimeSplitVisualizer,
             SplitEventLogger,
+        )
+        from visualization.ReluSearchTree import (
+            RealtimeSearchTreeVisualizer,
+            branch_log_path,
         )
 
         resolved_split_log_path = split_log_path or DEFAULT_SPLIT_LOG_PATH
@@ -326,6 +332,17 @@ def dpll_t_detailed(
                 def update_callback():
                     visualizer.request_update()
                     original_callback()
+        if realtime_tree_output_path is not None:
+            tree_visualizer = RealtimeSearchTreeVisualizer(
+                branch_log_path(resolved_split_log_path),
+                realtime_tree_output_path,
+            )
+            previous_callback = update_callback
+
+            def update_callback():
+                tree_visualizer.request_update()
+                if previous_callback is not None:
+                    previous_callback()
         split_logger = SplitEventLogger(
             resolved_split_log_path,
             update_callback=update_callback,
@@ -386,6 +403,11 @@ def dpll_t_detailed(
         if visualizer is not None:
             visualizer.request_update()
             visualizer.flush()
+        if tree_visualizer is not None:
+            if "result" in locals():
+                tree_visualizer.set_overall(result.status.value, result.reason)
+            tree_visualizer.request_update()
+            tree_visualizer.flush()
 
 
 def dpll_t(
@@ -400,6 +422,7 @@ def dpll_t(
     split_log_path: Optional[str] = None,
     split_update_callback: Optional[Callable[[], None]] = None,
     realtime_output_path: Optional[str] = None,
+    realtime_tree_output_path: Optional[str] = None,
     realtime_open_view: bool = False,
     realtime_playback_ms: int = 0,
     realtime_window_seconds: float = 300.0,
@@ -419,6 +442,7 @@ def dpll_t(
         split_log_path=split_log_path,
         split_update_callback=split_update_callback,
         realtime_output_path=realtime_output_path,
+        realtime_tree_output_path=realtime_tree_output_path,
         realtime_open_view=realtime_open_view,
         realtime_playback_ms=realtime_playback_ms,
         realtime_window_seconds=realtime_window_seconds,

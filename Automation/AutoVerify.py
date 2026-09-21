@@ -198,6 +198,7 @@ from visualization.RealtimeSplitVisualization import (
     split_events_from_trace,
     split_metadata_path,
 )
+from visualization.ReluSearchTree import write_relu_search_tree_html
 from visualization.SolverProgress import (
     SolverProgressLogger,
     SolverProgressPanelVisualizer,
@@ -935,6 +936,11 @@ def run_vnnlib_verification(
         split_heatmap_output = str(default_paths.feedback_heatmap)
     if feedback_relu_enabled and relu_feedback_output is None:
         relu_feedback_output = str(default_paths.feedback_history)
+    relu_search_tree_output = (
+        str(default_paths.feedback_search_tree)
+        if (feedback_relu_enabled or realtime_relu_enabled)
+        else None
+    )
     if realtime_relu_enabled and realtime_log_output is None:
         realtime_log_output = str(default_paths.realtime_log)
     if realtime_relu_enabled and realtime_split_output is None:
@@ -1019,6 +1025,12 @@ def run_vnnlib_verification(
             )
             initial_split_logger.request_update()
             initial_split_visualizer.flush()
+            write_relu_search_tree_html(
+                SolveTrace(),
+                relu_search_tree_output,
+                overall_status="RUNNING",
+                title="Realtime ReLU Search Tree",
+            )
 
         if realtime_solver_enabled:
             initial_progress_visualizer = SolverProgressPanelVisualizer(
@@ -1047,6 +1059,11 @@ def run_vnnlib_verification(
             realtime_panel_outputs,
             realtime_dashboard_path,
             refresh_interval_ms=realtime_refresh_ms,
+            embedded_pages=(
+                {"relu-tree": relu_search_tree_output}
+                if realtime_relu_enabled and relu_search_tree_output is not None
+                else None
+            ),
         ).write(open_browser=open_realtime_view)
 
     input_vars = [f"x{index}" for index in range(info.input_size)]
@@ -1184,6 +1201,9 @@ def run_vnnlib_verification(
             split_mode="realtime" if realtime_relu_enabled else "off",
             split_log_path=realtime_log_output,
             realtime_output_path=realtime_split_output if realtime_relu_enabled else None,
+            realtime_tree_output_path=(
+                relu_search_tree_output if realtime_relu_enabled else None
+            ),
             realtime_open_view=False,
             realtime_playback_ms=realtime_playback_ms,
             realtime_window_seconds=realtime_window_seconds,
@@ -1221,7 +1241,9 @@ def run_vnnlib_verification(
                 "log_output": realtime_log_output,
                 "metadata_output": str(split_metadata_path(realtime_log_output)),
                 "image_output": realtime_split_output,
+                "search_tree_output": relu_search_tree_output,
             })
+            result["relu_search_tree_output"] = relu_search_tree_output
         if realtime_solver_enabled:
             realtime_result["solver_progress"] = {
                 "log_output": solver_progress_log_output,
@@ -1282,12 +1304,24 @@ def run_vnnlib_verification(
             plt.close(fig)
             result["relu_feedback_output"] = relu_feedback_output
 
+        if feedback_relu_enabled and relu_search_tree_output is not None:
+            write_relu_search_tree_html(
+                trace,
+                relu_search_tree_output,
+                overall_status=solver_result.status.value,
+                overall_reason=solver_result.reason,
+                title=f"ReLU Search Tree: {Path(model_path).name}",
+            )
+            result["relu_search_tree_output"] = relu_search_tree_output
+
         if feedback_relu_enabled:
             feedback_result = result["visualization"].setdefault("feedback", {})
             if split_heatmap_output is not None:
                 feedback_result["heatmap_output"] = split_heatmap_output
             if relu_feedback_output is not None:
                 feedback_result["relu_history_output"] = relu_feedback_output
+            if relu_search_tree_output is not None:
+                feedback_result["relu_search_tree_output"] = relu_search_tree_output
             if realtime_relu_enabled:
                 feedback_result["relu_log_output"] = realtime_log_output
             else:
@@ -1551,6 +1585,8 @@ def _print_vnnlib_verification(result: Mapping[str, Any]) -> None:
         print(f"  split heatmap: {result['split_heatmap_output']}")
     if result.get("relu_feedback_output"):
         print(f"  ReLU full-period feedback: {result['relu_feedback_output']}")
+    if result.get("relu_search_tree_output"):
+        print(f"  ReLU search tree: {result['relu_search_tree_output']}")
     visualization = result.get("visualization", {})
     if visualization.get("mode", "off") != "off":
         print(f"  visualization: {visualization['mode']}")

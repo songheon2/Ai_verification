@@ -1204,6 +1204,7 @@ def run_vnnlib_verification(
             realtime_tree_output_path=(
                 relu_search_tree_output if realtime_relu_enabled else None
             ),
+            realtime_tree_title=f"ReLU Search Tree: {Path(model_path).name}",
             realtime_open_view=False,
             realtime_playback_ms=realtime_playback_ms,
             realtime_window_seconds=realtime_window_seconds,
@@ -1311,6 +1312,7 @@ def run_vnnlib_verification(
                 overall_status=solver_result.status.value,
                 overall_reason=solver_result.reason,
                 title=f"ReLU Search Tree: {Path(model_path).name}",
+                theory_stats=solver_result.theory_stats,
             )
             result["relu_search_tree_output"] = relu_search_tree_output
 

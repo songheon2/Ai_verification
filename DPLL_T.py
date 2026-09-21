@@ -273,6 +273,7 @@ def dpll_t_detailed(
     split_update_callback: Optional[Callable[[], None]] = None,
     realtime_output_path: Optional[str] = None,
     realtime_tree_output_path: Optional[str] = None,
+    realtime_tree_title: str = "Realtime ReLU Search Tree",
     realtime_open_view: bool = False,
     realtime_playback_ms: int = 0,
     realtime_window_seconds: float = 300.0,
@@ -298,6 +299,7 @@ def dpll_t_detailed(
     # 실시간 모드는 append-only 로그와 update callback을 명시적으로 요청한
     # 실행에서만 켠다. 사후 피드백 visualization은 기존 SolveTrace와
     # SplitHeatmap이 담당하므로 solver 실행 모드로 취급하지 않는다.
+    theory_stats: Dict[str, int] = {}
     split_logger = None
     visualizer = None
     tree_visualizer = None
@@ -336,6 +338,8 @@ def dpll_t_detailed(
             tree_visualizer = RealtimeSearchTreeVisualizer(
                 branch_log_path(resolved_split_log_path),
                 realtime_tree_output_path,
+                theory_stats=theory_stats,
+                title=realtime_tree_title,
             )
             previous_callback = update_callback
 
@@ -352,7 +356,6 @@ def dpll_t_detailed(
         # split이 한 번도 발생하지 않아도 0개 상태의 실시간 화면을 만든다.
         split_logger.request_update()
 
-    theory_stats: Dict[str, int] = {}
     started_at = monotonic()
     round_state = {"current": 0}
     deadline = (

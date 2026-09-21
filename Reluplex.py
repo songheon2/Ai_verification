@@ -191,6 +191,12 @@ def reluplex(
     derive_bound: bool = True,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
 
+    original_relu_count = len(relus)
+    if stats is not None:
+        stats['DERIVE_TOTAL_RELUS'] = original_relu_count
+        stats['DERIVE_FIXED_RELUS'] = 0
+        stats['DERIVE_REMAINING_RELUS'] = original_relu_count
+
     missing_relu_bounds = {
         var for pair in relus for var in pair if var not in bounds
     }
@@ -483,6 +489,7 @@ def reluplex(
                         layer=layer,
                         index=index,
                         bound=f"[{max(0.0, lo)}, {hi}]",
+                        round_index=base_progress_context.get("round_index"),
                     ) as active_branch_event:
                         try:
                             r1, sat1 = _rec(bounds1, depth + 1, row_defs1, warm1)
@@ -553,6 +560,7 @@ def reluplex(
                         layer=layer,
                         index=index,
                         bound=f"[{lo}, {min(0.0, hi)}]",
+                        round_index=base_progress_context.get("round_index"),
                     ) as inactive_branch_event:
                         if inactive_bounds_conflict:
                             r2, sat2 = None, False
@@ -624,6 +632,9 @@ def reluplex(
     active_bounds = dict(bounds)
     if derive_bound and relus:
         tightened, fixed, infeasible = derive_bounds(row_defs, bounds, relus)
+        if stats is not None:
+            stats['DERIVE_FIXED_RELUS'] = len(fixed)
+            stats['DERIVE_REMAINING_RELUS'] = original_relu_count - len(fixed)
         if infeasible:
             # 전파만으로 l > u 모순이 드러났다 — 분기할 것도 없이 UNSAT
             if stats is not None:
@@ -638,9 +649,6 @@ def reluplex(
             relus = [p for p in relus if p not in fixed]
         else:
             active_bounds = tightened
-        if stats is not None:
-            stats['DERIVE_FIXED_RELUS'] = len(fixed)
-            stats['DERIVE_REMAINING_RELUS'] = len(relus)
 
     return _rec(active_bounds, 0, active_row_defs)
 

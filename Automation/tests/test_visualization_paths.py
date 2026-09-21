@@ -26,7 +26,7 @@ from visualization.UnifiedRealtimeDashboard import UnifiedRealtimeDashboard
 
 
 class VisualizationOutputPathTests(unittest.TestCase):
-    def test_run_directory_is_grouped_by_start_date(self):
+    def test_run_directory_is_grouped_by_model_then_start_time(self):
         started_at = datetime(2026, 9, 18, 3, 4, 5, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as directory:
             output_root = Path(directory)
@@ -34,30 +34,31 @@ class VisualizationOutputPathTests(unittest.TestCase):
                 "model.onnx", started_at=started_at, output_root=output_root
             )
             local_started_at = started_at.astimezone()
+            self.assertEqual(run_directory.parent.name, "model")
             self.assertEqual(
-                run_directory.parent.parent.name,
-                local_started_at.strftime("%Y-%m-%d"),
-            )
-            self.assertEqual(
-                run_directory.parent.name,
-                f"{local_started_at:%Y%m%d_%H%M%S}~running",
+                run_directory.name, f"{local_started_at:%Y%m%d_%H%M%S}~running"
             )
 
-    def test_finalized_directory_stays_in_start_date_folder(self):
+    def test_finalized_directory_stays_in_model_folder(self):
         started_at = datetime(2026, 9, 18, 3, 4, 5, tzinfo=timezone.utc)
         finished_at = datetime(2026, 9, 18, 3, 5, 6, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as directory:
             staging = create_visualization_run_directory(
                 "model.onnx", started_at=started_at, output_root=directory
             )
-            date_directory = staging.parent.parent
+            model_directory = staging.parent
             finalized = finalize_visualization_run_directory(
                 staging,
                 "model.onnx",
                 started_at=started_at,
                 finished_at=finished_at,
             )
-            self.assertEqual(finalized.parent.parent, date_directory)
+            self.assertEqual(finalized.parent, model_directory)
+            self.assertEqual(
+                finalized.name,
+                f"{started_at.astimezone():%Y%m%d_%H%M%S}~"
+                f"{finished_at.astimezone():%Y%m%d_%H%M%S}",
+            )
             self.assertTrue(finalized.is_dir())
 
 
@@ -85,6 +86,7 @@ class ReLUSearchTreeTests(unittest.TestCase):
         )
         self.assertEqual(roots[0]["children"][0]["result"], "CLOSED")
         self.assertEqual(roots[0]["subtreeSize"], 3)
+        self.assertEqual(roots[0]["maxDepth"], 2)
 
         final_roots = build_relu_search_tree(trace, overall_status="UNSAT")
         self.assertEqual(final_roots[0]["children"][0]["result"], "CLOSED")
@@ -113,6 +115,23 @@ class ReLUSearchTreeTests(unittest.TestCase):
         self.assertEqual(
             final_nested_roots[0]["children"][0]["result"], "CLOSED"
         )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "nested.html"
+            write_relu_search_tree_html(
+                nested_unsat,
+                output,
+                overall_status="UNSAT",
+                theory_stats={
+                    "DERIVE_TOTAL_RELUS": 4,
+                    "DERIVE_FIXED_RELUS": 0,
+                    "DERIVE_REMAINING_RELUS": 4,
+                },
+            )
+            content = output.read_text(encoding="utf-8")
+            # The depth-1 aggregate UNSAT contains the depth-2 terminal UNSAT;
+            # only the terminal prefix prunes 2^(4-2), not both prefixes.
+            self.assertIn('"exponent": 2', content)
+            self.assertIn('"ratio": 0.25', content)
 
     def test_html_is_self_contained_and_contains_timeline(self):
         trace = SolveTrace(events=[
@@ -122,7 +141,15 @@ class ReLUSearchTreeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "relu_search_tree.html"
             write_relu_search_tree_html(
-                trace, output, overall_status="UNSAT", title="Tree test"
+                trace,
+                output,
+                overall_status="UNSAT",
+                title="Tree test",
+                theory_stats={
+                    "DERIVE_TOTAL_RELUS": 27,
+                    "DERIVE_FIXED_RELUS": 18,
+                    "DERIVE_REMAINING_RELUS": 9,
+                },
             )
             content = output.read_text(encoding="utf-8")
             self.assertIn("탐색 완료 순서 타임라인", content)
@@ -134,8 +161,23 @@ class ReLUSearchTreeTests(unittest.TestCase):
             self.assertIn("timelineOrder:$('#timelineOrder').value", content)
             self.assertIn('"phase": "+"', content)
             self.assertIn('id="neuronFilter"', content)
+            self.assertIn('id="closedMetric"', content)
+            self.assertIn('"closedCount": 0', content)
+            self.assertIn('"closedReluCount": 0', content)
+            self.assertIn('"total": 27', content)
+            self.assertIn('"fixed": 18', content)
+            self.assertIn('"remaining": 9', content)
+            self.assertIn("닫힘으로 생략한 탐색 공간", content)
+            self.assertIn('"totalExponent": 9', content)
+            self.assertIn('"exponent": 8', content)
+            self.assertIn('"ratio": 0.5', content)
+            self.assertIn("탐색하지 않아도 되는 공간", content)
+            self.assertIn("경계 유도 ReLU", content)
             self.assertIn('.CLOSED{background:#172f58', content)
             self.assertIn('.TIMEOUT{background:#4a3b0d', content)
+            self.assertIn("내부적으로 UNSAT 판정된 중간 분기", content)
+            self.assertIn('"splitCount": 1', content)
+            self.assertIn("하위 탐색 최대 깊이", content)
             self.assertNotIn("https://", content)
 
 
@@ -202,13 +244,24 @@ class RealtimeSearchTreeTests(unittest.TestCase):
             self.assertEqual(roots[0]["children"][0]["phase"], "-")
 
             output = Path(directory) / "relu_search_tree.html"
+            theory_stats = {
+                "DERIVE_TOTAL_RELUS": 32,
+                "DERIVE_FIXED_RELUS": 23,
+                "DERIVE_REMAINING_RELUS": 9,
+            }
             visualizer = RealtimeSearchTreeVisualizer(
-                branch_log_path(split_log), output
+                branch_log_path(split_log),
+                output,
+                theory_stats=theory_stats,
+                title="ReLU Search Tree: test.onnx",
             )
             visualizer.set_overall("SAT", "THEORY_SAT")
             visualizer.request_update()
             visualizer.flush()
-            self.assertIn('"neuron": 36', output.read_text(encoding="utf-8"))
+            content = output.read_text(encoding="utf-8")
+            self.assertIn('"neuron": 36', content)
+            self.assertIn('"remaining": 9', content)
+            self.assertIn("ReLU Search Tree: test.onnx", content)
 
     def test_unified_dashboard_embeds_realtime_tree(self):
         with tempfile.TemporaryDirectory() as directory:

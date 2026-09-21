@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import Counter
 from html import escape
 import json
 import os
@@ -19,6 +20,7 @@ class SearchNode:
     id: int
     order: int
     split_number: Optional[int]
+    round_index: Optional[int]
     depth: int
     layer: Optional[int]
     neuron: Optional[int]
@@ -31,14 +33,19 @@ class SearchNode:
     completed_at: Optional[float]
     repairs: int
     simplex_calls: int
+    prunes_space: bool
     children: List["SearchNode"] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         children = [child.to_dict() for child in self.children]
+        max_depth = max(
+            [self.depth] + [int(child["maxDepth"]) for child in children]
+        )
         return {
             "id": self.id,
             "order": self.order,
             "splitNumber": self.split_number,
+            "roundIndex": self.round_index,
             "depth": self.depth,
             "layer": self.layer,
             "neuron": self.neuron,
@@ -51,6 +58,8 @@ class SearchNode:
             "completedAt": self.completed_at,
             "repairs": self.repairs,
             "simplexCalls": self.simplex_calls,
+            "prunesSpace": self.prunes_space,
+            "maxDepth": max_depth,
             "subtreeSize": 1 + sum(child["subtreeSize"] for child in children),
             "children": children,
         }
@@ -118,6 +127,11 @@ def build_relu_search_tree(
             split_number=(
                 None if split_number is None else int(split_number)
             ),
+            round_index=(
+                None
+                if event.meta.get("round_index") is None
+                else int(event.meta["round_index"])
+            ),
             depth=int(event.depth or 0),
             layer=None if layer is None else int(layer),
             neuron=None if neuron is None else int(neuron),
@@ -130,6 +144,7 @@ def build_relu_search_tree(
             completed_at=None if event.t_end is None else float(event.t_end),
             repairs=_count_inside(trace.events, event, "reluplex_repair"),
             simplex_calls=_count_inside(trace.events, event, "simplex"),
+            prunes_space=(raw_result == "UNSAT"),
         )
         if stack:
             stack[-1][1].children.append(node)
@@ -164,15 +179,102 @@ def write_relu_search_tree_html(
     overall_status: str,
     overall_reason: Optional[str] = None,
     title: str = "ReLU Search Tree",
+    theory_stats: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Write a standalone HTML report; no server or external library is required."""
     roots = build_relu_search_tree(trace, overall_status=overall_status)
+    serialized_nodes: List[Dict[str, Any]] = []
+
+    def collect(nodes: List[Dict[str, Any]]) -> None:
+        for node in nodes:
+            serialized_nodes.append(node)
+            collect(node["children"])
+
+    collect(roots)
+    known_split_numbers = {
+        int(node["splitNumber"])
+        for node in serialized_nodes
+        if node.get("splitNumber") is not None
+    }
+    closed_count = sum(node["result"] == "CLOSED" for node in serialized_nodes)
+    closed_relu_count = len({
+        node["variable"]
+        for node in serialized_nodes
+        if node["result"] == "CLOSED"
+    })
+    stats = theory_stats or {}
+    total_relus = stats.get("DERIVE_TOTAL_RELUS")
+    fixed_relus = stats.get("DERIVE_FIXED_RELUS")
+    remaining_relus = stats.get("DERIVE_REMAINING_RELUS")
+    rounds = [
+        int(node["roundIndex"])
+        for node in serialized_nodes
+        if node.get("roundIndex") is not None
+    ]
+    metric_round = max(rounds) if rounds else None
+    pruned_depths: List[int] = []
+
+    def collect_pruned_frontier(nodes: List[Dict[str, Any]]) -> None:
+        for node in nodes:
+            if metric_round is not None and node.get("roundIndex") != metric_round:
+                collect_pruned_frontier(node["children"])
+                continue
+            if node.get("prunesSpace") and not node["children"]:
+                # A leaf UNSAT prefix closes every still-unassigned activation
+                # pattern below it without visiting those individual patterns.
+                pruned_depths.append(max(0, int(node["depth"])))
+                continue
+            collect_pruned_frontier(node["children"])
+
+    collect_pruned_frontier(roots)
+    depth_counts = Counter(pruned_depths)
+    if isinstance(remaining_relus, int):
+        depth_counts = Counter({
+            depth: sum(
+                count
+                for original_depth, count in depth_counts.items()
+                if min(original_depth, remaining_relus) == depth
+            )
+            for depth in {min(value, remaining_relus) for value in depth_counts}
+        })
+    pruned_ratio = min(
+        1.0,
+        sum(count * (2.0 ** (-depth)) for depth, count in depth_counts.items()),
+    )
+    pruned_terms = []
+    if isinstance(remaining_relus, int):
+        pruned_terms = [
+            {
+                "depth": depth,
+                "count": count,
+                "exponent": remaining_relus - depth,
+            }
+            for depth, count in sorted(depth_counts.items())
+        ]
     payload = {
         "title": title,
         "status": str(overall_status).upper(),
         "reason": overall_reason,
         "roots": roots,
         "nodeCount": sum(root["subtreeSize"] for root in roots),
+        "closedCount": closed_count,
+        "closedReluCount": closed_relu_count,
+        "boundDerivation": {
+            "total": total_relus,
+            "fixed": fixed_relus,
+            "remaining": remaining_relus,
+        },
+        "prunedSpace": {
+            "totalExponent": remaining_relus,
+            "terms": pruned_terms,
+            "ratio": pruned_ratio,
+            "roundIndex": metric_round,
+        },
+        "splitCount": (
+            len(known_split_numbers)
+            if known_split_numbers
+            else len(serialized_nodes)
+        ),
     }
     data = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
     document = _HTML.replace("__TITLE__", escape(title)).replace("__DATA__", data)
@@ -216,6 +318,7 @@ def trace_from_branch_log(path: str | Path) -> SolveTrace:
                         "index": record.get("index"),
                         "bound": record.get("bound"),
                         "split_number": record.get("split_number"),
+                        "round_index": record.get("round_index"),
                         "result": "RUNNING",
                     },
                 )
@@ -233,11 +336,20 @@ def trace_from_branch_log(path: str | Path) -> SolveTrace:
 class RealtimeSearchTreeVisualizer:
     """Coalescing background writer for the realtime interactive tree."""
 
-    def __init__(self, log_path: str | Path, output_path: str | Path) -> None:
+    def __init__(
+        self,
+        log_path: str | Path,
+        output_path: str | Path,
+        *,
+        theory_stats: Optional[Dict[str, Any]] = None,
+        title: str = "Realtime ReLU Search Tree",
+    ) -> None:
         self.log_path = Path(log_path)
         self.output_path = Path(output_path)
         self.status = "RUNNING"
         self.reason: Optional[str] = None
+        self.theory_stats = theory_stats
+        self.title = title
         self._lock = threading.Lock()
         self._pending = False
         self._worker: Optional[threading.Thread] = None
@@ -254,7 +366,8 @@ class RealtimeSearchTreeVisualizer:
             self.output_path,
             overall_status=self.status,
             overall_reason=self.reason,
-            title="Realtime ReLU Search Tree",
+            title=self.title,
+            theory_stats=self.theory_stats,
         )
 
     def _run(self) -> None:
@@ -296,20 +409,22 @@ _HTML = r'''<!doctype html>
 <style>
 :root{color-scheme:dark;--bg:#0b1020;--panel:#121a2c;--line:#42506b;--text:#e7edf8;--muted:#9daac0;--sat:#35c779;--unsat:#ff626b;--closed:#3b82f6;--unknown:#94a3b8;--timeout:#eab308;--running:#f97316;--other:#8390a8}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,sans-serif}header{position:sticky;top:0;z-index:3;background:#0b1020ee;border-bottom:1px solid #29344b;padding:16px 22px}h1{font-size:20px;margin:0 0 8px}.summary,.controls{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.pill,.badge{border-radius:999px;padding:2px 8px;font-weight:700}.SAT{background:#153f31;color:#7ce7ad}.UNSAT{background:#4b2028;color:#ff9ca3}.CLOSED{background:#172f58;color:#93c5fd}.UNKNOWN{background:#30394a;color:#cbd5e1}.TIMEOUT{background:#4a3b0d;color:#fde047}.RUNNING{background:#51280f;color:#fdba74}.OTHER{background:#283246;color:#b8c4d8}button,select,input{background:#172137;color:var(--text);border:1px solid #35435e;border-radius:6px;padding:6px 9px}button{cursor:pointer}main{padding:18px 22px}.panel{background:var(--panel);border:1px solid #26334b;border-radius:10px;padding:14px;margin-bottom:16px}.panel-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}.panel-heading h2{font-size:16px;margin:0}.tree,.children{list-style:none;margin:0;padding-left:0}.children{margin-left:21px;padding-left:17px;border-left:1px solid var(--line)}details{margin:5px 0}summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:7px;min-height:34px;border-left:var(--weight,3px) solid var(--other);padding:5px 9px;background:#172137;border-radius:6px}summary::-webkit-details-marker{display:none}summary:before{content:'▸';color:var(--muted);width:10px}details[open]>summary:before{content:'▾'}summary.s-SAT{border-color:var(--sat)}summary.s-UNSAT{border-color:var(--unsat)}summary.s-CLOSED{border-color:var(--closed)}summary.s-UNKNOWN{border-color:var(--unknown)}summary.s-TIMEOUT{border-color:var(--timeout)}summary.s-RUNNING{border-color:var(--running)}.label{font-weight:750}.meta,.collapsed{color:var(--muted);font-size:12px}.collapsed{margin-left:auto}.phase{font-family:ui-monospace,monospace;background:#27344c;border-radius:4px;padding:1px 6px}.phase.plus{color:#75d8ff}.phase.minus{color:#dda6ff}.timeline{max-height:330px;overflow:auto}.row{display:grid;grid-template-columns:55px minmax(140px,1fr) 85px 90px;gap:8px;padding:6px 8px;border-bottom:1px solid #243047}.row:hover{background:#19243a}.empty{text-align:center;color:var(--muted);padding:35px}.help{color:var(--muted);font-size:12px;margin-top:8px}@media(max-width:650px){.row{grid-template-columns:45px 1fr 72px}.row .duration{display:none}header,main{padding-left:11px;padding-right:11px}}
+.metrics{display:grid;grid-template-columns:repeat(2,minmax(240px,1fr));gap:10px;margin:12px 0}.metric{background:#121a2c;border:1px solid #2b3953;border-radius:9px;padding:10px 12px}.metric-label{color:var(--muted);font-size:12px}.metric-value{font-size:18px;font-weight:800;margin-top:2px}.metric-detail{color:var(--muted);font-size:12px;margin-top:2px}.metric-bar{height:5px;background:#26334b;border-radius:999px;overflow:hidden;margin-top:7px}.metric-bar>i{display:block;height:100%;background:var(--closed);border-radius:inherit}.metric.bound .metric-bar>i{background:var(--sat)}@media(max-width:650px){.metrics{grid-template-columns:1fr}}
 </style></head><body>
 <header><h1 id="title"></h1><div class="summary"><span id="overall" class="pill"></span><span id="count"></span><span id="reason" class="meta"></span></div>
+<div class="metrics"><div class="metric" title="더 분기하지 않고 UNSAT으로 닫힌 말단 접두사가 생략한 활성화 패턴 수를 전체 불안정 ReLU 활성화 패턴 2^n과 비교합니다. 내부 CLOSED 노드는 말단 결과를 합친 것이므로 중복 계산하지 않습니다."><div class="metric-label">닫힘으로 생략한 탐색 공간</div><div id="closedMetric" class="metric-value"></div><div id="closedDetail" class="metric-detail"></div><div class="metric-bar"><i id="closedBar"></i></div></div><div class="metric bound" title="구간 경계 유도로 활성/비활성 상태가 확정되어 탐색에서 제외된 ReLU와 아직 분기가 가능한 불안정 ReLU 수입니다."><div class="metric-label">경계 유도 ReLU</div><div id="boundMetric" class="metric-value"></div><div id="boundDetail" class="metric-detail"></div><div class="metric-bar"><i id="boundBar"></i></div></div></div>
 <div class="controls"><button id="defaultView">최종 경로</button><button id="expandAll">모두 펼치기</button><button id="collapseAll">모두 접기</button><select id="statusFilter"><option value="ALL">모든 결과</option><option>SAT</option><option>UNSAT</option><option>CLOSED</option><option>UNKNOWN</option><option>TIMEOUT</option></select><input id="layerFilter" inputmode="numeric" placeholder="Layer 번호"><input id="neuronFilter" inputmode="numeric" placeholder="Neuron 번호"></div></header>
-<main><section class="panel"><ul id="tree" class="tree"></ul><div class="help">L은 Layer(신경망 층), N은 Neuron(해당 층의 뉴런)을 뜻하며 번호는 0부터 시작합니다. 예: L1:N36은 첫 번째 은닉층의 37번째 뉴런입니다.</div><div class="help">SAT/UNSAT은 실제 결론이 난 말단 분기이며, CLOSED는 그 하위 분기 탐색을 마치고 되돌아온 내부 노드입니다.</div><div class="help">노드를 클릭해 하위 분기를 펼칩니다. 노드 위에 마우스를 올리면 bound, repair, Simplex 호출 수가 표시됩니다.</div></section>
+<main><section class="panel"><ul id="tree" class="tree"></ul><div class="help">L은 Layer(신경망 층), N은 Neuron(해당 층의 뉴런)을 뜻하며 번호는 0부터 시작합니다. 예: L1:N36은 첫 번째 은닉층의 37번째 뉴런입니다.</div><div class="help">전체 결과가 UNSAT인 실행에서 CLOSED는 상위 분기 조건까지 포함한 해당 분기 아래에 전체 신경망 해가 없어 내부적으로 UNSAT 판정된 중간 분기입니다. 전체 UNSAT을 최종 확정한 마지막 분기만 UNSAT으로 표시됩니다.</div><div class="help">노드를 클릭해 하위 분기를 펼칩니다. 노드 위에 마우스를 올리면 bound, repair, Simplex 호출 수가 표시됩니다.</div></section>
 <section class="panel"><div class="panel-heading"><h2 id="timelineTitle">탐색 완료 순서 타임라인</h2><select id="timelineOrder" aria-label="타임라인 정렬"><option value="completion">완료순</option><option value="visit">방문순</option><option value="duration">소요시간순(긴 순)</option></select></div><div id="timeline" class="timeline"></div></section></main>
 <script>
 const DATA=__DATA__,STATE_PREFIX='relu-search-tree-ui:';let savedState={};try{if(window.name.startsWith(STATE_PREFIX))savedState=JSON.parse(window.name.slice(STATE_PREFIX.length))}catch(_error){savedState={}}let mode=['default','all','none'].includes(savedState.mode)?savedState.mode:'default';
 if(window.parent!==window)window.parent.postMessage({type:'relu-search-tree-status',status:DATA.status},'*');
 const $=s=>document.querySelector(s), statusClass=s=>['SAT','UNSAT','CLOSED','UNKNOWN','TIMEOUT','RUNNING'].includes(s)?s:'OTHER';
-$('#title').textContent=DATA.title;$('#overall').textContent=DATA.status;$('#overall').className='pill '+statusClass(DATA.status);$('#count').textContent=`분기 ${DATA.nodeCount.toLocaleString()}개`;$('#reason').textContent=DATA.reason||'';
+$('#title').textContent=DATA.title;$('#overall').textContent=DATA.status;$('#overall').className='pill '+statusClass(DATA.status);$('#count').textContent=`분기 노드 ${DATA.splitCount.toLocaleString()}개 · 가지 ${DATA.nodeCount.toLocaleString()}개`;$('#reason').textContent=DATA.reason||'';const bd=DATA.boundDerivation||{},ps=DATA.prunedSpace||{},hasBound=Number.isInteger(bd.total)&&Number.isInteger(bd.fixed)&&Number.isInteger(bd.remaining),hasSpace=Number.isInteger(ps.totalExponent),closedPercent=hasSpace?ps.ratio*100:0,percentText=p=>p===0?'0.0':p>=0.01?p.toFixed(2):p.toExponential(2),termText=t=>`${t.count>1?t.count+' × ':''}2^${t.exponent}`,numerator=ps.terms&&ps.terms.length?ps.terms.map(termText).join(' + '):'0';$('#closedMetric').textContent=hasSpace?`(${numerator}) / 2^${ps.totalExponent} = ${percentText(closedPercent)}%`:'계산 중';$('#closedDetail').textContent=hasSpace?`탐색하지 않아도 되는 공간 ${percentText(closedPercent)}% · 남은 공간 ${percentText(Math.max(0,100-closedPercent))}%`:'경계 유도 결과를 기다리는 중';$('#closedBar').style.width=`${Math.min(100,closedPercent)}%`;$('#boundMetric').textContent=hasBound?`${bd.total.toLocaleString()} → ${bd.fixed.toLocaleString()} 고정 → ${bd.remaining.toLocaleString()} 불안정`:'계산 중';$('#boundDetail').textContent=hasBound?`전체 ${bd.total.toLocaleString()}개 중 경계로 ${bd.fixed.toLocaleString()}개 고정`:'경계 유도 결과를 기다리는 중';$('#boundBar').style.width=hasBound&&bd.total?`${bd.fixed/bd.total*100}%`:'0%';
 function flat(nodes,out=[]){for(const n of nodes){out.push(n);flat(n.children,out)}return out}const ALL=flat(DATA.roots),LAST_ORDER=ALL.reduce((m,n)=>Math.max(m,n.order),0),TIMELINE=[...ALL].sort((a,b)=>(a.completedAt??Number.MAX_VALUE)-(b.completedAt??Number.MAX_VALUE)),DURATION_TIMELINE=[...ALL].sort((a,b)=>b.duration-a.duration||a.order-b.order);TIMELINE.forEach((n,i)=>n.completionOrder=i+1);DURATION_TIMELINE.forEach((n,i)=>n.durationOrder=i+1);
 function matches(n){const s=$('#statusFilter').value,l=$('#layerFilter').value.trim(),v=$('#neuronFilter').value.trim();return (s==='ALL'||n.result===s)&&(!l||String(n.layer)===l)&&(!v||String(n.neuron)===v)}
 function hasMatch(n){return matches(n)||n.children.some(hasMatch)}
-function tip(n){return [`Split #${n.splitNumber??'?'}`,`${n.layer==null?n.variable:`Layer ${n.layer}, Neuron ${n.neuron}`} (${n.phase})`,`결과: ${n.result}${n.reason?' / '+n.reason:''}`,`bound: ${n.bound||'-'}`,`repair: ${n.repairs}`,`Simplex 호출: ${n.simplexCalls}`,`소요시간: ${n.duration.toFixed(6)}초`].join('\n')}
+function tip(n){return [`Split #${n.splitNumber??'?'}`,`${n.layer==null?n.variable:`Layer ${n.layer}, Neuron ${n.neuron}`} (${n.phase})`,`결과: ${n.result}${n.reason?' / '+n.reason:''}`,`현재 깊이: ${n.depth}`,`하위 탐색 최대 깊이: ${n.maxDepth}`,`bound: ${n.bound||'-'}`,`repair: ${n.repairs}`,`Simplex 호출: ${n.simplexCalls}`,`소요시간: ${n.duration.toFixed(6)}초`].join('\n')}
 function onLastPath(n){return n.order<=LAST_ORDER&&LAST_ORDER<n.order+n.subtreeSize}
 function shouldOpen(n){return mode==='all'||(mode==='default'&&(n.result==='SAT'||n.result==='UNKNOWN'||n.result==='TIMEOUT'||n.result==='RUNNING'||(DATA.status==='UNSAT'&&onLastPath(n))))}
 function makeNode(n){const li=document.createElement('li'),d=document.createElement('details'),s=document.createElement('summary');d.dataset.id=n.id;d.open=shouldOpen(n);s.className='s-'+statusClass(n.result);s.style.setProperty('--weight',`${Math.min(10,3+Math.log10(1+n.duration*1000)*1.6)}px`);s.title=tip(n);const label=n.layer==null?n.variable:`L${n.layer}:N${n.neuron}`;s.innerHTML=`<span class="label">${label}</span><span class="phase ${n.phase==='+'?'plus':'minus'}">${n.phase}</span><span class="meta">Split #${n.splitNumber??'?'}</span><span class="badge ${statusClass(n.result)}">${n.result}</span><span class="meta">${n.duration.toFixed(3)}s</span>${n.children.length?`<span class="collapsed">${n.subtreeSize-1}개 하위 노드</span>`:''}`;d.appendChild(s);const box=document.createElement('ul');box.className='children';let built=false;const build=()=>{if(built)return;built=true;for(const c of n.children)if(hasMatch(c))box.appendChild(makeNode(c));d.appendChild(box)};if(d.open)build();d.addEventListener('toggle',()=>{if(d.open)build()});li.appendChild(d);return li}

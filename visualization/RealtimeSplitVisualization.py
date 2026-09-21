@@ -197,6 +197,7 @@ class SplitEventLogger:
             )
         self.update_callback = update_callback
         self.global_split_count = 0
+        self._round_index: Optional[int] = None
         self._sequence = 0
         self._split_orders: Dict[str, int] = {}
         self._lock = threading.Lock()
@@ -213,6 +214,7 @@ class SplitEventLogger:
     def round_start(self, round_index: int) -> None:
         """Record boundaries separately from neuron +/- events."""
         with self._lock:
+            self._round_index = int(round_index)
             metadata = read_split_metadata(self.path)
             rounds = metadata.setdefault("round_starts", [])
             rounds.append({"round": round_index, "time_ns": time_ns()})
@@ -251,6 +253,7 @@ class SplitEventLogger:
             "depth": depth,
             "bound": bound,
             "split_number": self._split_orders.get(split_id) if split_id else None,
+            "round_index": self._round_index,
         })
         return branch_id
 

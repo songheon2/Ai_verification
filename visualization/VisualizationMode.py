@@ -66,7 +66,7 @@ def create_visualization_run_directory(
     output_root: str | Path | None = None,
     stable_path: bool = False,
 ) -> Path:
-    """Create ``outputs/YYYY-MM-DD/<run>/<model>`` for one verification run."""
+    """Create ``outputs/<model>/<YYYYMMDD_HHMMSS run>`` for one run."""
     root = (
         Path(output_root)
         if output_root is not None
@@ -74,18 +74,16 @@ def create_visualization_run_directory(
     )
     root.mkdir(parents=True, exist_ok=True)
     local_started_at = started_at.astimezone()
-    date_directory = root / local_started_at.strftime("%Y-%m-%d")
-    date_directory.mkdir(parents=True, exist_ok=True)
     start_text = local_started_at.strftime("%Y%m%d_%H%M%S")
     model_name = _safe_folder_component(_artifact_stem(model_path))
+    model_directory = root / model_name
+    model_directory.mkdir(parents=True, exist_ok=True)
     base_name = start_text if stable_path else f"{start_text}~running"
-    group_directory = date_directory / base_name
+    run_directory = model_directory / base_name
     suffix = 2
-    while group_directory.exists():
-        group_directory = date_directory / f"{base_name}_{suffix}"
+    while run_directory.exists():
+        run_directory = model_directory / f"{base_name}_{suffix}"
         suffix += 1
-    group_directory.mkdir()
-    run_directory = group_directory / model_name
     run_directory.mkdir()
     return run_directory
 
@@ -99,17 +97,16 @@ def finalize_visualization_run_directory(
 ) -> Path:
     """상위 시간 폴더를 ``시작시간~종료시간/모델/``으로 확정한다."""
     staging = Path(staging_directory)
-    staging_group = staging.parent
     start_text = started_at.astimezone().strftime("%Y%m%d_%H%M%S")
     finish_text = finished_at.astimezone().strftime("%Y%m%d_%H%M%S")
     base_name = f"{start_text}~{finish_text}"
-    destination_group = staging_group.parent / base_name
+    destination = staging.parent / base_name
     suffix = 2
-    while destination_group.exists():
-        destination_group = staging_group.parent / f"{base_name}_{suffix}"
+    while destination.exists():
+        destination = staging.parent / f"{base_name}_{suffix}"
         suffix += 1
-    staging_group.rename(destination_group)
-    return destination_group / staging.name
+    staging.rename(destination)
+    return destination
 
 
 def default_visualization_paths(

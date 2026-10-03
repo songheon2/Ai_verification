@@ -95,12 +95,25 @@ def _child_tableau(
     """
 
     child = copy.deepcopy(parent)
-    for name, terms, (lo, hi) in new_rows:
-        row = Row(basic_var=name, coeffs=_express_in_nonbasic(child, terms))
-        child.rows.append(row)
-        child.bounds[name] = Bound(lower=lo, upper=hi)
-        child.assign[name] = _compute_basic(child, row)
+    _append_rows(child, new_rows)
     return child
+
+
+def _append_rows(
+    tableau: SimplexTableau,
+    new_rows: List[Tuple[str, Dict[str, float], Tuple[float, float]]],
+) -> None:
+    """이미 풀던 tableau에 새 제약 row를 제자리에서 기저변수로 얹는다.
+
+    원래 형태(terms)는 origin_rows에도 남긴다. Simplex가 누적 오차를 잴 때와
+    tableau를 다시 세울 때 이 원래 등식을 기준으로 삼는다.
+    """
+    for name, terms, (lo, hi) in new_rows:
+        row = Row(basic_var=name, coeffs=_express_in_nonbasic(tableau, terms))
+        tableau.rows.append(row)
+        tableau.origin_rows.append((name, dict(terms)))
+        tableau.bounds[name] = Bound(lower=lo, upper=hi)
+        tableau.assign[name] = _compute_basic(tableau, row)
 
 
 def relu(v: float) -> float:
@@ -187,7 +200,7 @@ def reluplex(
     branch_rule: str = "violated",
     warm_start: bool = True,
     seed: Optional[int] = 0,
-    stats: Optional[Dict[str, int]] = None,
+    stats: Optional[Dict[str, Any]] = None,
     derive_bound: bool = True,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
 
@@ -288,6 +301,7 @@ def reluplex(
                     "depth": depth,
                     "origin": "relu_repair",
                 },
+                stats=stats,
             )
 
     def _select_violation(violations: List[Tuple[str, str]]) -> Tuple[str, str]:
@@ -338,6 +352,7 @@ def reluplex(
                     "depth": depth,
                     "origin": "reluplex",
                 },
+                stats=stats,
             )
 
         if not sat:

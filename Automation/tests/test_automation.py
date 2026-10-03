@@ -29,7 +29,7 @@ from Automation.PropertyBuilder import (
     infer_expected_from_outputs,
 )
 from Reluplex import reluplex
-from Simplex import build_tableau, simplex
+from Simplex import DRIFT_CHECK_AT_EXIT, build_tableau, simplex
 from Automation.SolverStatus import SolverLimitReached, SolverResult, SolverStatus
 from Automation.VnnlibParser import (
     VnnlibParseError,
@@ -669,6 +669,48 @@ class AutomationIntegrationTests(unittest.TestCase):
             realtime_result = result["visualization"]["realtime"]
             self.assertEqual(set(realtime_result["panel_outputs"]), {"relu"})
             self.assertNotIn("solver_progress", realtime_result)
+
+
+class SimplexDriftTests(unittest.TestCase):
+    def test_drifted_row_is_restored_instead_of_false_unsat(self):
+        inf = float("inf")
+        tableau = build_tableau(
+            [("s", {"x": 1.0, "y": 1.0})],
+            {"s": (3.0, inf), "x": (0.0, 1.0), "y": (0.0, 5.0)},
+        )
+        # 피벗 오차가 쌓여 계수 부호가 뒤집힌 상황을 흉내 낸다 (원래 식은 s = x + y).
+        # 틀어진 row(s = x - y)로는 s >= 3을 만들 수 없어 거짓 UNSAT이 나온다.
+        tableau.rows[0].coeffs["y"] = -1.0
+        # 검사 없이 피벗이 오래 쌓인 tableau 계보라고 둔다
+        tableau.pivots_since_check = DRIFT_CHECK_AT_EXIT
+        stats = {}
+        assign, sat = simplex(tableau, stats=stats)
+        self.assertTrue(sat)
+        self.assertGreaterEqual(stats.get("SIMPLEX_RESTORES", 0), 1)
+        self.assertAlmostEqual(assign["s"], assign["x"] + assign["y"])
+        self.assertGreaterEqual(assign["s"], 3.0 - 1e-9)
+
+    def test_clean_solve_does_not_restore(self):
+        inf = float("inf")
+        tableau = build_tableau(
+            [
+                ("s1", {"x": 1.0, "y": 1.0}),
+                ("s2", {"x": 2.0, "y": -1.0}),
+                ("s3", {"x": -1.0, "y": 3.0}),
+            ],
+            {
+                "s1": (2.0, inf), "s2": (-inf, 1.5), "s3": (1.0, 8.0),
+                "x": (-5.0, 5.0), "y": (-5.0, 5.0),
+            },
+        )
+        tableau.pivots_since_check = DRIFT_CHECK_AT_EXIT
+        stats = {}
+        _assign, sat = simplex(tableau, stats=stats)
+        self.assertTrue(sat)
+        self.assertEqual(stats.get("SIMPLEX_RESTORES", 0), 0)
+        self.assertGreater(stats.get("SIMPLEX_DRIFT_CHECKS", 0), 0)
+        self.assertLess(stats.get("SIMPLEX_MAX_DRIFT", 0.0), 1e-12)
+
 
 
 if __name__ == "__main__":

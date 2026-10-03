@@ -1,3 +1,5 @@
+import copy
+import zlib
 from dataclasses import dataclass, field
 from math import isfinite
 from typing import Any, Dict, List, Optional, Tuple
@@ -5,6 +7,21 @@ from Automation.SolverStatus import SolverLimitReached, check_deadline
 
 
 DEFAULT_TOL = 1e-9
+
+# 누적 반올림 오차 검사 (Reluplex 논문 5절: "Pivot 5,000번마다 오차를 검사하고
+# 10^-6을 넘으면 tableau를 복원했다"). 웜 스타트는 자식이 부모 tableau를 그대로
+# 물려받으므로, 루트부터 현재 노드까지의 피벗이 한 tableau에 전부 누적된다.
+# 그래서 피벗 수는 호출 단위가 아니라 tableau 계보 단위(pivots_since_check)로 센다.
+DRIFT_TOL = 1e-6
+# 마지막 검사 이후 이만큼 피벗이 쌓였으면 SAT/UNSAT을 선언하기 직전에 검사한다.
+# 모든 선언마다 검사하면 LP가 작은 인스턴스에서는 검사 비용이 LP 풀이의 약 30%
+# 까지 올라갔다(sat_v18_c87 실측). 논문의 5000보다 훨씬 촘촘한 값이다.
+DRIFT_CHECK_AT_EXIT = 200
+# 한 호출이 길어지면 끝날 때까지 기다리지 않고 이 피벗 수에서 중간 검사를 한다.
+DRIFT_CHECK_EVERY = 1000
+# 복원 직후에도 오차가 다시 나면 입력 자체가 수치적으로 나쁜 것이다.
+# 무한 복원 대신 수치 실패(UNKNOWN)로 끝낸다.
+MAX_RESTORES_PER_CALL = 3
 
 
 def _scaled_tol(value: float, tol: float = DEFAULT_TOL) -> float:
@@ -47,10 +64,29 @@ class SimplexTableau:
     - rows   : 기저변수 row 방정식들
     - bounds : 모든 변수(기저+비기저)의 범위
     - assign : 현재 변수 할당값
+    - origin_rows : 피벗하기 전의 원래 등식들 (basic_var = sum(coeff*var)).
+                    피벗이 쌓이며 생긴 부동소수 오차를 재는 기준이자,
+                    오차가 크면 tableau를 다시 세우는 재료다.
+    - pivots_since_check : 마지막 오차 검사(또는 새로 만든 뒤) 이후 이 tableau
+                    계보에 쌓인 피벗 수. 복사본(웜 스타트 자식)도 물려받는다.
     """
     rows: List[Row]
     bounds: Dict[str, Bound]
     assign: Dict[str, float]
+    origin_rows: List[Tuple[str, Dict[str, float]]] = field(default_factory=list)
+    pivots_since_check: int = 0
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "SimplexTableau":
+        # origin_rows는 한 번 만들어지면 바뀌지 않으므로 목록만 새로 만들고
+        # 안의 (이름, 계수) 쌍은 부모와 공유한다. 분기·repair마다 tableau를
+        # 복사하는데, 원래 등식까지 매번 깊게 복사할 이유가 없다.
+        return SimplexTableau(
+            rows=copy.deepcopy(self.rows, memo),
+            bounds=copy.deepcopy(self.bounds, memo),
+            assign=copy.deepcopy(self.assign, memo),
+            origin_rows=list(self.origin_rows),
+            pivots_since_check=self.pivots_since_check,
+        )
 
     # 기저변수 집합 (빠른 조회)
     @property
@@ -131,6 +167,8 @@ def build_tableau(
                 coeffs={var: coefficient for var, coefficient in coeffs.items()
                         if coefficient != 0.0})
             for name, coeffs in row_defs]
+    # 피벗은 rows의 계수 dict를 제자리에서 고치므로 원래 등식은 따로 복사해 둔다.
+    origin_rows = [(row.basic_var, dict(row.coeffs)) for row in rows]
 
     bound_map: Dict[str, Bound] = {}
     for var, (lo, hi) in bounds.items():
@@ -166,7 +204,9 @@ def build_tableau(
             # SAT 직전 일관성 검사가 이를 UNKNOWN으로 승격한다.
             assign[row.basic_var] = float("nan")
 
-    return SimplexTableau(rows=rows, bounds=bound_map, assign=assign)
+    return SimplexTableau(
+        rows=rows, bounds=bound_map, assign=assign, origin_rows=origin_rows
+    )
 
 
 # ─────────────────────────────────────────────
@@ -223,6 +263,91 @@ def _tableau_is_consistent(
         if not isfinite(expected) or abs(actual - expected) > tol * scale:
             return False
 
+    return True
+
+
+def _probe_value(var: str) -> float:
+    """변수 이름으로 정해지는 [-1, 1) 사이의 고정된 값.
+
+    Python의 hash()는 PYTHONHASHSEED에 따라 실행마다 달라지므로 쓰지 않는다.
+    같은 tableau는 언제나 같은 오차 값을 내야 복원 여부가 재현된다.
+    """
+    return zlib.crc32(var.encode("utf-8")) / 2147483648.0 - 1.0
+
+
+def _tableau_drift(tableau: SimplexTableau) -> float:
+    """현재 tableau의 row 계수가 원래 등식에서 벗어난 정도 (상대 오차의 최댓값).
+
+    `_tableau_is_consistent`는 현재 row와 현재 할당을 비교한다. 그런데 기저변수
+    값은 매 피벗마다 현재 row로 다시 계산되므로, row 계수 자체가 틀어져도 그
+    검사는 항상 통과한다. 현재 할당을 원래 등식에 넣어 보는 것만으로도 부족하다
+    — 값이 0인 비기저변수의 계수 오차가 보이지 않는데, UNSAT 판정은 바로 그
+    계수의 부호와 크기로 내려진다.
+
+    그래서 비기저변수에 임의의 값을 넣고 현재 row로 기저변수를 계산한 뒤, 그
+    값을 원래 등식에 넣은 잔차를 잰다. row가 정확하다면 비기저변수를 어떤 값으로
+    두어도 원래 등식이 성립하므로, 이 잔차는 계수 오차만 반영한다. 현재 할당도
+    같은 row로 계산되므로 row가 맞으면 할당도 원래 등식을 만족한다.
+    """
+    if not tableau.origin_rows:
+        return 0.0
+
+    probe: Dict[str, float] = {}
+    basic = {row.basic_var for row in tableau.rows}
+    for var in tableau.assign:
+        if var not in basic:
+            probe[var] = _probe_value(var)
+    for row in tableau.rows:
+        probe[row.basic_var] = sum(c * probe[nv] for nv, c in row.coeffs.items())
+
+    worst = 0.0
+    for name, coeffs in tableau.origin_rows:
+        try:
+            lhs = probe[name]
+            terms = [c * probe[var] for var, c in coeffs.items()]
+        except KeyError:
+            return float("inf")
+        rhs = sum(terms)
+        if not (isfinite(lhs) and isfinite(rhs)):
+            return float("inf")
+        scale = max(1.0, abs(lhs), sum(abs(t) for t in terms))
+        worst = max(worst, abs(lhs - rhs) / scale)
+    return worst
+
+
+def _restore_tableau(tableau: SimplexTableau) -> bool:
+    """원래 등식으로 tableau를 다시 세운다 (논문의 tableau 복원).
+
+    기저는 처음 상태로 돌아가지만, 비기저변수의 값은 지금 값을 그대로 쓴다
+    (범위 밖이면 경계로 당긴다). 기저변수는 원래 등식으로 정확히 다시 계산되므로
+    지금까지 풀어온 위치에서 오차만 걷어낸 상태로 simplex를 이어갈 수 있다.
+    """
+    if not tableau.origin_rows:
+        return False
+    try:
+        fresh = build_tableau(
+            tableau.origin_rows,
+            {var: (b.lower, b.upper) for var, b in tableau.bounds.items()},
+        )
+    except ValueError:
+        return False
+
+    basic = {row.basic_var for row in fresh.rows}
+    for var in fresh.assign:
+        if var in basic:
+            continue
+        value = tableau.assign.get(var)
+        if value is None or not isfinite(value):
+            continue
+        bound = fresh.bounds[var]
+        fresh.assign[var] = min(max(value, bound.lower), bound.upper)
+    for row in fresh.rows:
+        fresh.assign[row.basic_var] = _compute_basic(fresh, row)
+
+    tableau.rows = fresh.rows
+    tableau.assign.clear()
+    tableau.assign.update(fresh.assign)
+    tableau.pivots_since_check = 0
     return True
 
 
@@ -360,6 +485,7 @@ def simplex(
     report_unknown: bool = False,
     progress: Optional[Any] = None,
     progress_context: Optional[Dict[str, Any]] = None,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     Simplex 알고리즘 (Algorithm 3 스타일).
@@ -389,6 +515,15 @@ def simplex(
 
     경계 위반 판정과 여유 판정은 절대 EPS가 아니라 값의 크기에 비례한 상대
     허용오차(_tol)를 쓰고, 계수 0 판정도 row 최대계수 대비 상대값(ZERO_REL)을 쓴다.
+
+    누적 오차 복원
+    --------------
+    tableau 계보에 검사 없이 DRIFT_CHECK_AT_EXIT 피벗 이상 쌓였으면 SAT/UNSAT을
+    선언하기 직전에, 한 호출이 길어지면 DRIFT_CHECK_EVERY 피벗에서 원래 등식 대비
+    오차(_tableau_drift)를 잰다. DRIFT_TOL을 넘으면 원래 등식으로 tableau를 다시
+    세우고(_restore_tableau) 이어서 푼다. 특히 UNSAT은 "피벗할 수 있는 변수가
+    없다"는 계수의 부호로 판정하므로, 틀어진 row로 UNSAT을 선언하면 반례가 있는
+    영역을 잘라내는 잘못된 증명이 된다.
 
     Args:
         tableau : SimplexTableau 객체
@@ -444,6 +579,36 @@ def simplex(
             return EPS
         return EPS * max(1.0, abs(x))
 
+    restores = 0
+
+    def _drift_needs_restore() -> Optional[bool]:
+        """오차를 재고 필요하면 복원한다.
+
+        반환: False=오차 정상, True=복원했음(루프를 이어가야 함),
+              None=복원할 수 없음(수치 실패로 끝내야 함)
+        """
+        nonlocal restores
+        drift = _tableau_drift(tableau)
+        if stats is not None:
+            stats["SIMPLEX_DRIFT_CHECKS"] = stats.get("SIMPLEX_DRIFT_CHECKS", 0) + 1
+            if drift > stats.get("SIMPLEX_MAX_DRIFT", 0.0):
+                stats["SIMPLEX_MAX_DRIFT"] = drift
+        if drift <= DRIFT_TOL:
+            tableau.pivots_since_check = 0
+            return False
+        if restores >= MAX_RESTORES_PER_CALL or not _restore_tableau(tableau):
+            return None
+        restores += 1
+        if stats is not None:
+            stats["SIMPLEX_RESTORES"] = stats.get("SIMPLEX_RESTORES", 0) + 1
+        return True
+
+    def _numerical_failure() -> Tuple[Optional[Dict[str, float]], bool]:
+        _finish("NUMERICAL_FAILURE")
+        if report_unknown:
+            raise SolverLimitReached("SIMPLEX_NUMERICAL_FAILURE")
+        return (None, False)
+
     for iteration in range(max_iter):
         iteration_count = iteration + 1
         try:
@@ -474,13 +639,20 @@ def simplex(
 
         if violated_row is None:
             # 모든 기저변수가 범위 안 → SAT.
-            # 단, 여기까지의 피벗으로 tableau 자체가 깨졌다면(row 식과 assignment
+            # 검사 없이 쌓인 피벗이 많으면 원래 등식 대비 오차부터 본다. 틀어진
+            # row로 구한 할당은 원래 문제의 해가 아닐 수 있고, 자식 노드가 이
+            # row로 경계 유도를 한다. 복원하면 기저가 바뀌므로 위반 검사부터
+            # 다시 한다.
+            if tableau.pivots_since_check >= DRIFT_CHECK_AT_EXIT:
+                restored = _drift_needs_restore()
+                if restored is None:
+                    return _numerical_failure()
+                if restored:
+                    continue
+            # 여기까지의 피벗으로 tableau 자체가 깨졌다면(row 식과 assignment
             # 불일치, inf/nan) SAT이라고 내보내면 안 된다 — 수치 실패로 구분한다.
             if not _tableau_is_consistent(tableau):
-                _finish("NUMERICAL_FAILURE")
-                if report_unknown:
-                    raise SolverLimitReached("SIMPLEX_NUMERICAL_FAILURE")
-                return (None, False)
+                return _numerical_failure()
             if progress is not None and call_id is not None:
                 progress.simplex_iteration(call_id, iteration, violated_var=None)
             _finish("SAT")
@@ -539,7 +711,17 @@ def simplex(
                 pivot_xi = best[1]
 
         if pivot_xi is None:
-            # 피벗 가능한 변수 없음 → UNSAT
+            # 피벗 가능한 변수 없음 → UNSAT.
+            # 이 판정은 violated_row 계수의 부호에 전적으로 기댄다. 계수가
+            # 오차로 틀어졌다면 반례가 있는 영역을 잘라내는 잘못된 UNSAT이
+            # 되므로, 검사 없이 쌓인 피벗이 많으면 선언하기 전에 원래 등식
+            # 대비 오차를 확인한다.
+            if tableau.pivots_since_check >= DRIFT_CHECK_AT_EXIT:
+                restored = _drift_needs_restore()
+                if restored is None:
+                    return _numerical_failure()
+                if restored:
+                    continue
             _finish("UNSAT")
             return (None, False)
 
@@ -583,6 +765,14 @@ def simplex(
         # 기저변수들 재계산
         for row in tableau.rows:
             tableau.assign[row.basic_var] = _compute_basic(tableau, row)
+
+        tableau.pivots_since_check += 1
+
+        # 긴 호출은 끝날 때까지 기다리지 않고 중간에도 오차를 본다. 틀어진
+        # row로 피벗을 계속하면 엉뚱한 방향으로 헤매며 반복만 늘어난다.
+        if tableau.pivots_since_check >= DRIFT_CHECK_EVERY:
+            if _drift_needs_restore() is None:
+                return _numerical_failure()
 
     # 반복 제한 초과는 논리적 UNSAT이 아니라 결론을 내리지 못한 UNKNOWN이다.
     _finish("ITERATION_LIMIT")

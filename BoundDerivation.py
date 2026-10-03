@@ -113,10 +113,13 @@ def derive_bounds(
 
             s_lo = -INF if lo_inf else lo_fin
             s_hi = INF if hi_inf else hi_fin
-            r = _tighten(b, name, s_lo, s_hi, tol)
-            if r is None:
-                return b, fixed, True
-            changed |= r
+            cur_lo, cur_hi = b[name]
+            # 아래 역방향과 같은 이유로, 좁힐 게 없으면 _tighten을 건너뛴다
+            if s_lo > cur_lo or s_hi < cur_hi or cur_lo > cur_hi:
+                r = _tighten(b, name, s_lo, s_hi, tol)
+                if r is None:
+                    return b, fixed, True
+                changed |= r
 
             # 역방향: name과 "나머지 항"으로 각 v를 좁힌다
             n_lo, n_hi = b[name]
@@ -143,6 +146,13 @@ def derive_bounds(
                 else:
                     v_lo = -INF if cv_hi == INF else cv_hi / c
                     v_hi = INF if cv_lo == -INF else cv_lo / c
+                # 현재 경계보다 좁지 않고 현재 경계에 모순이 없으면 _tighten은
+                # 아무것도 바꾸지 못하고 모순도 내지 않는다. 탐색 중 노드마다
+                # 유도를 돌리면 호출의 대부분이 이 경우라서 함수 호출 자체를
+                # 건너뛴다 (결과는 같고 비용만 준다).
+                cur_lo, cur_hi = b[v]
+                if v_lo <= cur_lo and v_hi >= cur_hi and cur_lo <= cur_hi:
+                    continue
                 r = _tighten(b, v, v_lo, v_hi, tol)
                 if r is None:
                     return b, fixed, True

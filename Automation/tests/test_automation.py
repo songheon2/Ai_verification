@@ -713,5 +713,103 @@ class SimplexDriftTests(unittest.TestCase):
 
 
 
+def _random_relu_problem(seed, n_in=2, layers=(4, 4)):
+    """작은 무작위 ReLU 네트워크 + 입력 박스 + 출력 하한 속성.
+
+    출력 하한 theta는 격자에서 본 최댓값 근처로 잡아 SAT/UNSAT이 섞이게 한다.
+    """
+    import itertools
+    import random
+
+    inf = float("inf")
+    rng = random.Random(seed)
+    rows, bounds, relus, net = [], {}, [], []
+    prev = [f"x{i}" for i in range(n_in)]
+    for var in prev:
+        bounds[var] = (-1.0, 1.0)
+    for layer, width in enumerate(layers):
+        weights = [[rng.uniform(-1, 1) for _ in prev] for _ in range(width)]
+        biases = [rng.uniform(-0.5, 0.5) for _ in range(width)]
+        net.append((weights, biases))
+        current = []
+        for j in range(width):
+            z, h = f"z{layer}_{j}", f"h{layer}_{j}"
+            coeffs = {z: 1.0}
+            for p, w in zip(prev, weights[j]):
+                coeffs[p] = -w
+            rows.append((f"s_{z}", coeffs))
+            bounds[f"s_{z}"] = (biases[j], biases[j])
+            bounds[z] = (-inf, inf)
+            bounds[h] = (-inf, inf)
+            relus.append((z, h))
+            current.append(h)
+        prev = current
+    out_w = [rng.uniform(-1, 1) for _ in prev]
+    out_b = rng.uniform(-0.2, 0.2)
+    coeffs = {"o": 1.0}
+    for p, w in zip(prev, out_w):
+        coeffs[p] = -w
+    rows.append(("s_o", coeffs))
+    bounds["s_o"] = (out_b, out_b)
+
+    def forward(xs):
+        act = list(xs)
+        for weights, biases in net:
+            act = [
+                max(0.0, sum(w * a for w, a in zip(row, act)) + b)
+                for row, b in zip(weights, biases)
+            ]
+        return sum(w * a for w, a in zip(out_w, act)) + out_b
+
+    grid = [i / 10 for i in range(-10, 11)]
+    values = [forward(p) for p in itertools.product(grid, repeat=n_in)]
+    hi, lo = max(values), min(values)
+    theta = hi + rng.choice([-0.3, -0.05, 0.02, 0.1, 0.3]) * (hi - lo + 1e-3)
+    bounds["o"] = (theta, inf)
+    return rows, bounds, relus, forward, theta
+
+
+class SearchBoundDerivationTests(unittest.TestCase):
+    def test_search_derivation_agrees_with_plain_search(self):
+        """탐색 중 경계 유도를 켜도 SAT/UNSAT 판정은 그대로여야 한다."""
+        fired = 0
+        nodes_plain = nodes_derived = 0
+        for seed in range(40):
+            rows, bounds, relus, forward, theta = _random_relu_problem(seed)
+            plain_stats = {}
+            _model, plain_sat = reluplex(
+                rows, dict(bounds), relus,
+                derive_in_search=False, stats=plain_stats, max_recursion=100,
+            )
+            nodes_plain += plain_stats.get("SEARCH_NODES", 0)
+            for mode, pivot_tighten in (
+                ("original", False), ("tableau", False), ("both", False), ("both", True),
+            ):
+                with self.subTest(seed=seed, mode=mode, pivot_tighten=pivot_tighten):
+                    stats = {}
+                    model, sat = reluplex(
+                        rows, dict(bounds), relus,
+                        derive_in_search=True, search_derive_rows=mode,
+                        pivot_tighten=pivot_tighten,
+                        stats=stats, max_recursion=100,
+                    )
+                    self.assertEqual(sat, plain_sat)
+                    if sat:
+                        xs = [model["x0"], model["x1"]]
+                        self.assertTrue(all(-1 - 1e-7 <= x <= 1 + 1e-7 for x in xs))
+                        self.assertGreaterEqual(forward(xs), theta - 1e-6)
+                    else:
+                        # 닫힌 가지들의 2^-depth 합이 정확히 1 = 탐색 공간 전체를 닫았다
+                        self.assertEqual(stats.get("CLOSED_MEASURE"), 1.0)
+                    if mode == "both" and not pivot_tighten:
+                        nodes_derived += stats.get("SEARCH_NODES", 0)
+                        if stats.get("SEARCH_DERIVE_FIXED", 0) or stats.get(
+                            "UNSAT_LEAVES_DERIVE", 0
+                        ):
+                            fired += 1
+        self.assertGreater(fired, 0)
+        self.assertLess(nodes_derived, nodes_plain)
+
+
 if __name__ == "__main__":
     unittest.main()

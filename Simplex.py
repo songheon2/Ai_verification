@@ -351,6 +351,50 @@ def _restore_tableau(tableau: SimplexTableau) -> bool:
     return True
 
 
+def _tighten_from_row(
+    tableau: SimplexTableau, row: Row, tol: float = DEFAULT_TOL
+) -> Optional[bool]:
+    """row의 우변(비기저변수들의 경계)으로 기저변수의 경계를 좁힌다.
+
+    논문 5절: "각 피벗 뒤에 진입 변수에 대해 경계 강화를 수행했다". 방금 기저로
+    들어온 변수의 row 하나만 보므로 row 길이만큼의 비용이다.
+
+    반환: True=좁아짐, False=변화 없음, None=모순(이 row는 만족될 수 없다)
+    """
+    inf = float("inf")
+    lo = hi = 0.0
+    lo_inf = hi_inf = False
+    for var, c in row.coeffs.items():
+        b = tableau.bounds[var]
+        t_lo, t_hi = (c * b.lower, c * b.upper) if c > 0 else (c * b.upper, c * b.lower)
+        if t_lo == -inf:
+            lo_inf = True
+        else:
+            lo += t_lo
+        if t_hi == inf:
+            hi_inf = True
+        else:
+            hi += t_hi
+    if lo_inf and hi_inf:
+        return False
+    # 여러 항을 더하며 생긴 반올림으로 경계가 실제보다 좁아지지 않도록 바깥쪽으로 조금 넓힌다
+    implied_lo = -inf if lo_inf else lo - 1e-12 * max(1.0, abs(lo))
+    implied_hi = inf if hi_inf else hi + 1e-12 * max(1.0, abs(hi))
+
+    cur = tableau.bounds[row.basic_var]
+    new_lo = max(cur.lower, implied_lo)
+    new_hi = min(cur.upper, implied_hi)
+    if new_lo > new_hi + tol * max(1.0, abs(new_lo), abs(new_hi)):
+        return None
+    changed = (
+        new_lo > cur.lower + _scaled_tol(cur.lower, tol)
+        or new_hi < cur.upper - _scaled_tol(cur.upper, tol)
+    )
+    if changed:
+        tableau.bounds[row.basic_var] = Bound(lower=new_lo, upper=new_hi)
+    return changed
+
+
 def _pivot(tableau: SimplexTableau, xi: str, xj: str) -> None:
     """
     피벗: 비기저변수 xi와 기저변수 xj를 교환합니다.
@@ -486,6 +530,7 @@ def simplex(
     progress: Optional[Any] = None,
     progress_context: Optional[Dict[str, Any]] = None,
     stats: Optional[Dict[str, Any]] = None,
+    tighten_bounds: bool = False,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     Simplex 알고리즘 (Algorithm 3 스타일).
@@ -524,6 +569,13 @@ def simplex(
     세우고(_restore_tableau) 이어서 푼다. 특히 UNSAT은 "피벗할 수 있는 변수가
     없다"는 계수의 부호로 판정하므로, 틀어진 row로 UNSAT을 선언하면 반례가 있는
     영역을 잘라내는 잘못된 증명이 된다.
+
+    피벗마다 경계 강화 (tighten_bounds=True)
+    ----------------------------------------
+    피벗 직후 새로 기저가 된 변수의 경계를 그 row로 좁힌다(_tighten_from_row).
+    좁아진 경계는 tableau.bounds에 남아 호출자가 읽어 갈 수 있다. 범위가
+    모순이면 더 피벗할 것 없이 UNSAT이다. 복원할 때는 틀어진 row로 좁혔을 수
+    있으므로 이 호출에서 좁힌 경계를 모두 되돌린다.
 
     Args:
         tableau : SimplexTableau 객체
@@ -580,6 +632,11 @@ def simplex(
         return EPS * max(1.0, abs(x))
 
     restores = 0
+    # 복원하면 이 호출에서 틀어진 row로 좁혔을 수도 있는 경계를 되돌린다
+    bounds_at_start = (
+        {var: Bound(lower=b.lower, upper=b.upper) for var, b in tableau.bounds.items()}
+        if tighten_bounds else None
+    )
 
     def _drift_needs_restore() -> Optional[bool]:
         """오차를 재고 필요하면 복원한다.
@@ -596,6 +653,12 @@ def simplex(
         if drift <= DRIFT_TOL:
             tableau.pivots_since_check = 0
             return False
+        if bounds_at_start is not None:
+            tableau.bounds.clear()
+            tableau.bounds.update(
+                (var, Bound(lower=b.lower, upper=b.upper))
+                for var, b in bounds_at_start.items()
+            )
         if restores >= MAX_RESTORES_PER_CALL or not _restore_tableau(tableau):
             return None
         restores += 1
@@ -767,6 +830,27 @@ def simplex(
             tableau.assign[row.basic_var] = _compute_basic(tableau, row)
 
         tableau.pivots_since_check += 1
+
+        # 방금 기저로 들어온 변수(pivot_xi)의 row로 그 경계를 좁힌다.
+        # violated_row는 _pivot()이 제자리에서 "pivot_xi = ..." row로 바꿔 두었다.
+        if tighten_bounds:
+            tightened = _tighten_from_row(tableau, violated_row)
+            if tightened is None:
+                # 비기저변수를 경계 안에서 어떻게 움직여도 이 row를 만족시킬 수
+                # 없다 → UNSAT. 피벗 불가 UNSAT과 똑같이 row 계수에 기대는
+                # 판정이므로 같은 오차 검사를 거친다.
+                if tableau.pivots_since_check >= DRIFT_CHECK_AT_EXIT:
+                    restored = _drift_needs_restore()
+                    if restored is None:
+                        return _numerical_failure()
+                    if restored:
+                        continue
+                if stats is not None:
+                    stats["PIVOT_TIGHTEN_UNSAT"] = stats.get("PIVOT_TIGHTEN_UNSAT", 0) + 1
+                _finish("UNSAT")
+                return (None, False)
+            if tightened and stats is not None:
+                stats["PIVOT_TIGHTENED"] = stats.get("PIVOT_TIGHTENED", 0) + 1
 
         # 긴 호출은 끝날 때까지 기다리지 않고 중간에도 오차를 본다. 틀어진
         # row로 피벗을 계속하면 엉뚱한 방향으로 헤매며 반복만 늘어난다.

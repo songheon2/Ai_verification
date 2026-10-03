@@ -22,6 +22,7 @@ from visualization.SolveTrace import SolveTrace, span
 import copy
 import random
 import re
+import time
 
 _NEURON_VAR_RE = re.compile(r"^[zh](\d+)_(\d+)(?:_.*)?$")
 
@@ -202,13 +203,35 @@ def reluplex(
     seed: Optional[int] = 0,
     stats: Optional[Dict[str, Any]] = None,
     derive_bound: bool = True,
+    derive_in_search: bool = True,
+    search_derive_rows: str = "both",
+    pivot_tighten: bool = True,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
+    """
+    derive_in_search: 분기로 좁아진 경계로 노드마다 경계 유도를 다시 돌린다
+        (논문 5절: "ReLU의 약 10%를 분기하면 경계 유도로 나머지가 전부
+        제거되는 경우가 잦았다"). 모순이 나오면 LP를 풀지 않고 그 가지를
+        닫고, 새로 확정된 ReLU는 선형 제약으로 바꿔 분기 후보에서 뺀다.
+    search_derive_rows: 노드 경계 유도에 쓸 등식.
+        "original" — 원래 row(+분기·확정으로 추가된 row). 희소하고 정확하다.
+        "tableau"  — 부모가 피벗해 둔 현재 tableau row. 같은 제약의 다른
+                     선형결합이라 원래 row에서는 안 나오는 경계가 나온다.
+        "both"     — 둘 다.
+    pivot_tighten: Simplex가 피벗할 때마다 진입 변수의 경계를 그 row로 좁힌다
+        (논문 5절). LP가 끝나면 좁아진 경계를 노드 경계에 합치고, 그 결과
+        새로 확정된 ReLU를 강제한 뒤 LP를 다시 푼다.
+    """
+    if search_derive_rows not in ("original", "tableau", "both"):
+        raise ValueError(f"알 수 없는 search_derive_rows: {search_derive_rows}")
 
     original_relu_count = len(relus)
     if stats is not None:
         stats['DERIVE_TOTAL_RELUS'] = original_relu_count
         stats['DERIVE_FIXED_RELUS'] = 0
         stats['DERIVE_REMAINING_RELUS'] = original_relu_count
+        # 닫은 비율은 이 이론 호출의 탐색 트리 기준이다. 속성에 OR가 있으면
+        # DPLL 라운드마다 다른 부분문제로 다시 불리므로 호출마다 새로 센다.
+        stats['CLOSED_MEASURE'] = 0.0
 
     missing_relu_bounds = {
         var for pair in relus for var in pair if var not in bounds
@@ -235,6 +258,22 @@ def reluplex(
         if report_unknown:
             raise SolverLimitReached(reason)
         return None, False
+
+    def _bump(key: str, amount: float = 1) -> None:
+        if stats is not None:
+            stats[key] = stats.get(key, 0) + amount
+
+    def _closed(depth: int, kind: str) -> None:
+        """UNSAT으로 닫힌 가지(잎)를 센다.
+
+        분기 한 번이 탐색 공간을 반으로 나누므로, 깊이 d에서 닫힌 가지는 전체의
+        2^-d 이다. 그 합(CLOSED_MEASURE)이 1이 되면 전체가 닫힌 것이다 — 노드
+        수보다 "얼마나 진행됐는가"를 정직하게 보여준다. kind는 무엇이 닫았는지
+        (LP=simplex, DERIVE=경계 유도, BOUNDS=경계 모순)를 구분한다.
+        """
+        _bump("UNSAT_LEAVES")
+        _bump(f"UNSAT_LEAVES_{kind}")
+        _bump("CLOSED_MEASURE", 2.0 ** -depth)
 
     def _validated_sat(
         assign: Optional[Dict[str, float]],
@@ -302,7 +341,37 @@ def reluplex(
                     "origin": "relu_repair",
                 },
                 stats=stats,
+                tighten_bounds=pivot_tighten,
             )
+
+    def _enforce_fixed(
+        fixed_here: Dict[Tuple[str, str], str],
+        depth: int,
+        current_row_defs: List[Tuple[str, Dict[str, float]]],
+        bounds_now: Dict[str, Tuple[float, float]],
+        tableau: Optional[SimplexTableau],
+        active: List[Tuple[str, str]],
+    ) -> Tuple[List[Tuple[str, Dict[str, float]]], List[Tuple[str, str]]]:
+        """확정된 ReLU를 분기했을 때와 같은 형태로 강제하고 active에서 뺀다.
+
+        active: y - x = 0 (slack row), inactive: y = 0 (bound). 두 경우 모두 x의
+        부호 경계는 derive_bounds가 이미 좁혀 두었다. bounds_now와 tableau는
+        제자리에서 고치고, row 목록과 active는 새로 만들어 돌려준다.
+        """
+        current_row_defs = list(current_row_defs)
+        new_rows = []
+        for (x, y), state in sorted(fixed_here.items()):
+            if state == "active":
+                slack = f"relu_fixed_{x}_on_d{depth}"
+                terms = {y: 1.0, x: -1.0}
+                current_row_defs.append((slack, terms))
+                bounds_now[slack] = (0.0, 0.0)
+                new_rows.append((slack, terms, (0.0, 0.0)))
+            else:
+                bounds_now[y] = (0.0, 0.0)
+        if tableau is not None and new_rows:
+            _append_rows(tableau, new_rows)
+        return current_row_defs, [p for p in active if p not in fixed_here]
 
     def _select_violation(violations: List[Tuple[str, str]]) -> Tuple[str, str]:
         return min(violations, key=lambda p: repair_count.get(p, 0))
@@ -312,14 +381,24 @@ def reluplex(
         depth: int,
         current_row_defs: Optional[List[Tuple[str, Dict[str, float]]]] = None,
         warm: Optional[SimplexTableau] = None,
+        active: Optional[List[Tuple[str, str]]] = None,
     ) -> Tuple[Optional[Dict[str, float]], bool]:
+        """active: 이 노드에서 아직 켜짐/꺼짐이 정해지지 않은 ReLU.
+
+        분기했거나 경계 유도로 확정된 ReLU는 선형 제약(row/bound)으로 강제되어
+        있으므로 위반 검사·repair·분기 대상에서 빠진다. 최종 SAT 검산만은
+        _validated_sat이 전체 ReLU로 다시 한다.
+        """
         check_deadline(deadline)
         
         if current_row_defs is None:
             current_row_defs = row_defs
+        if active is None:
+            active = relus
             
         if depth > max_recursion:
             return _limit("RELUPLEX_RECURSION_LIMIT")
+        _bump("SEARCH_NODES")
 
         bounds_now = dict(bounds_now)
         for _, y in relus:
@@ -328,9 +407,39 @@ def reluplex(
             
             # [수정된 부분] 모순된 제약(하한이 상한보다 큼) 발생 시 즉시 UNSAT 처리
             if new_lo > hi + 1e-9:
+                _closed(depth, "BOUNDS")
                 return None, False
                 
             bounds_now[y] = (new_lo, hi)
+
+        # ── 탐색 중 경계 유도 (논문 5절) ──
+        # 루트의 경계 유도는 입력 박스만 보고 한 번 돌았다. 분기로 한 ReLU의
+        # 부호가 정해지면 그 사실이 다른 뉴런의 범위를 좁혀서 새로 안정이 되는
+        # ReLU가 생긴다. 이 연쇄를 쓰지 않으면 이미 부호가 정해진 ReLU까지
+        # 계속 분기하게 된다. 루트(depth 0)는 바로 앞에서 같은 계산을 했으므로
+        # 건너뛴다.
+        if derive_in_search and depth > 0 and active:
+            started = time.perf_counter()
+            derive_rows = []
+            if search_derive_rows != "tableau" or warm is None:
+                derive_rows.extend(current_row_defs)
+            if search_derive_rows != "original" and warm is not None:
+                derive_rows.extend((row.basic_var, row.coeffs) for row in warm.rows)
+            tightened, fixed_here, infeasible = derive_bounds(
+                derive_rows, bounds_now, active
+            )
+            _bump("SEARCH_DERIVE_CALLS")
+            _bump("SEARCH_DERIVE_SECONDS", time.perf_counter() - started)
+            if infeasible:
+                # 전파만으로 l > u 모순 — 이 가지는 LP를 풀 필요도 없이 UNSAT
+                _closed(depth, "DERIVE")
+                return None, False
+            bounds_now = tightened
+            if fixed_here:
+                current_row_defs, active = _enforce_fixed(
+                    fixed_here, depth, current_row_defs, bounds_now, warm, active
+                )
+                _bump("SEARCH_DERIVE_FIXED", len(fixed_here))
 
         if warm is not None:
             # 부모의 basis를 물려받고, 좁아진 bound만 반영해 이어서 푼다.
@@ -339,27 +448,61 @@ def reluplex(
             _sync_bounds(tableau, bounds_now)
         else:
             tableau = build_tableau(current_row_defs, bounds_now)
-        with span(trace, "simplex", depth=depth):
-            sol, sat = simplex(
-                tableau,
-                max_iter=simplex_max_iter,
-                debug=debug,
-                deadline=deadline,
-                report_unknown=report_unknown,
-                progress=progress,
-                progress_context={
-                    **base_progress_context,
-                    "depth": depth,
-                    "origin": "reluplex",
-                },
-                stats=stats,
-            )
+        while True:
+            with span(trace, "simplex", depth=depth):
+                sol, sat = simplex(
+                    tableau,
+                    max_iter=simplex_max_iter,
+                    debug=debug,
+                    deadline=deadline,
+                    report_unknown=report_unknown,
+                    progress=progress,
+                    progress_context={
+                        **base_progress_context,
+                        "depth": depth,
+                        "origin": "reluplex",
+                    },
+                    stats=stats,
+                    tighten_bounds=pivot_tighten,
+                )
 
-        if not sat:
-            return None, False
+            if not sat:
+                _closed(depth, "LP")
+                return None, False
+            if not pivot_tighten or not active:
+                break
+
+            # 피벗하며 좁힌 경계를 노드 경계에 합친다. 자식은 bounds_now를
+            # 물려받으므로 여기서 합쳐야 다음 분기 선택과 자식 노드에 쓰인다.
+            merged = False
+            for var, b in tableau.bounds.items():
+                lo, hi = bounds_now.get(var, (float('-inf'), float('inf')))
+                if b.lower > lo or b.upper < hi:
+                    bounds_now[var] = (max(lo, b.lower), min(hi, b.upper))
+                    merged = True
+            if not merged:
+                break
+            # 좁아진 경계로 부호가 정해진 ReLU가 생겼는지 ReLU 규칙만으로 본다.
+            # 정해졌는데 강제하지 않으면 그 ReLU는 위반 중이어도 분기 후보가
+            # 아니게 되어(_splittable=False) 탐색이 결론 없이 끝난다. 그래서
+            # 강제한 뒤 이 노드의 LP를 다시 푼다.
+            tightened, fixed_here, infeasible = derive_bounds(
+                [], bounds_now, active, max_passes=1
+            )
+            if infeasible:
+                _closed(depth, "DERIVE")
+                return None, False
+            bounds_now = tightened
+            if not fixed_here:
+                break
+            current_row_defs, active = _enforce_fixed(
+                fixed_here, depth, current_row_defs, bounds_now, tableau, active
+            )
+            _sync_bounds(tableau, bounds_now)
+            _bump("PIVOT_TIGHTEN_FIXED", len(fixed_here))
 
         assign = sol
-        violations = _check_relu_violations(assign, relus)
+        violations = _check_relu_violations(assign, active)
         if not violations:
             return _validated_sat(assign, current_row_defs, bounds_now)
 
@@ -385,18 +528,18 @@ def reluplex(
                 if not sat2:
                     continue
 
-                violations2 = _check_relu_violations(sol2, relus)
+                violations2 = _check_relu_violations(sol2, active)
                 if not violations2:
                     return _validated_sat(sol2, current_row_defs, bounds_now)
 
-                if best_assign is None or len(violations2) < len(_check_relu_violations(best_assign, relus)):
+                if best_assign is None or len(violations2) < len(_check_relu_violations(best_assign, active)):
                     best_assign = sol2
 
             if best_assign is None:
                 break
 
             assign = best_assign
-            violations = _check_relu_violations(assign, relus)
+            violations = _check_relu_violations(assign, active)
             if not violations:
                 return _validated_sat(assign, current_row_defs, bounds_now)
 
@@ -469,6 +612,9 @@ def reluplex(
                     row_defs1.append((slack_name, {relu_y: 1.0, branch_x: -1.0}))
                     bounds1[slack_name] = (0.0, 0.0)
 
+                # 분기한 ReLU는 두 자식에서 모두 제약으로 강제되므로 빠진다
+                child_active = [p for p in active if p != (branch_x, relu_y)]
+
                 branch_unknown_reason = None
                 split_id = None
                 if split_logger is not None:
@@ -507,7 +653,9 @@ def reluplex(
                         round_index=base_progress_context.get("round_index"),
                     ) as active_branch_event:
                         try:
-                            r1, sat1 = _rec(bounds1, depth + 1, row_defs1, warm1)
+                            r1, sat1 = _rec(
+                                bounds1, depth + 1, row_defs1, warm1, child_active
+                            )
                         except SolverLimitReached as exc:
                             if active_branch_event is not None:
                                 active_branch_event.meta["result"] = (
@@ -579,6 +727,7 @@ def reluplex(
                     ) as inactive_branch_event:
                         if inactive_bounds_conflict:
                             r2, sat2 = None, False
+                            _closed(depth + 1, "BOUNDS")
                             if inactive_branch_event is not None:
                                 inactive_branch_event.meta["result"] = "UNSAT"
                                 inactive_branch_event.meta["reason"] = "BOUNDS_CONFLICT"
@@ -592,7 +741,9 @@ def reluplex(
                         else:
                             warm2 = _child_tableau(tableau, []) if warm_start else None
                             try:
-                                r2, sat2 = _rec(bounds2, depth + 1, row_defs2, warm2)
+                                r2, sat2 = _rec(
+                                    bounds2, depth + 1, row_defs2, warm2, child_active
+                                )
                             except SolverLimitReached as exc:
                                 if inactive_branch_event is not None:
                                     inactive_branch_event.meta["result"] = (
@@ -654,6 +805,7 @@ def reluplex(
             # 전파만으로 l > u 모순이 드러났다 — 분기할 것도 없이 UNSAT
             if stats is not None:
                 stats['DERIVE_INFEASIBLE'] = stats.get('DERIVE_INFEASIBLE', 0) + 1
+            _closed(0, "DERIVE")
             return None, False
         if fixed:
             active_row_defs, active_bounds = apply_fixed_relus(

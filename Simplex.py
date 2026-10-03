@@ -1,4 +1,6 @@
 import copy
+import hashlib
+import random
 import zlib
 from dataclasses import dataclass, field
 from math import isfinite
@@ -22,6 +24,36 @@ DRIFT_CHECK_EVERY = 1000
 # 복원 직후에도 오차가 다시 나면 입력 자체가 수치적으로 나쁜 것이다.
 # 무한 복원 대신 수치 실패(UNKNOWN)로 끝낸다.
 MAX_RESTORES_PER_CALL = 3
+
+# 순환이 감지된 뒤에는 진입변수를 "가장 큰 후보 계수의 이 비율 이상"인 후보들
+# 중에서 무작위로 고른다. 결정적 규칙이 같은 상태를 되풀이하는 것을 깨면서도,
+# 피벗 계수는 최선의 후보와 10배 이내로 유지해 수치 안정성을 지킨다.
+RANDOM_PIVOT_RATIO = 0.1
+# 무작위 선택은 순환을 빠져나올 동안만 쓰고 이 피벗 수가 지나면 |a| 최대로
+# 돌아간다(다시 순환하면 다시 감지한다). 계속 무작위로 고르면 row가 빨리 조밀해져
+# 피벗 한 번의 비용이 커진다 — mMIMO 루트 LP에서 1000피벗당 약 100초 → 600초.
+RANDOM_PIVOT_STEPS = 100
+# 테스트용: True면 피벗마다 증분 갱신한 상태 해시를 처음부터 다시 계산한 값과
+# 비교한다 (느리다).
+_CHECK_STATE_HASH = False
+
+_VAR_HASH_CACHE: Dict[str, int] = {}
+
+
+def _var_hash(var: str) -> int:
+    """기저 해시에 쓰는 변수별 64비트 값. PYTHONHASHSEED와 무관하게 고정이다."""
+    value = _VAR_HASH_CACHE.get(var)
+    if value is None:
+        digest = hashlib.blake2b(var.encode("utf-8"), digest_size=8).digest()
+        value = int.from_bytes(digest, "little")
+        _VAR_HASH_CACHE[var] = value
+    return value
+
+
+def _value_hash(var: str, value: float) -> int:
+    """비기저변수 하나의 (이름, 값) 64비트 해시. 값은 비트 단위로 정확히 구분한다."""
+    digest = hashlib.blake2b(f"{var}={value!r}".encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "little")
 
 
 def _scaled_tol(value: float, tol: float = DEFAULT_TOL) -> float:
@@ -555,8 +587,23 @@ def simplex(
     몇백 번 피벗한 뒤 row가 통째로 잡음이 되어, 있지도 않은 UNSAT을 선언하고
     Reluplex가 분기 한 번 없이 종료한 사례가 있었다.
 
-    Bland's rule은 BLAND_AFTER 반복 이후 순환 방지 폴백으로만 쓴다. DdM 불변식은
-    진입변수 선택과 무관하게 유지되므로, 도중에 Bland로 전환해도 종료성은 보장된다.
+    순환(cycling) 대처
+    ------------------
+    |a| 최대 규칙은 퇴화(degenerate)된 LP에서 같은 상태를 되풀이할 수 있다. 순환은
+    같은 상태(기저변수 집합 + 비기저변수 값)가 다시 나타나야만 생기므로, 그 해시를
+    피벗마다 갱신하다가 이미 본 상태가 다시 나오면, 그 뒤 RANDOM_PIVOT_STEPS번
+    동안 이탈변수는 위반 row 중에서, 진입변수는 가장 큰 후보 계수의
+    RANDOM_PIVOT_RATIO 이상인 후보 중에서 무작위로 고른다(시드 고정이라 재현된다).
+    그다음 |a| 최대로 돌아가고, 다시 순환하면 다시 감지한다. 문제 자체는 바꾸지
+    않으므로 SAT/UNSAT 판정의 정확성에는 영향이 없다.
+
+    교과서의 순환 방지책인 Bland's rule(이름순 최초)은 쓰지 않는다. 정확한 유리수
+    연산에서는 종료가 보장되지만 부동소수에서는 계수 크기를 무시한 피벗이 이어져
+    tableau가 깨진다. 실측(mMIMO 루트 LP, 2972행): |a| 최대 규칙이 6993번째 피벗에서
+    실제로 같은 상태로 돌아왔고, 거기서 Bland로 넘어가자 원래 등식 대비 오차가
+    2e-11 → 1.1로 붕괴했다(기저 B의 rank 2969). 증폭률을 1e6 이하로 제한한
+    Bland도 2e-4까지 커졌다. 예전에는 반복 횟수(2*rows+1000)만 보고 Bland로
+    전환했으므로, 이 붕괴는 순환 감지와 무관하게 큰 LP에서 일어나고 있었다.
 
     경계 위반 판정과 여유 판정은 절대 EPS가 아니라 값의 크기에 비례한 상대
     허용오차(_tol)를 쓰고, 계수 0 판정도 row 최대계수 대비 상대값(ZERO_REL)을 쓴다.
@@ -591,11 +638,26 @@ def simplex(
     # (예전 구현) 정상적인 1e-10짜리 계수가 통째로 버려져서 피벗 후보가
     # 사라지고 없는 UNSAT이 만들어진다.
     ZERO_REL = 1e-12
-    # 이 반복 횟수를 넘어가면 진입변수 선택을 순수 Bland's rule로 영구 전환한다.
-    # DdM 불변식(비기저변수는 항상 범위 안)은 진입변수를 어떻게 고르든 매 피벗마다
-    # 유지되므로, 어느 시점에 Bland로 갈아타도 그때부터는 유효한 상태에서 시작하는
-    # 정상 Bland 실행이라 종료가 보장된다.
-    BLAND_AFTER = 2 * len(tableau.rows) + 1000
+
+    # 순환 감지: 상태(기저변수 집합 + 비기저변수 값)의 해시를 피벗마다 갱신하고,
+    # 이미 본 상태가 다시 나오면 그때부터 피벗 선택을 무작위로 바꾼다(위 docstring).
+    # 기저만 같고 비기저 값이 다르면 순환이 아니라 진행 중인 것이다. 피벗 한 번에
+    # 값이 바뀌는 비기저변수는 들어가는 변수와 나오는 변수뿐이라 갱신 비용은 상수다.
+    def _state_hash() -> int:
+        value = 0
+        basic = set()
+        for row in tableau.rows:
+            value ^= _var_hash(row.basic_var)
+            basic.add(row.basic_var)
+        for var, val in tableau.assign.items():
+            if var not in basic:
+                value ^= _value_hash(var, val)
+        return value
+
+    state_hash = _state_hash()
+    seen_states = {state_hash}
+    random_steps_left = 0     # >0 이면 순환에서 빠져나오는 중 (무작위 피벗)
+    pivot_rng = random.Random(0)
 
     context = dict(progress_context or {})
     call_id = None
@@ -644,7 +706,7 @@ def simplex(
         반환: False=오차 정상, True=복원했음(루프를 이어가야 함),
               None=복원할 수 없음(수치 실패로 끝내야 함)
         """
-        nonlocal restores
+        nonlocal restores, state_hash, seen_states
         drift = _tableau_drift(tableau)
         if stats is not None:
             stats["SIMPLEX_DRIFT_CHECKS"] = stats.get("SIMPLEX_DRIFT_CHECKS", 0) + 1
@@ -664,6 +726,9 @@ def simplex(
         restores += 1
         if stats is not None:
             stats["SIMPLEX_RESTORES"] = stats.get("SIMPLEX_RESTORES", 0) + 1
+        # 기저가 처음 상태로 돌아갔으므로 순환 감지도 새로 시작한다
+        state_hash = _state_hash()
+        seen_states = {state_hash}
         return True
 
     def _numerical_failure() -> Tuple[Optional[Dict[str, float]], bool]:
@@ -682,23 +747,26 @@ def simplex(
         if debug:
             _print_tableau(tableau, iteration)
 
-        use_bland = iteration >= BLAND_AFTER
-
-        # ── 범위 위반 기저변수 찾기 (Bland's rule: 이름 사전순 최소인 변수) ──
-        # 이탈변수는 항상 이 전순서로 고른다. 진입변수도 Bland로 고르는 폴백
-        # 구간(use_bland)에서는 두 선택이 같은 전순서를 쓰게 되어 anti-cycling
-        # 보장이 성립한다. tableau.rows의 list 순서는 피벗마다 바뀌므로
-        # "첫 번째로 찾은 row"를 쓰면 그 보장이 깨져서 특히 퇴화(degenerate)된
-        # tableau에서 진짜로 순환(cycle)할 수 있다.
+        # ── 범위 위반 기저변수 찾기 ──
+        # 평소에는 이름 사전순 최소인 변수를 고른다. tableau.rows의 list 순서는
+        # 피벗마다 바뀌므로 "첫 번째로 찾은 row"를 쓰면 실행이 결정적이지 않다.
+        # 순환이 감지된 뒤(randomize)에는 위반 row 중에서 무작위로 고른다.
+        randomize = random_steps_left > 0
         violated_row = None
+        violated_rows = [] if randomize else None
         for row in tableau.rows:
             xj = row.basic_var
             val = tableau.assign[xj]
             b = tableau.bounds[xj]
 
             if val < b.lower - _tol(b.lower) or val > b.upper + _tol(b.upper):
-                if violated_row is None or xj < violated_row.basic_var:
+                if violated_rows is not None:
+                    violated_rows.append(row)
+                elif violated_row is None or xj < violated_row.basic_var:
                     violated_row = row
+        if violated_rows:
+            violated_rows.sort(key=lambda r: r.basic_var)
+            violated_row = pivot_rng.choice(violated_rows)
 
         if violated_row is None:
             # 모든 기저변수가 범위 안 → SAT.
@@ -752,15 +820,21 @@ def simplex(
             return xi_val > b_xi.lower + _tol(b_xi.lower)
 
         # ── 피벗 가능한 비기저변수 xi 탐색 ──
-        # 기본은 |a| 최대(threshold pivoting). Bland's rule은 |a|~1e-10짜리 열도
-        # 태연히 고르는데, _pivot()의 -c/a 에서 오차가 1e10배 증폭되어 몇백 번만
-        # 피벗해도 정수 tableau가 잡음 덩어리가 된다.
+        # 기본은 |a| 최대(threshold pivoting). 이름순 최초(Bland's rule)는
+        # |a|~1e-10짜리 열도 태연히 고르는데, _pivot()의 -c/a 에서 오차가 1e10배
+        # 증폭되어 몇백 번만 피벗해도 정수 tableau가 잡음 덩어리가 된다.
         pivot_xi = None
-        if use_bland:
-            for xi in sorted(violated_row.coeffs.keys()):  # Bland's rule
-                if _eligible(xi, violated_row.coeffs[xi]):
-                    pivot_xi = xi
-                    break
+        if randomize:
+            # 순환이 감지된 뒤: 가장 큰 후보 계수의 RANDOM_PIVOT_RATIO 이상인
+            # 후보들 중에서 무작위로 고른다 (수치 안정성은 |a| 최대와 비슷하게 유지).
+            candidates = [
+                (xi, a) for xi, a in violated_row.coeffs.items() if _eligible(xi, a)
+            ]
+            if candidates:
+                floor = RANDOM_PIVOT_RATIO * max(abs(a) for _, a in candidates)
+                pivot_xi = pivot_rng.choice(
+                    sorted(xi for xi, a in candidates if abs(a) >= floor)
+                )
         else:
             best = None
             for xi, a in violated_row.coeffs.items():
@@ -804,10 +878,36 @@ def simplex(
         delta = (target - val) / a  # xj가 target에 도달하도록 xi 변화량
 
         # xi를 delta만큼 이동 (비기저→기저 교환 전 assign 업데이트)
-        _update_assign(tableau, pivot_xi, tableau.assign[pivot_xi] + delta)
+        entering_old_value = tableau.assign[pivot_xi]
+        _update_assign(tableau, pivot_xi, entering_old_value + delta)
 
         # 구조적 피벗 (row 재작성)
         _pivot(tableau, pivot_xi, xj)
+
+        # 상태가 바뀌었다: pivot_xi가 (원래 값을 들고) 비기저에서 빠져 기저로
+        # 들어가고, xj가 경계값 target을 들고 비기저로 나왔다. 이미 본 상태로
+        # 돌아왔다면 순환이 시작된 것이므로 이때부터 피벗을 무작위로 고른다.
+        state_hash ^= (
+            _var_hash(xj) ^ _var_hash(pivot_xi)
+            ^ _value_hash(pivot_xi, entering_old_value) ^ _value_hash(xj, target)
+        )
+        if _CHECK_STATE_HASH:
+            saved = tableau.assign[xj]
+            tableau.assign[xj] = target       # 아래에서 넣을 값을 미리 넣고 비교
+            assert state_hash == _state_hash(), "증분 상태 해시가 어긋났다"
+            tableau.assign[xj] = saved
+        if random_steps_left > 0:
+            random_steps_left -= 1
+            if random_steps_left == 0:
+                # 순환에서 빠져나왔다고 보고 |a| 최대로 돌아간다. 다시 순환하는지는
+                # 지금부터 새로 본다.
+                seen_states = {state_hash}
+        elif state_hash in seen_states:
+            random_steps_left = RANDOM_PIVOT_STEPS
+            if stats is not None:
+                stats["SIMPLEX_CYCLES_DETECTED"] = stats.get("SIMPLEX_CYCLES_DETECTED", 0) + 1
+        else:
+            seen_states.add(state_hash)
 
         # fill-in으로 생긴 잡음 계수를 정확히 0으로 지워 누적을 끊는다.
         # (이걸 안 하면 원래 0이어야 할 자리가 1e-10 언저리로 떠다니면서

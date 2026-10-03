@@ -711,6 +711,18 @@ class SimplexDriftTests(unittest.TestCase):
         self.assertGreater(stats.get("SIMPLEX_DRIFT_CHECKS", 0), 0)
         self.assertLess(stats.get("SIMPLEX_MAX_DRIFT", 0.0), 1e-12)
 
+    def test_incremental_state_hash_matches_full_recompute(self):
+        """순환 감지용 상태 해시를 피벗마다 증분 갱신한 값이 정확해야 한다."""
+        import Simplex as simplex_module
+
+        previous = simplex_module._CHECK_STATE_HASH
+        simplex_module._CHECK_STATE_HASH = True
+        try:
+            for seed in range(10):
+                rows, bounds, relus, _forward, _theta = _random_relu_problem(seed)
+                reluplex(rows, dict(bounds), relus, max_recursion=100)
+        finally:
+            simplex_module._CHECK_STATE_HASH = previous
 
 
 def _random_relu_problem(seed, n_in=2, layers=(4, 4)):

@@ -13,6 +13,7 @@ from Simplex import (
     _compute_basic,
     _pivot,
     _scaled_tol,
+    _update_assign,
     build_tableau,
     simplex,
 )
@@ -240,7 +241,6 @@ def reluplex(
         missing = ", ".join(sorted(missing_relu_bounds))
         raise ValueError(f"ReLU 변수의 bound가 없습니다: {missing}")
 
-    repair_count: Dict[Tuple[str, str], int] = {}
     base_progress_context = dict(progress_context or {})
     # 전역 random 대신 이 호출 전용 RNG를 쓴다. 예전에는 module-level
     # random.shuffle을 써서 같은 입력도 실행마다 repair 방향 순서가 달라졌고,
@@ -285,64 +285,44 @@ def reluplex(
             return assign, True
         return _limit("RELUPLEX_MODEL_INVALID")
 
-    def _try_repair(
-        tableau: SimplexTableau,
-        x: str,
-        y: str,
-        direction: int,
-        depth: int,
-    ) -> Tuple[Optional[Dict[str, float]], bool]:
-        import copy
-        check_deadline(deadline)
-        t = copy.deepcopy(tableau)
+    def _apply_relu_fix(tableau: SimplexTableau, x: str, y: str) -> Optional[str]:
+        """위반된 ReLU 쌍 하나를 tableau에서 제자리로 고친다.
 
-        x_val = t.assign.get(x, 0.0)
-        y_val = t.assign.get(y, 0.0)
+        논문 3절의 Update_f(y := relu(x))와 Update_b(x := y) 중 하나를 적용한다.
+        고칠 변수가 기저변수면 먼저 PivotForRelu로 비기저로 빼낸다. 피벗 열은
+        |계수|가 가장 큰 변수로 고른다 — "0이 아닌 첫 계수"로 고르면 1e-9짜리
+        계수로도 피벗해서 오차가 1e9배 증폭될 수 있다. 피벗이 필요 없는 쪽을
+        먼저 시도하고, 목표값이 변수 범위 밖이면 다른 쪽을 시도한다.
 
-        target_var = y if direction == 0 else x
-        target_val = relu(x_val) if direction == 0 else y_val
-
-        # bounds 범위 확인
-        lo = t.bounds[target_var].lower
-        hi = t.bounds[target_var].upper
-        if target_val < lo - 1e-9 or target_val > hi + 1e-9:
-            return None, False
-
-        # [수정된 부분] target_var가 '기저변수'라면 피벗해서 '비기저변수'로 빼내야 함
-        if target_var in t.basic_vars:
-            pivot_row = next((r for r in t.rows if r.basic_var == target_var), None)
-            if pivot_row is not None:
-                pivot_col = None
-                for nv, c in pivot_row.coeffs.items():
-                    if abs(c) > 1e-9:
-                        pivot_col = nv
-                        break
-                if pivot_col is None:
-                    return None, False
-                _pivot(t, pivot_col, target_var)
-
-        # 값 설정 후 simplex
-        t.assign[target_var] = target_val
-        for row in t.rows:
-            # 예외 없이 모든 기저변수를 수식에 맞게 다시 계산!
-            t.assign[row.basic_var] = _compute_basic(t, row)
-
-        with span(trace, "simplex"):
-            return simplex(
-                t,
-                max_iter=simplex_max_iter,
-                debug=debug,
-                deadline=deadline,
-                report_unknown=report_unknown,
-                progress=progress,
-                progress_context={
-                    **base_progress_context,
-                    "depth": depth,
-                    "origin": "relu_repair",
-                },
-                stats=stats,
-                tighten_bounds=pivot_tighten,
-            )
+        반환: 적용한 규칙 이름, 어느 쪽으로도 고칠 수 없으면 None.
+        수정으로 생긴 경계 위반은 호출자가 simplex로 이어서 고친다.
+        """
+        basic = {row.basic_var for row in tableau.rows}
+        options = [
+            ("update_f", y, relu(tableau.assign[x])),
+            ("update_b", x, tableau.assign[y]),
+        ]
+        rng.shuffle(options)
+        options.sort(key=lambda option: option[1] in basic)  # 비기저 쪽 먼저 (안정 정렬)
+        for rule, var, target in options:
+            bound = tableau.bounds[var]
+            if (target < bound.lower - _scaled_tol(bound.lower)
+                    or target > bound.upper + _scaled_tol(bound.upper)):
+                continue
+            target = min(max(target, bound.lower), bound.upper)
+            if var in basic:
+                row = next(r for r in tableau.rows if r.basic_var == var)
+                if not row.coeffs:
+                    continue
+                column = min(row.coeffs, key=lambda v: (-abs(row.coeffs[v]), v))
+                if row.coeffs[column] == 0.0:
+                    continue
+                _pivot(tableau, column, var)
+                tableau.pivots_since_check += 1
+                _bump("REPAIR_PIVOTS")
+            _update_assign(tableau, var, target)
+            return rule
+        return None
 
     def _enforce_fixed(
         fixed_here: Dict[Tuple[str, str], str],
@@ -372,9 +352,6 @@ def reluplex(
         if tableau is not None and new_rows:
             _append_rows(tableau, new_rows)
         return current_row_defs, [p for p in active if p not in fixed_here]
-
-    def _select_violation(violations: List[Tuple[str, str]]) -> Tuple[str, str]:
-        return min(violations, key=lambda p: repair_count.get(p, 0))
 
     def _rec(
         bounds_now: Dict[str, Tuple[float, float]],
@@ -506,45 +483,65 @@ def reluplex(
         if not violations:
             return _validated_sat(assign, current_row_defs, bounds_now)
 
+        # ── ReLU 위반 수정 (논문 3절 Update_b / Update_f / PivotForRelu) ──
+        # 노드의 tableau를 제자리에서 고친다. 한 쌍을 고치면 새 경계 위반이 생길
+        # 수 있으므로 simplex가 그 상태에서 이어서 경계를 맞춘다. 고칠 쌍은 위반
+        # 중인 쌍 가운데 이름순 첫 번째로 고정해서, 고쳐도 계속 다시 위반되는
+        # 쌍에 횟수가 쌓이게 한다. 이 노드에서 고친 횟수가 branch_tau에 닿은
+        # 쌍은 분기한다 (논문 5절: 5회). local_repair_max_iter는 노드당 수정
+        # 횟수의 상한이다.
+        #
+        # 예전 구현은 (1) tableau를 통째로 복사해 두 방향 모두 simplex를 끝까지
+        # 풀고 할당만 가져왔다 — tableau는 원본 그대로라 다음 수정은 다시 처음
+        # 상태에서 시작했다. (2) 횟수를 탐색 전체에서 누적하고 초기화하지 않아,
+        # 탐색 초반에는 노드마다 repair를 20번까지 하고 포화된 뒤에는 1번만 했다.
+        # ACAS Xu 20개(116초)에서 repair가 시간의 29~52%를 썼다.
+        repair_count: Dict[Tuple[str, str], int] = {}
         repair_unknown_reason = None
         for _ in range(local_repair_max_iter):
             check_deadline(deadline)
-            x, y = _select_violation(violations)
-            pair = (x, y)
+            pair = min(violations, key=lambda p: p[0])
+            if repair_count.get(pair, 0) >= branch_tau:
+                break
             repair_count[pair] = repair_count.get(pair, 0) + 1
-
-            best_assign = None
-            directions = [0, 1]
-            rng.shuffle(directions)
-            for direction in directions:
+            with span(trace, "reluplex_repair", depth=depth, branch_x=pair[0]):
+                if _apply_relu_fix(tableau, *pair) is None:
+                    # 어느 쪽으로도 범위 안에서 고칠 수 없다 → 분기로만 풀린다
+                    repair_count[pair] = branch_tau
+                    _bump("REPAIR_UNFIXABLE")
+                    break
+                _bump("REPAIR_STEPS")
                 try:
-                    with span(trace, "reluplex_repair", depth=depth, branch_x=x):
-                        sol2, sat2 = _try_repair(tableau, x, y, direction, depth)
+                    with span(trace, "simplex", depth=depth):
+                        sol2, sat2 = simplex(
+                            tableau,
+                            max_iter=simplex_max_iter,
+                            debug=debug,
+                            deadline=deadline,
+                            report_unknown=report_unknown,
+                            progress=progress,
+                            progress_context={
+                                **base_progress_context,
+                                "depth": depth,
+                                "origin": "relu_repair",
+                            },
+                            stats=stats,
+                            tighten_bounds=pivot_tighten,
+                        )
                 except SolverLimitReached as exc:
                     if exc.reason == "TIMEOUT":
                         raise
                     repair_unknown_reason = exc.reason
-                    continue
-                if not sat2:
-                    continue
-
-                violations2 = _check_relu_violations(sol2, active)
-                if not violations2:
-                    return _validated_sat(sol2, current_row_defs, bounds_now)
-
-                if best_assign is None or len(violations2) < len(_check_relu_violations(best_assign, active)):
-                    best_assign = sol2
-
-            if best_assign is None:
-                break
-
-            assign = best_assign
+                    break
+            if not sat2:
+                # 수정은 할당만 바꾸고 제약은 그대로이므로, 여기서 UNSAT이면 이
+                # 노드의 LP 자체가 불가능하다는 뜻이다(피벗 강화로 좁힌 경계 포함).
+                _closed(depth, "LP")
+                return None, False
+            assign = sol2
             violations = _check_relu_violations(assign, active)
             if not violations:
                 return _validated_sat(assign, current_row_defs, bounds_now)
-
-            if repair_count.get(_select_violation(violations), 0) >= branch_tau:
-                break
 
         # ── 분기 변수(branch_x) 선택 ──
         # 원래 Reluplex 규칙은 "repair로 여러 번 고쳐봤는데 계속 말썽인 ReLU를

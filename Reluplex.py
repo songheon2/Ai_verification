@@ -17,7 +17,7 @@ from Simplex import (
     build_tableau,
     simplex,
 )
-from BoundDerivation import derive_bounds, apply_fixed_relus
+from BoundDerivation import BoundDeps, derive_bounds, apply_fixed_relus
 from Automation.SolverStatus import SolverLimitReached, check_deadline
 from visualization.SolveTrace import SolveTrace, span
 import copy
@@ -55,7 +55,9 @@ def _express_in_nonbasic(
 
 
 def _sync_bounds(
-    tableau: SimplexTableau, bounds_now: Dict[str, Tuple[float, float]]
+    tableau: SimplexTableau,
+    bounds_now: Dict[str, Tuple[float, float]],
+    deps_now: Optional[BoundDeps] = None,
 ) -> None:
     """tableau의 bound를 bounds_now에 맞추고 DdM 불변식을 복구한다.
 
@@ -63,13 +65,20 @@ def _sync_bounds(
     밖으로 나가면 새 경계로 당겨온다(DdM의 assertBound와 같은 처리).
     기저변수는 건드리지 않는다 — 범위를 벗어나도 되고, 그건 simplex가
     피벗으로 해결할 일이다. 마지막에 모든 기저변수를 row 식으로 재계산한다.
+    deps_now가 있으면 경계의 원인 마스크도 같이 맞춘다(tableau.deps).
     """
 
     basic = {row.basic_var for row in tableau.rows}
+    if deps_now is not None and tableau.deps is None:
+        tableau.deps = BoundDeps()
+    deps = tableau.deps if deps_now is not None else None
     for var, (lo, hi) in bounds_now.items():
         if var not in tableau.assign:
             continue
         tableau.bounds[var] = Bound(lower=lo, upper=hi)
+        if deps is not None:
+            deps.set_lo(var, deps_now.lo.get(var, 0))
+            deps.set_hi(var, deps_now.hi.get(var, 0))
         if var in basic:
             continue
         value = tableau.assign[var]
@@ -207,6 +216,8 @@ def reluplex(
     derive_in_search: bool = True,
     search_derive_rows: str = "both",
     pivot_tighten: bool = True,
+    backjump: bool = False,
+    check_backjump: bool = False,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     derive_in_search: 분기로 좁아진 경계로 노드마다 경계 유도를 다시 돌린다
@@ -221,6 +232,18 @@ def reluplex(
     pivot_tighten: Simplex가 피벗할 때마다 진입 변수의 경계를 그 row로 좁힌다
         (논문 5절). LP가 끝나면 좁아진 경계를 노드 경계에 합치고, 그 결과
         새로 확정된 ReLU를 강제한 뒤 LP를 다시 푼다.
+    backjump: 충돌 분석과 백점프 (논문 4절 "Derived Bounds and Conflict
+        Analysis"). 경계마다 기대는 분기 깊이를 비트마스크로 기록하고
+        (BoundDeps), 가지를 닫을 때 그 모순이 실제로 기대는 분기 집합을 위로
+        올린다. 첫째 가지의 모순이 이 분기와 무관하면 둘째 가지도 같은 이유로
+        UNSAT이므로 풀지 않고 건너뛴다 — 여러 층이 무관하면 그만큼 한꺼번에
+        되돌아간다(논문 예: 분기 8, 7, 6을 한 번에 취소).
+        기본값은 꺼 둔다. 실측에서 모순의 원인이 경로 분기의 67~100%를 차지해
+        건너뛴 것이 매번 바로 닫힐 형제 잎 하나뿐이었고, 원인 기록 비용으로 경계
+        유도가 33~44% 느려져 ACAS Xu 증명 3개가 10~15% 느려졌다. 켜면
+        CONFLICT_BITS / CONFLICT_DEPTH로 "모순이 경로의 몇 할에 기대는가"를 잴 수 있다.
+    check_backjump: 테스트용. 건너뛸 가지를 실제로 풀어 보고 SAT이면
+        AssertionError를 낸다 (원인 기록이 틀렸는지 검증).
     """
     if search_derive_rows not in ("original", "tableau", "both"):
         raise ValueError(f"알 수 없는 search_derive_rows: {search_derive_rows}")
@@ -250,7 +273,19 @@ def reluplex(
     # seed=None을 넘기면 예전처럼 비결정적으로 동작한다.
     rng = random.Random(seed)
 
+    # ── 충돌 분석 ──
+    # 깊이 i의 분기 결정 = 비트 i. _rec이 UNSAT을 돌려줄 때 그 근거가 기대는
+    # 분기 마스크를 last_conflict[0]에 남기고, 부모가 바로 읽는다.
+    # None은 "증명이 아님"(UNKNOWN을 UNSAT처럼 돌려준 경우)이라 백점프에 쓰지 않는다.
+    track_deps = backjump
+    last_conflict: List[Optional[int]] = [None]
+
+    def _full(depth: int) -> int:
+        """원인을 모를 때: 깊이 1..depth의 분기 전부."""
+        return (1 << (depth + 1)) - 2
+
     def _limit(reason: str) -> Tuple[Optional[Dict[str, float]], bool]:
+        last_conflict[0] = None
         if stats is not None:
             # 사유별로 몇 번 걸렸는지 센다. UNKNOWN이 TIMEOUT으로 뭉뚱그려질 때
             # 진짜 병목(깊이 상한인지 Simplex 반복 상한인지)을 구분하는 근거가 된다.
@@ -274,6 +309,31 @@ def reluplex(
         _bump("UNSAT_LEAVES")
         _bump(f"UNSAT_LEAVES_{kind}")
         _bump("CLOSED_MEASURE", 2.0 ** -depth)
+
+    def _unsat(
+        depth: int, kind: str, mask: Optional[int]
+    ) -> Tuple[Optional[Dict[str, float]], bool]:
+        """잎을 UNSAT으로 닫고 그 원인 분기 마스크를 부모에게 남긴다.
+
+        mask가 None이면(원인을 모름) 깊이 1..depth 전부에 기댄다고 본다.
+        CONFLICT_BITS / CONFLICT_DEPTH는 원인에 실제로 든 분기 수와 경로 길이의
+        합이라, 둘의 비가 "모순이 경로의 몇 할에 기대는가"이다.
+        """
+        _closed(depth, kind)
+        if not track_deps:
+            last_conflict[0] = None
+        elif mask is None:
+            last_conflict[0] = _full(depth)
+        else:
+            if check_backjump and mask & ~_full(depth):
+                raise AssertionError(
+                    f"원인 마스크에 현재 깊이({depth})보다 깊은 분기가 있다: {mask:b}"
+                )
+            last_conflict[0] = mask
+            _bump("CONFLICT_LEAVES")
+            _bump("CONFLICT_BITS", bin(mask).count("1"))
+            _bump("CONFLICT_DEPTH", depth)
+        return None, False
 
     def _validated_sat(
         assign: Optional[Dict[str, float]],
@@ -331,24 +391,36 @@ def reluplex(
         bounds_now: Dict[str, Tuple[float, float]],
         tableau: Optional[SimplexTableau],
         active: List[Tuple[str, str]],
+        deps_now: Optional[BoundDeps] = None,
     ) -> Tuple[List[Tuple[str, Dict[str, float]]], List[Tuple[str, str]]]:
         """확정된 ReLU를 분기했을 때와 같은 형태로 강제하고 active에서 뺀다.
 
         active: y - x = 0 (slack row), inactive: y = 0 (bound). 두 경우 모두 x의
         부호 경계는 derive_bounds가 이미 좁혀 두었다. bounds_now와 tableau는
         제자리에서 고치고, row 목록과 active는 새로 만들어 돌려준다.
+        추가한 경계의 원인은 확정 근거 경계의 원인(deps_now.fixed)이다.
+        y >= 0은 ReLU의 정의라 원인이 없다.
         """
         current_row_defs = list(current_row_defs)
         new_rows = []
         for (x, y), state in sorted(fixed_here.items()):
+            reason = 0
+            if deps_now is not None:
+                reason = deps_now.fixed.get((x, y), _full(depth))
             if state == "active":
                 slack = f"relu_fixed_{x}_on_d{depth}"
                 terms = {y: 1.0, x: -1.0}
                 current_row_defs.append((slack, terms))
                 bounds_now[slack] = (0.0, 0.0)
                 new_rows.append((slack, terms, (0.0, 0.0)))
+                if deps_now is not None:
+                    deps_now.set_lo(slack, reason)
+                    deps_now.set_hi(slack, reason)
             else:
                 bounds_now[y] = (0.0, 0.0)
+                if deps_now is not None:
+                    deps_now.set_lo(y, 0)
+                    deps_now.set_hi(y, reason)
         if tableau is not None and new_rows:
             _append_rows(tableau, new_rows)
         return current_row_defs, [p for p in active if p not in fixed_here]
@@ -359,12 +431,17 @@ def reluplex(
         current_row_defs: Optional[List[Tuple[str, Dict[str, float]]]] = None,
         warm: Optional[SimplexTableau] = None,
         active: Optional[List[Tuple[str, str]]] = None,
+        deps_now: Optional[BoundDeps] = None,
     ) -> Tuple[Optional[Dict[str, float]], bool]:
         """active: 이 노드에서 아직 켜짐/꺼짐이 정해지지 않은 ReLU.
 
         분기했거나 경계 유도로 확정된 ReLU는 선형 제약(row/bound)으로 강제되어
         있으므로 위반 검사·repair·분기 대상에서 빠진다. 최종 SAT 검산만은
         _validated_sat이 전체 ReLU로 다시 한다.
+
+        deps_now: bounds_now의 경계마다 기대는 분기 마스크. 이 노드가 소유한다
+        (호출자는 새 복사본을 넘긴다). UNSAT을 돌려줄 때는 그 원인 마스크를
+        last_conflict[0]에 남긴다.
         """
         check_deadline(deadline)
         
@@ -378,16 +455,23 @@ def reluplex(
         _bump("SEARCH_NODES")
 
         bounds_now = dict(bounds_now)
+        if track_deps and deps_now is None:
+            deps_now = BoundDeps()      # 루트: 아직 분기가 없다
         for _, y in relus:
             lo, hi = bounds_now.get(y, (float('-inf'), float('inf')))
             new_lo = max(0.0, lo)
             
             # [수정된 부분] 모순된 제약(하한이 상한보다 큼) 발생 시 즉시 UNSAT 처리
             if new_lo > hi + 1e-9:
-                _closed(depth, "BOUNDS")
-                return None, False
+                return _unsat(
+                    depth, "BOUNDS",
+                    deps_now.lo.get(y, 0) | deps_now.hi.get(y, 0)
+                    if deps_now is not None else None,
+                )
                 
             bounds_now[y] = (new_lo, hi)
+            if deps_now is not None and new_lo != lo:
+                deps_now.set_lo(y, 0)   # y >= 0은 ReLU의 정의
 
         # ── 탐색 중 경계 유도 (논문 5절) ──
         # 루트의 경계 유도는 입력 박스만 보고 한 번 돌았다. 분기로 한 ReLU의
@@ -403,18 +487,21 @@ def reluplex(
             if search_derive_rows != "original" and warm is not None:
                 derive_rows.extend((row.basic_var, row.coeffs) for row in warm.rows)
             tightened, fixed_here, infeasible = derive_bounds(
-                derive_rows, bounds_now, active
+                derive_rows, bounds_now, active, deps=deps_now
             )
             _bump("SEARCH_DERIVE_CALLS")
             _bump("SEARCH_DERIVE_SECONDS", time.perf_counter() - started)
             if infeasible:
                 # 전파만으로 l > u 모순 — 이 가지는 LP를 풀 필요도 없이 UNSAT
-                _closed(depth, "DERIVE")
-                return None, False
+                return _unsat(
+                    depth, "DERIVE",
+                    deps_now.conflict if deps_now is not None else None,
+                )
             bounds_now = tightened
             if fixed_here:
                 current_row_defs, active = _enforce_fixed(
-                    fixed_here, depth, current_row_defs, bounds_now, warm, active
+                    fixed_here, depth, current_row_defs, bounds_now, warm, active,
+                    deps_now,
                 )
                 _bump("SEARCH_DERIVE_FIXED", len(fixed_here))
 
@@ -422,9 +509,11 @@ def reluplex(
             # 부모의 basis를 물려받고, 좁아진 bound만 반영해 이어서 푼다.
             # bounds_now 기준으로 한 번 맞춰주므로 부모와 어긋날 여지가 없다.
             tableau = warm
-            _sync_bounds(tableau, bounds_now)
+            _sync_bounds(tableau, bounds_now, deps_now)
         else:
             tableau = build_tableau(current_row_defs, bounds_now)
+            if deps_now is not None:
+                tableau.deps = deps_now.copy()
         while True:
             with span(trace, "simplex", depth=depth):
                 sol, sat = simplex(
@@ -444,18 +533,23 @@ def reluplex(
                 )
 
             if not sat:
-                _closed(depth, "LP")
-                return None, False
+                return _unsat(depth, "LP", tableau.conflict)
             if not pivot_tighten or not active:
                 break
 
             # 피벗하며 좁힌 경계를 노드 경계에 합친다. 자식은 bounds_now를
             # 물려받으므로 여기서 합쳐야 다음 분기 선택과 자식 노드에 쓰인다.
+            # 원인 마스크도 tableau에서 같이 가져온다.
             merged = False
             for var, b in tableau.bounds.items():
                 lo, hi = bounds_now.get(var, (float('-inf'), float('inf')))
                 if b.lower > lo or b.upper < hi:
                     bounds_now[var] = (max(lo, b.lower), min(hi, b.upper))
+                    if deps_now is not None:
+                        if b.lower > lo:
+                            deps_now.set_lo(var, tableau.deps.lo.get(var, 0))
+                        if b.upper < hi:
+                            deps_now.set_hi(var, tableau.deps.hi.get(var, 0))
                     merged = True
             if not merged:
                 break
@@ -464,18 +558,21 @@ def reluplex(
             # 아니게 되어(_splittable=False) 탐색이 결론 없이 끝난다. 그래서
             # 강제한 뒤 이 노드의 LP를 다시 푼다.
             tightened, fixed_here, infeasible = derive_bounds(
-                [], bounds_now, active, max_passes=1
+                [], bounds_now, active, max_passes=1, deps=deps_now
             )
             if infeasible:
-                _closed(depth, "DERIVE")
-                return None, False
+                return _unsat(
+                    depth, "DERIVE",
+                    deps_now.conflict if deps_now is not None else None,
+                )
             bounds_now = tightened
             if not fixed_here:
                 break
             current_row_defs, active = _enforce_fixed(
-                fixed_here, depth, current_row_defs, bounds_now, tableau, active
+                fixed_here, depth, current_row_defs, bounds_now, tableau, active,
+                deps_now,
             )
-            _sync_bounds(tableau, bounds_now)
+            _sync_bounds(tableau, bounds_now, deps_now)
             _bump("PIVOT_TIGHTEN_FIXED", len(fixed_here))
 
         assign = sol
@@ -536,8 +633,7 @@ def reluplex(
             if not sat2:
                 # 수정은 할당만 바꾸고 제약은 그대로이므로, 여기서 UNSAT이면 이
                 # 노드의 LP 자체가 불가능하다는 뜻이다(피벗 강화로 좁힌 경계 포함).
-                _closed(depth, "LP")
-                return None, False
+                return _unsat(depth, "LP", tableau.conflict)
             assign = sol2
             violations = _check_relu_violations(assign, active)
             if not violations:
@@ -600,19 +696,30 @@ def reluplex(
                     split_trace_event.meta["layer"] = layer
                     split_trace_event.meta["index"] = index
 
+                # 이 분기 결정의 비트. 자식(깊이 depth+1)에서 이 결정으로 생긴
+                # 경계는 이 비트를 원인으로 갖는다.
+                bit = 1 << (depth + 1)
+
                 # 1. x >= 0 분기
                 bounds1 = dict(bounds_now)
                 bounds1[branch_x] = (max(0.0, lo), hi)
+                deps1 = deps_now.copy() if deps_now is not None else None
+                if deps1 is not None:
+                    deps1.set_lo(branch_x, bit)
                 row_defs1 = list(current_row_defs)
                 if relu_y is not None:
                     slack_name = f"relu_slack_{branch_x}_pos_{depth}"
                     row_defs1.append((slack_name, {relu_y: 1.0, branch_x: -1.0}))
                     bounds1[slack_name] = (0.0, 0.0)
+                    if deps1 is not None:
+                        deps1.set_lo(slack_name, bit)
+                        deps1.set_hi(slack_name, bit)
 
                 # 분기한 ReLU는 두 자식에서 모두 제약으로 강제되므로 빠진다
                 child_active = [p for p in active if p != (branch_x, relu_y)]
 
                 branch_unknown_reason = None
+                c1 = c2 = None      # 두 자식이 UNSAT일 때의 원인 마스크
                 split_id = None
                 if split_logger is not None:
                     # global_split_count 증가 및 '+' 기록: 첫 Reluplex 재귀 호출 직전.
@@ -651,8 +758,10 @@ def reluplex(
                     ) as active_branch_event:
                         try:
                             r1, sat1 = _rec(
-                                bounds1, depth + 1, row_defs1, warm1, child_active
+                                bounds1, depth + 1, row_defs1, warm1, child_active,
+                                deps1,
                             )
+                            c1 = last_conflict[0]
                         except SolverLimitReached as exc:
                             if active_branch_event is not None:
                                 active_branch_event.meta["result"] = (
@@ -687,9 +796,20 @@ def reluplex(
                     # 동시에 살아있지 않도록)
                     warm1 = None
 
+                    # ── 백점프 (논문 4절 충돌 분석) ──
+                    # 첫째 가지를 닫은 모순이 이 분기(bit)에 기대지 않으면, 그
+                    # 모순은 둘째 가지에서도 그대로 성립한다(기대는 경계가 모두
+                    # 이 분기보다 위에서 정해졌으므로). 그래서 둘째 가지를 풀지
+                    # 않고 같은 원인으로 닫는다. 부모도 같은 검사를 하므로 무관한
+                    # 층이 여럿이면 한꺼번에 되돌아간다.
+                    backjumped = backjump and c1 is not None and not (c1 & bit)
+
                     # 2. x <= 0 분기
                     bounds2 = dict(bounds_now)
                     bounds2[branch_x] = (lo, min(0.0, hi))
+                    deps2 = deps_now.copy() if deps_now is not None else None
+                    if deps2 is not None:
+                        deps2.set_hi(branch_x, bit)
                     row_defs2 = list(current_row_defs)
                     inactive_bounds_conflict = False
                     if relu_y is not None:
@@ -699,6 +819,11 @@ def reluplex(
                         inactive_bounds_conflict = max(y_lo, 0.0) > min(y_hi, 0.0) + 1e-9
                         if not inactive_bounds_conflict:
                             bounds2[relu_y] = (max(y_lo, 0.0), min(y_hi, 0.0))
+                            if deps2 is not None:
+                                if y_lo < 0.0:
+                                    deps2.set_lo(relu_y, 0)     # y >= 0은 ReLU의 정의
+                                if y_hi > 0.0:
+                                    deps2.set_hi(relu_y, bit)   # y = 0은 이 분기 결정
 
                     inactive_branch_log_id = None
                     if split_logger is not None and hasattr(split_logger, "branch_begin"):
@@ -722,9 +847,31 @@ def reluplex(
                         bound=f"[{lo}, {min(0.0, hi)}]",
                         round_index=base_progress_context.get("round_index"),
                     ) as inactive_branch_event:
-                        if inactive_bounds_conflict:
+                        if backjumped and not check_backjump:
+                            r2, sat2 = None, False
+                            c2 = c1
+                            _bump("BACKJUMPS")
+                            _bump("BACKJUMP_SKIPPED_MEASURE", 2.0 ** -(depth + 1))
+                            _bump("CLOSED_MEASURE", 2.0 ** -(depth + 1))
+                            if inactive_branch_event is not None:
+                                inactive_branch_event.meta["result"] = "UNSAT"
+                                inactive_branch_event.meta["reason"] = "BACKJUMP"
+                            if inactive_branch_log_id is not None:
+                                split_logger.branch_end(
+                                    inactive_branch_log_id,
+                                    result="UNSAT",
+                                    reason="BACKJUMP",
+                                )
+                                inactive_branch_log_id = None
+                        elif inactive_bounds_conflict:
                             r2, sat2 = None, False
                             _closed(depth + 1, "BOUNDS")
+                            if deps_now is not None:
+                                c2 = (
+                                    deps_now.lo.get(relu_y, 0)
+                                    | deps_now.hi.get(relu_y, 0)
+                                    | bit
+                                )
                             if inactive_branch_event is not None:
                                 inactive_branch_event.meta["result"] = "UNSAT"
                                 inactive_branch_event.meta["reason"] = "BOUNDS_CONFLICT"
@@ -739,8 +886,10 @@ def reluplex(
                             warm2 = _child_tableau(tableau, []) if warm_start else None
                             try:
                                 r2, sat2 = _rec(
-                                    bounds2, depth + 1, row_defs2, warm2, child_active
+                                    bounds2, depth + 1, row_defs2, warm2, child_active,
+                                    deps2,
                                 )
+                                c2 = last_conflict[0]
                             except SolverLimitReached as exc:
                                 if inactive_branch_event is not None:
                                     inactive_branch_event.meta["result"] = (
@@ -769,11 +918,35 @@ def reluplex(
                                         result=("SAT" if sat2 else "UNSAT"),
                                     )
                                     inactive_branch_log_id = None
+                    if backjumped and check_backjump:
+                        # 검증 모드: 백점프가 건너뛰었을 가지를 실제로 풀어 봤다
+                        if sat2:
+                            raise AssertionError(
+                                f"백점프가 SAT 가지를 건너뛸 뻔했다: depth={depth}, "
+                                f"branch_x={branch_x}, 원인={c1:b}"
+                            )
+                        _bump(
+                            "BACKJUMP_CHECKED" if branch_unknown_reason is None
+                            else "BACKJUMP_CHECK_INCONCLUSIVE"
+                        )
                     if sat2:
                         return r2, True
 
                     if branch_unknown_reason is not None:
                         return _limit(branch_unknown_reason)
+                    # 이 노드를 닫은 원인: 한쪽 가지의 원인이 이 분기와 무관하면
+                    # 그것만으로 충분하고, 아니면 두 원인을 합쳐 이 분기를 뺀다.
+                    if not track_deps:
+                        conflict = None
+                    elif backjumped:
+                        conflict = c1
+                    elif c2 is not None and not (c2 & bit):
+                        conflict = c2
+                    elif c1 is not None and c2 is not None:
+                        conflict = (c1 | c2) & ~bit
+                    else:
+                        conflict = _full(depth)
+                    last_conflict[0] = conflict
                     return None, False
                 finally:
                     if split_logger is not None and split_id is not None:

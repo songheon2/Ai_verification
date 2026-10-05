@@ -28,6 +28,7 @@ from Automation.PropertyBuilder import (
     build_precondition,
     infer_expected_from_outputs,
 )
+from BoundDerivation import BoundDeps, derive_bounds
 from Reluplex import reluplex
 from Simplex import DRIFT_CHECK_AT_EXIT, build_tableau, simplex
 from Automation.SolverStatus import SolverLimitReached, SolverResult, SolverStatus
@@ -821,6 +822,73 @@ class SearchBoundDerivationTests(unittest.TestCase):
                             fired += 1
         self.assertGreater(fired, 0)
         self.assertLess(nodes_derived, nodes_plain)
+
+
+class BackjumpTests(unittest.TestCase):
+    """충돌 분석과 백점프. 원인 마스크의 비트 i = 깊이 i의 분기 결정."""
+
+    @staticmethod
+    def _two_row_problem():
+        # s = a + b >= 3 은 a, b <= 1 이라 불가능하다. t = c 는 무관한 row다.
+        inf = float("inf")
+        rows = [("s", {"a": 1.0, "b": 1.0}), ("t", {"c": 1.0})]
+        bounds = {
+            "s": (3.0, inf), "a": (0.0, 1.0), "b": (0.0, 1.0),
+            "t": (-inf, inf), "c": (0.0, 5.0),
+        }
+        # a, b, c의 상한은 각각 깊이 2, 4, 3의 분기에서 나왔다고 둔다
+        deps = BoundDeps(hi={"a": 1 << 2, "b": 1 << 4, "c": 1 << 3})
+        return rows, bounds, deps
+
+    def test_derive_conflict_names_only_the_bounds_it_used(self):
+        rows, bounds, deps = self._two_row_problem()
+        _bounds, _fixed, infeasible = derive_bounds(rows, bounds, [], deps=deps)
+        self.assertTrue(infeasible)
+        # c의 상한(깊이 3)은 모순과 무관하므로 원인에 들면 안 된다
+        self.assertEqual(deps.conflict, (1 << 2) | (1 << 4))
+
+    def test_simplex_unsat_conflict_is_the_blocking_row(self):
+        import copy
+
+        rows, bounds, deps = self._two_row_problem()
+        tableau = build_tableau(rows, bounds)
+        tableau.deps = deps
+        for tighten in (False, True):
+            with self.subTest(tighten_bounds=tighten):
+                t = copy.deepcopy(tableau)
+                _assign, sat = simplex(t, tighten_bounds=tighten)
+                self.assertFalse(sat)
+                self.assertEqual(t.conflict, (1 << 2) | (1 << 4))
+
+    def test_backjump_keeps_verdicts_and_skips_only_unsat_branches(self):
+        """백점프를 켜도 판정이 같고, 건너뛴 가지는 실제로 풀어 보면 모두 UNSAT이다.
+
+        check_backjump=True는 건너뛸 가지를 실제로 풀어 SAT이면 AssertionError를 낸다.
+        시드 36, 45, 46에서 백점프가 일어난다.
+        """
+        checked = 0
+        for seed in range(60):
+            rows, bounds, relus, forward, theta = _random_relu_problem(seed)
+            _model, plain_sat = reluplex(
+                rows, dict(bounds), relus, backjump=False, max_recursion=100,
+            )
+            for check in (False, True):
+                with self.subTest(seed=seed, check=check):
+                    stats = {}
+                    model, sat = reluplex(
+                        rows, dict(bounds), relus, backjump=True,
+                        check_backjump=check, stats=stats, max_recursion=100,
+                    )
+                    self.assertEqual(sat, plain_sat)
+                    if sat:
+                        self.assertGreaterEqual(
+                            forward([model["x0"], model["x1"]]), theta - 1e-6
+                        )
+                    else:
+                        # 건너뛴 가지도 닫힌 것으로 세므로 합이 정확히 1이어야 한다
+                        self.assertEqual(stats.get("CLOSED_MEASURE"), 1.0)
+                    checked += stats.get("BACKJUMP_CHECKED", 0)
+        self.assertGreater(checked, 0)
 
 
 if __name__ == "__main__":

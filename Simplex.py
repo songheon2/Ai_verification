@@ -101,12 +101,18 @@ class SimplexTableau:
                     오차가 크면 tableau를 다시 세우는 재료다.
     - pivots_since_check : 마지막 오차 검사(또는 새로 만든 뒤) 이후 이 tableau
                     계보에 쌓인 피벗 수. 복사본(웜 스타트 자식)도 물려받는다.
+    - deps : 경계마다 기대는 분기 마스크 (BoundDerivation.BoundDeps, 충돌 분석용).
+             None이면 추적하지 않는다. 피벗마다 좁힌 경계에도 원인을 붙인다.
+    - conflict : 마지막 simplex 호출이 UNSAT이었을 때 그 원인 분기 마스크.
+             모르면 None (추적을 안 했거나 UNSAT이 아니었다).
     """
     rows: List[Row]
     bounds: Dict[str, Bound]
     assign: Dict[str, float]
     origin_rows: List[Tuple[str, Dict[str, float]]] = field(default_factory=list)
     pivots_since_check: int = 0
+    deps: Optional[Any] = None
+    conflict: Optional[int] = None
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> "SimplexTableau":
         # origin_rows는 한 번 만들어지면 바뀌지 않으므로 목록만 새로 만들고
@@ -118,6 +124,7 @@ class SimplexTableau:
             assign=copy.deepcopy(self.assign, memo),
             origin_rows=list(self.origin_rows),
             pivots_since_check=self.pivots_since_check,
+            deps=None if self.deps is None else self.deps.copy(),
         )
 
     # 기저변수 집합 (빠른 조회)
@@ -391,6 +398,9 @@ def _tighten_from_row(
     논문 5절: "각 피벗 뒤에 진입 변수에 대해 경계 강화를 수행했다". 방금 기저로
     들어온 변수의 row 하나만 보므로 row 길이만큼의 비용이다.
 
+    tableau.deps가 있으면 좁힌 경계에 그 계산에 쓰인 경계들의 원인 마스크를
+    붙이고, 모순이면 원인을 tableau.conflict에 남긴다.
+
     반환: True=좁아짐, False=변화 없음, None=모순(이 row는 만족될 수 없다)
     """
     inf = float("inf")
@@ -416,15 +426,59 @@ def _tighten_from_row(
     cur = tableau.bounds[row.basic_var]
     new_lo = max(cur.lower, implied_lo)
     new_hi = min(cur.upper, implied_hi)
-    if new_lo > new_hi + tol * max(1.0, abs(new_lo), abs(new_hi)):
-        return None
-    changed = (
+    conflict = new_lo > new_hi + tol * max(1.0, abs(new_lo), abs(new_hi))
+    changed = not conflict and (
         new_lo > cur.lower + _scaled_tol(cur.lower, tol)
         or new_hi < cur.upper - _scaled_tol(cur.upper, tol)
     )
+    deps = tableau.deps
+    if deps is not None and (conflict or changed):
+        # 하한은 c>0인 변수의 하한·c<0인 변수의 상한으로 만들었다 (상한은 반대)
+        d_lo = d_hi = 0
+        for var, c in row.coeffs.items():
+            if c > 0:
+                d_lo |= deps.lo.get(var, 0)
+                d_hi |= deps.hi.get(var, 0)
+            else:
+                d_lo |= deps.hi.get(var, 0)
+                d_hi |= deps.lo.get(var, 0)
+        src_lo = d_lo if new_lo != cur.lower else deps.lo.get(row.basic_var, 0)
+        src_hi = d_hi if new_hi != cur.upper else deps.hi.get(row.basic_var, 0)
+        if conflict:
+            tableau.conflict = src_lo | src_hi
+        else:
+            deps.set_lo(row.basic_var, src_lo)
+            deps.set_hi(row.basic_var, src_hi)
+    if conflict:
+        return None
     if changed:
         tableau.bounds[row.basic_var] = Bound(lower=new_lo, upper=new_hi)
     return changed
+
+
+def _blocked_row_conflict(
+    tableau: SimplexTableau, row: Row, going_up: bool, zero_thr: float
+) -> int:
+    """피벗 불가 UNSAT의 원인 마스크.
+
+    row의 기저변수는 going_up이면 하한 아래(올려야 함), 아니면 상한 위에 있다.
+    계수가 0이 아닌 비기저변수는 모두 올리는(내리는) 방향의 반대쪽 경계에 붙어
+    있으므로, 기저변수의 그 경계와 비기저변수들의 막는 쪽 경계만으로 모순이다.
+    (계수 0 판정은 피벗 후보를 고를 때와 같은 zero_thr를 쓴다.)
+    """
+    deps = tableau.deps
+    if going_up:
+        mask = deps.lo.get(row.basic_var, 0)
+    else:
+        mask = deps.hi.get(row.basic_var, 0)
+    for var, a in row.coeffs.items():
+        if abs(a) <= zero_thr:
+            continue
+        if (a > 0) == going_up:
+            mask |= deps.hi.get(var, 0)     # 올려야 하는데 상한에 붙어 있다
+        else:
+            mask |= deps.lo.get(var, 0)     # 내려야 하는데 하한에 붙어 있다
+    return mask
 
 
 def _pivot(tableau: SimplexTableau, xi: str, xj: str) -> None:
@@ -624,6 +678,13 @@ def simplex(
     모순이면 더 피벗할 것 없이 UNSAT이다. 복원할 때는 틀어진 row로 좁혔을 수
     있으므로 이 호출에서 좁힌 경계를 모두 되돌린다.
 
+    UNSAT의 원인 (tableau.deps가 있을 때)
+    -------------------------------------
+    피벗 불가로 UNSAT이면 막힌 row 하나가 증거다: 기저변수 xj = sum(a*xi)에서
+    모든 xi가 xj를 고치는 방향의 반대쪽 경계에 붙어 있어 row의 최댓값(최솟값)이
+    xj의 경계에 못 미친다. 그래서 xj의 그 경계와 각 xi의 막는 쪽 경계만으로
+    모순이고, 그 원인 마스크의 합을 tableau.conflict에 남긴다(Reluplex의 백점프용).
+
     Args:
         tableau : SimplexTableau 객체
         max_iter : 최대 반복 횟수 (기본값: 10000)
@@ -694,10 +755,16 @@ def simplex(
         return EPS * max(1.0, abs(x))
 
     restores = 0
+    tableau.conflict = None
     # 복원하면 이 호출에서 틀어진 row로 좁혔을 수도 있는 경계를 되돌린다
+    # (원인 마스크도 같이)
     bounds_at_start = (
         {var: Bound(lower=b.lower, upper=b.upper) for var, b in tableau.bounds.items()}
         if tighten_bounds else None
+    )
+    deps_at_start = (
+        (dict(tableau.deps.lo), dict(tableau.deps.hi))
+        if tighten_bounds and tableau.deps is not None else None
     )
 
     def _drift_needs_restore() -> Optional[bool]:
@@ -721,6 +788,10 @@ def simplex(
                 (var, Bound(lower=b.lower, upper=b.upper))
                 for var, b in bounds_at_start.items()
             )
+        if deps_at_start is not None:
+            tableau.deps.lo = dict(deps_at_start[0])
+            tableau.deps.hi = dict(deps_at_start[1])
+        tableau.conflict = None
         if restores >= MAX_RESTORES_PER_CALL or not _restore_tableau(tableau):
             return None
         restores += 1
@@ -859,6 +930,10 @@ def simplex(
                     return _numerical_failure()
                 if restored:
                     continue
+            if tableau.deps is not None:
+                tableau.conflict = _blocked_row_conflict(
+                    tableau, violated_row, going_up, zero_thr
+                )
             _finish("UNSAT")
             return (None, False)
 

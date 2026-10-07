@@ -891,5 +891,51 @@ class BackjumpTests(unittest.TestCase):
         self.assertGreater(checked, 0)
 
 
+class FullTightenTests(unittest.TestCase):
+    """LP 한 번 안에서 N피벗마다 하는 tableau 전체 경계 강화."""
+
+    def test_full_tightening_finds_conflict_in_untouched_row(self):
+        # a = x + y >= 1은 풀 수 있고, c = z + w >= 5는 z, w <= 1이라 불가능하다.
+        # simplex는 이름순으로 a부터 고치므로, 첫 피벗 뒤 전체 강화가 아직 손대지
+        # 않은 c의 row에서 모순을 먼저 본다.
+        inf = float("inf")
+        rows = [("a", {"x": 1.0, "y": 1.0}), ("c", {"z": 1.0, "w": 1.0})]
+        bounds = {
+            "a": (1.0, inf), "c": (5.0, inf),
+            "x": (0.0, 1.0), "y": (0.0, 1.0), "z": (0.0, 1.0), "w": (0.0, 1.0),
+        }
+        for every, expect_full in ((0, 0), (1, 1)):
+            with self.subTest(full_tighten_every=every):
+                stats = {}
+                _assign, sat = simplex(
+                    build_tableau(rows, bounds), stats=stats,
+                    tighten_bounds=True, full_tighten_every=every,
+                )
+                self.assertFalse(sat)
+                self.assertEqual(stats.get("SIMPLEX_FULL_TIGHTEN_UNSAT", 0), expect_full)
+
+    def test_full_tightening_keeps_verdicts(self):
+        fired = 0
+        for seed in range(40):
+            rows, bounds, relus, forward, theta = _random_relu_problem(seed)
+            _model, plain_sat = reluplex(rows, dict(bounds), relus, max_recursion=100)
+            for every in (1, 5):
+                with self.subTest(seed=seed, full_tighten_every=every):
+                    stats = {}
+                    model, sat = reluplex(
+                        rows, dict(bounds), relus, full_tighten_every=every,
+                        stats=stats, max_recursion=100,
+                    )
+                    self.assertEqual(sat, plain_sat)
+                    if sat:
+                        self.assertGreaterEqual(
+                            forward([model["x0"], model["x1"]]), theta - 1e-6
+                        )
+                    else:
+                        self.assertEqual(stats.get("CLOSED_MEASURE"), 1.0)
+                    fired += stats.get("SIMPLEX_FULL_TIGHTEN", 0)
+        self.assertGreater(fired, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

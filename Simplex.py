@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import random
+import time
 import zlib
 from dataclasses import dataclass, field
 from math import isfinite
@@ -617,6 +618,7 @@ def simplex(
     progress_context: Optional[Dict[str, Any]] = None,
     stats: Optional[Dict[str, Any]] = None,
     tighten_bounds: bool = False,
+    full_tighten_every: int = 0,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     Simplex 알고리즘 (Algorithm 3 스타일).
@@ -677,6 +679,15 @@ def simplex(
     좁아진 경계는 tableau.bounds에 남아 호출자가 읽어 갈 수 있다. 범위가
     모순이면 더 피벗할 것 없이 UNSAT이다. 복원할 때는 틀어진 row로 좁혔을 수
     있으므로 이 호출에서 좁힌 경계를 모두 되돌린다.
+
+    호출 중 tableau 전체 경계 강화 (full_tighten_every=N, tighten_bounds일 때)
+    ------------------------------------------------------------------------
+    논문 5절은 피벗마다 진입 변수를 강화하는 것에 더해 "수천 피벗마다 tableau의
+    모든 방정식으로 더 철저한 경계 강화"를 했다. 이 호출에서 N번째 피벗마다 모든
+    row로 기저변수 경계를 좁히고, 모순인 row가 있으면 그 자리에서 UNSAT이다.
+    LP를 끝까지 풀어야 드러날 모순을 피벗된 다른 row에서 일찍 볼 수 있다.
+    0이면 하지 않는다. 호출을 시작할 때의 row로는 노드의 경계 유도가 이미 같은
+    일을 했으므로 첫 피벗 전에는 하지 않는다.
 
     UNSAT의 원인 (tableau.deps가 있을 때)
     -------------------------------------
@@ -1026,6 +1037,44 @@ def simplex(
                 return (None, False)
             if tightened and stats is not None:
                 stats["PIVOT_TIGHTENED"] = stats.get("PIVOT_TIGHTENED", 0) + 1
+
+        # N번째 피벗마다 모든 row로 기저변수 경계를 좁힌다 (논문 5절의 주기적
+        # 전체 강화). 피벗마다 하는 강화는 방금 바뀐 row 하나만 보지만, 다른 row도
+        # 피벗으로 계속 새 선형결합이 되므로 거기서 모순이 먼저 보일 수 있다.
+        if (full_tighten_every and tighten_bounds
+                and pivot_count % full_tighten_every == 0):
+            started = time.perf_counter()
+            conflict_found = False
+            n_tightened = 0
+            for row in tableau.rows:
+                tightened = _tighten_from_row(tableau, row)
+                if tightened is None:
+                    conflict_found = True
+                    break
+                n_tightened += bool(tightened)
+            if stats is not None:
+                stats["SIMPLEX_FULL_TIGHTEN"] = stats.get("SIMPLEX_FULL_TIGHTEN", 0) + 1
+                stats["SIMPLEX_FULL_TIGHTENED"] = (
+                    stats.get("SIMPLEX_FULL_TIGHTENED", 0) + n_tightened
+                )
+                stats["SIMPLEX_FULL_TIGHTEN_SECONDS"] = (
+                    stats.get("SIMPLEX_FULL_TIGHTEN_SECONDS", 0.0)
+                    + time.perf_counter() - started
+                )
+            if conflict_found:
+                # 피벗마다 강화의 모순과 똑같이 row 계수에 기대는 판정이다
+                if tableau.pivots_since_check >= DRIFT_CHECK_AT_EXIT:
+                    restored = _drift_needs_restore()
+                    if restored is None:
+                        return _numerical_failure()
+                    if restored:
+                        continue
+                if stats is not None:
+                    stats["SIMPLEX_FULL_TIGHTEN_UNSAT"] = (
+                        stats.get("SIMPLEX_FULL_TIGHTEN_UNSAT", 0) + 1
+                    )
+                _finish("UNSAT")
+                return (None, False)
 
         # 긴 호출은 끝날 때까지 기다리지 않고 중간에도 오차를 본다. 틀어진
         # row로 피벗을 계속하면 엉뚱한 방향으로 헤매며 반복만 늘어난다.

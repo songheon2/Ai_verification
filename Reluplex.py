@@ -216,6 +216,7 @@ def reluplex(
     derive_in_search: bool = True,
     search_derive_rows: str = "both",
     pivot_tighten: bool = True,
+    full_tighten_every: int = 1000,
     backjump: bool = False,
     check_backjump: bool = False,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
@@ -232,6 +233,14 @@ def reluplex(
     pivot_tighten: Simplex가 피벗할 때마다 진입 변수의 경계를 그 row로 좁힌다
         (논문 5절). LP가 끝나면 좁아진 경계를 노드 경계에 합치고, 그 결과
         새로 확정된 ReLU를 강제한 뒤 LP를 다시 푼다.
+    full_tighten_every: LP 한 번 안에서 이 피벗 수마다 tableau의 모든 row로
+        경계를 강화한다 (논문 5절 "수천 피벗마다 더 철저한 경계 강화",
+        Simplex의 full_tighten_every). pivot_tighten일 때만 쓰인다. 0이면 끈다.
+        LP 도중의 row는 LP가 끝났을 때와 다른 선형결합이라, 자식 노드의 경계
+        유도가 보지 못하는 경계가 나온다. ACAS Xu 11개(1시간)에서 1000은 끔과
+        둘 다 푼 5개 모두 노드가 같거나 줄었고(987 -> 41, 1401 -> 727,
+        647 -> 247, 나머지 둘은 실행되지 않아 같음) 나빠진 경우가 없었다. 50은
+        새로 2개를 더 풀었지만 1개를 못 풀게 되는 등 들쭉날쭉했다.
     backjump: 충돌 분석과 백점프 (논문 4절 "Derived Bounds and Conflict
         Analysis"). 경계마다 기대는 분기 깊이를 비트마스크로 기록하고
         (BoundDeps), 가지를 닫을 때 그 모순이 실제로 기대는 분기 집합을 위로
@@ -530,6 +539,7 @@ def reluplex(
                     },
                     stats=stats,
                     tighten_bounds=pivot_tighten,
+                    full_tighten_every=full_tighten_every,
                 )
 
             if not sat:
@@ -624,6 +634,7 @@ def reluplex(
                             },
                             stats=stats,
                             tighten_bounds=pivot_tighten,
+                            full_tighten_every=full_tighten_every,
                         )
                 except SolverLimitReached as exc:
                     if exc.reason == "TIMEOUT":

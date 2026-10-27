@@ -288,6 +288,9 @@ def reluplex(
     # None은 "증명이 아님"(UNKNOWN을 UNSAT처럼 돌려준 경우)이라 백점프에 쓰지 않는다.
     track_deps = backjump
     last_conflict: List[Optional[int]] = [None]
+    # Record whether the returning call detected a conflict itself or only
+    # combined child results; the tree must not infer discovery from UNSAT alone.
+    last_unsat_origin: List[Optional[str]] = [None]
 
     def _full(depth: int) -> int:
         """원인을 모를 때: 깊이 1..depth의 분기 전부."""
@@ -295,6 +298,7 @@ def reluplex(
 
     def _limit(reason: str) -> Tuple[Optional[Dict[str, float]], bool]:
         last_conflict[0] = None
+        last_unsat_origin[0] = None
         if stats is not None:
             # 사유별로 몇 번 걸렸는지 센다. UNKNOWN이 TIMEOUT으로 뭉뚱그려질 때
             # 진짜 병목(깊이 상한인지 Simplex 반복 상한인지)을 구분하는 근거가 된다.
@@ -329,6 +333,7 @@ def reluplex(
         합이라, 둘의 비가 "모순이 경로의 몇 할에 기대는가"이다.
         """
         _closed(depth, kind)
+        last_unsat_origin[0] = "found"
         if not track_deps:
             last_conflict[0] = None
         elif mask is None:
@@ -773,6 +778,7 @@ def reluplex(
                                 deps1,
                             )
                             c1 = last_conflict[0]
+                            origin1 = last_unsat_origin[0] if not sat1 else None
                         except SolverLimitReached as exc:
                             if active_branch_event is not None:
                                 active_branch_event.meta["result"] = (
@@ -795,10 +801,12 @@ def reluplex(
                                 active_branch_event.meta["result"] = (
                                     "SAT" if sat1 else "UNSAT"
                                 )
+                                active_branch_event.meta["unsat_origin"] = origin1
                             if active_branch_log_id is not None:
                                 split_logger.branch_end(
                                     active_branch_log_id,
                                     result=("SAT" if sat1 else "UNSAT"),
+                                    unsat_origin=origin1,
                                 )
                                 active_branch_log_id = None
                     if sat1:
@@ -867,11 +875,13 @@ def reluplex(
                             if inactive_branch_event is not None:
                                 inactive_branch_event.meta["result"] = "UNSAT"
                                 inactive_branch_event.meta["reason"] = "BACKJUMP"
+                                inactive_branch_event.meta["unsat_origin"] = "skipped"
                             if inactive_branch_log_id is not None:
                                 split_logger.branch_end(
                                     inactive_branch_log_id,
                                     result="UNSAT",
                                     reason="BACKJUMP",
+                                    unsat_origin="skipped",
                                 )
                                 inactive_branch_log_id = None
                         elif inactive_bounds_conflict:
@@ -886,11 +896,13 @@ def reluplex(
                             if inactive_branch_event is not None:
                                 inactive_branch_event.meta["result"] = "UNSAT"
                                 inactive_branch_event.meta["reason"] = "BOUNDS_CONFLICT"
+                                inactive_branch_event.meta["unsat_origin"] = "found"
                             if inactive_branch_log_id is not None:
                                 split_logger.branch_end(
                                     inactive_branch_log_id,
                                     result="UNSAT",
                                     reason="BOUNDS_CONFLICT",
+                                    unsat_origin="found",
                                 )
                                 inactive_branch_log_id = None
                         else:
@@ -901,6 +913,7 @@ def reluplex(
                                     deps2,
                                 )
                                 c2 = last_conflict[0]
+                                origin2 = last_unsat_origin[0] if not sat2 else None
                             except SolverLimitReached as exc:
                                 if inactive_branch_event is not None:
                                     inactive_branch_event.meta["result"] = (
@@ -923,10 +936,12 @@ def reluplex(
                                     inactive_branch_event.meta["result"] = (
                                         "SAT" if sat2 else "UNSAT"
                                     )
+                                    inactive_branch_event.meta["unsat_origin"] = origin2
                                 if inactive_branch_log_id is not None:
                                     split_logger.branch_end(
                                         inactive_branch_log_id,
                                         result=("SAT" if sat2 else "UNSAT"),
+                                        unsat_origin=origin2,
                                     )
                                     inactive_branch_log_id = None
                     if backjumped and check_backjump:
@@ -958,6 +973,7 @@ def reluplex(
                     else:
                         conflict = _full(depth)
                     last_conflict[0] = conflict
+                    last_unsat_origin[0] = "propagated"
                     return None, False
                 finally:
                     if split_logger is not None and split_id is not None:

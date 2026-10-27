@@ -263,6 +263,7 @@ class SplitEventLogger:
         *,
         result: str,
         reason: Optional[str] = None,
+        unsat_origin: Optional[str] = None,
     ) -> None:
         """Record the result of a previously entered ReLU branch."""
         self._append_branch({
@@ -270,6 +271,7 @@ class SplitEventLogger:
             "branch_id": branch_id,
             "result": result,
             "reason": reason,
+            "unsat_origin": unsat_origin,
         })
 
     def _append_branch(self, values: Dict) -> None:

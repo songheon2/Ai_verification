@@ -63,6 +63,144 @@ class VisualizationOutputPathTests(unittest.TestCase):
 
 
 class ReLUSearchTreeTests(unittest.TestCase):
+    def test_explicit_unsat_origin_prevents_false_discovery_in_partial_logs(self):
+        for origin in ("found", "propagated", "skipped"):
+            with self.subTest(origin=origin):
+                trace = SolveTrace(events=[
+                    TraceEvent("reluplex_branch", 1, 2, 1, "z1_1",
+                               {"phase": "+", "result": "UNSAT", "unsat_origin": origin}),
+                ])
+                branch = build_relu_search_tree(trace, overall_status="RUNNING")[0]
+                self.assertEqual(branch["unsatRole"], origin)
+                self.assertEqual(
+                    branch["unsatSourceIds"], [branch["id"]] if origin == "found" else []
+                )
+
+    def test_live_and_completed_trees_preserve_immediate_parent_for_both_results(self):
+        for result in ("SAT", "UNSAT"):
+            with self.subTest(result=result):
+                trace = SolveTrace(events=[
+                    TraceEvent("reluplex_branch", 1, None, 1, "z1_10",
+                               {"phase": "+", "result": "RUNNING"}),
+                    TraceEvent("reluplex_branch", 2, 9, 2, "z2_20",
+                               {"phase": "+", "result": result}),
+                    TraceEvent("reluplex_branch", 3, 8, 3, "z3_30",
+                               {"phase": "-", "result": result}),
+                ])
+                root = build_relu_search_tree(trace, overall_status="RUNNING")[0]
+                returned = root["children"][0]
+                found = returned["children"][0]
+                self.assertIsNone(root["parentId"])
+                self.assertEqual(returned["parentId"], root["id"])
+                self.assertEqual(found["parentId"], returned["id"])
+                self.assertEqual(root["result"], "RUNNING")
+                role_key = "satRole" if result == "SAT" else "unsatRole"
+                self.assertEqual(returned[role_key], "propagated")
+                self.assertEqual(found[role_key], "found")
+
+                trace.events[0].t_end = 10
+                trace.events[0].meta["result"] = result
+                completed = build_relu_search_tree(trace, overall_status=result)[0]
+                self.assertEqual(completed["result"], result)
+                self.assertEqual(completed["children"][0]["parentId"], root["id"])
+                self.assertEqual(completed["children"][0][role_key], "propagated")
+
+    def test_unsat_conflicts_are_distinct_from_returns_and_backjump_skips(self):
+        trace = SolveTrace(events=[
+            TraceEvent("reluplex_branch", 1, 15, 1, "z1_10",
+                       {"phase": "+", "result": "UNSAT"}),
+            TraceEvent("reluplex_branch", 2, 9, 2, "z2_20",
+                       {"phase": "+", "result": "UNSAT"}),
+            TraceEvent("reluplex_branch", 3, 5, 3, "z3_30",
+                       {"phase": "+", "result": "UNSAT"}),
+            TraceEvent("reluplex_branch", 6, 8, 3, "z3_30",
+                       {"phase": "-", "result": "UNSAT", "reason": "BOUNDS_CONFLICT"}),
+            TraceEvent("reluplex_branch", 10, 11, 2, "z2_20",
+                       {"phase": "-", "result": "UNSAT", "reason": "BACKJUMP"}),
+        ])
+        root = build_relu_search_tree(trace, overall_status="UNSAT")[0]
+        forwarded, skipped = root["children"]
+        found = forwarded["children"]
+        self.assertEqual(root["result"], "UNSAT")
+        self.assertEqual(root["unsatRole"], "propagated")
+        self.assertEqual(forwarded["unsatRole"], "propagated")
+        source_ids = [branch["id"] for branch in found]
+        self.assertEqual(root["unsatSourceIds"], source_ids)
+        self.assertEqual(forwarded["unsatSourceIds"], source_ids)
+        for branch in found:
+            self.assertEqual(branch["unsatRole"], "found")
+            self.assertEqual(branch["unsatSourceIds"], [branch["id"]])
+        self.assertEqual(skipped["unsatRole"], "skipped")
+        self.assertEqual(skipped["unsatSourceIds"], [])
+        self.assertTrue(skipped["prunesSpace"])
+        self.assertIsNone(root["satRole"])
+
+        trace.events[0].t_end = None
+        trace.events[0].meta["result"] = "RUNNING"
+        live_root = build_relu_search_tree(trace, overall_status="RUNNING")[0]
+        self.assertIsNone(live_root["unsatRole"])
+        self.assertEqual(live_root["unsatSourceIds"], [])
+        self.assertEqual(live_root["children"][0]["unsatRole"], "propagated")
+
+    def test_sat_discovery_is_distinct_from_ancestor_returns(self):
+        trace = SolveTrace(events=[
+            TraceEvent("reluplex_branch", 1, 10, 1, "z1_10",
+                       {"phase": "+", "result": "SAT"}),
+            TraceEvent("reluplex_branch", 2, 3, 2, "z2_20",
+                       {"phase": "+", "result": "UNSAT"}),
+            TraceEvent("reluplex_branch", 4, 9, 2, "z2_20",
+                       {"phase": "-", "result": "SAT"}),
+            TraceEvent("reluplex_branch", 5, 8, 3, "z3_30",
+                       {"phase": "+", "result": "SAT"}),
+        ])
+        root = build_relu_search_tree(trace, overall_status="SAT")[0]
+        rejected, forwarded = root["children"]
+        found = forwarded["children"][0]
+        self.assertEqual(root["result"], "SAT")
+        self.assertEqual(root["satRole"], "propagated")
+        self.assertEqual(forwarded["satRole"], "propagated")
+        self.assertEqual(found["satRole"], "found")
+        for branch in (root, forwarded, found):
+            self.assertEqual(branch["satSourceId"], found["id"])
+            self.assertFalse(branch["prunesSpace"])
+        self.assertIsNone(rejected["satRole"])
+        self.assertIsNone(rejected["satSourceId"])
+        self.assertTrue(rejected["prunesSpace"])
+
+        # A live snapshot can already contain the discovery while ancestors
+        # are still returning. Do not label those RUNNING branches as SAT.
+        trace.events[0].t_end = None
+        trace.events[0].meta["result"] = "RUNNING"
+        live_root = build_relu_search_tree(trace, overall_status="RUNNING")[0]
+        self.assertIsNone(live_root["satRole"])
+        self.assertEqual(live_root["result"], "RUNNING")
+        self.assertEqual(live_root["children"][1]["satRole"], "propagated")
+        self.assertEqual(
+            live_root["children"][1]["children"][0]["satRole"], "found"
+        )
+
+    def test_sat_found_without_children_and_non_sat_results(self):
+        for result in ("SAT", "UNSAT", "UNKNOWN", "TIMEOUT", "RUNNING"):
+            with self.subTest(result=result):
+                trace = SolveTrace(events=[
+                    TraceEvent("reluplex_branch", 1, 2, 1, "z1_1",
+                               {"phase": "+", "result": result}),
+                ])
+                branch = build_relu_search_tree(trace, overall_status=result)[0]
+                self.assertEqual(
+                    branch["satRole"], "found" if result == "SAT" else None
+                )
+                self.assertEqual(
+                    branch["satSourceId"], branch["id"] if result == "SAT" else None
+                )
+                self.assertEqual(
+                    branch["unsatRole"], "found" if result == "UNSAT" else None
+                )
+                self.assertEqual(
+                    branch["unsatSourceIds"], [branch["id"]] if result == "UNSAT" else []
+                )
+        self.assertEqual(build_relu_search_tree(SolveTrace(), overall_status="SAT"), [])
+
     def test_branch_spans_become_siblings_and_nested_children(self):
         trace = SolveTrace(events=[
             TraceEvent("reluplex_split", 0.9, 7.1, 0, "z1_2"),
@@ -79,18 +217,29 @@ class ReLUSearchTreeTests(unittest.TestCase):
         roots = build_relu_search_tree(trace)
         self.assertEqual(len(roots), 2)
         self.assertEqual(roots[0]["result"], "CLOSED")
+        self.assertEqual(roots[0]["branchResult"], "SAT")
+        self.assertFalse(roots[0]["prunesSpace"])
         self.assertEqual(roots[0]["splitNumber"], 1)
         self.assertEqual([child["phase"] for child in roots[0]["children"]], ["+", "-"])
         self.assertEqual(
             [child["splitNumber"] for child in roots[0]["children"]], [2, 2]
         )
         self.assertEqual(roots[0]["children"][0]["result"], "CLOSED")
+        self.assertEqual(
+            [child["branchResult"] for child in roots[0]["children"]],
+            ["UNSAT", "SAT"],
+        )
+        self.assertEqual(
+            [child["prunesSpace"] for child in roots[0]["children"]],
+            [True, False],
+        )
         self.assertEqual(roots[0]["subtreeSize"], 3)
         self.assertEqual(roots[0]["maxDepth"], 2)
 
         final_roots = build_relu_search_tree(trace, overall_status="UNSAT")
         self.assertEqual(final_roots[0]["children"][0]["result"], "CLOSED")
         self.assertEqual(final_roots[-1]["result"], "UNSAT")
+        self.assertEqual(final_roots[-1]["branchResult"], "UNSAT")
         final_results = []
         pending = list(final_roots)
         while pending:
@@ -175,7 +324,9 @@ class ReLUSearchTreeTests(unittest.TestCase):
             self.assertIn("경계 유도 ReLU", content)
             self.assertIn('.CLOSED{background:#172f58', content)
             self.assertIn('.TIMEOUT{background:#4a3b0d', content)
-            self.assertIn("내부적으로 UNSAT 판정된 중간 분기", content)
+            self.assertIn("SAT 발견", content)
+            self.assertIn("SAT 전달", content)
+            self.assertIn("CLOSED (UNSAT)", content)
             self.assertIn('"splitCount": 1', content)
             self.assertIn("하위 탐색 최대 깊이", content)
             self.assertNotIn("https://", content)
@@ -216,6 +367,106 @@ class ReLUFeedbackHistoryTests(unittest.TestCase):
 
 
 class RealtimeSearchTreeTests(unittest.TestCase):
+    def test_solver_records_direct_conflicts_and_returns_in_trace_and_live_log(self):
+        from Reluplex import reluplex
+
+        rows = [
+            ("total", {"h1_0": 1.0, "h1_1": 1.0}),
+            ("sum_z", {"z1_0": 1.0, "z1_1": 1.0}),
+        ]
+        bounds = {
+            "total": (1.5, 2.0), "sum_z": (-2.0, 0.0),
+            "z1_0": (-1.0, 1.0), "z1_1": (-1.0, 1.0),
+            "h1_0": (0.0, 1.0), "h1_1": (0.0, 1.0),
+        }
+        # ReLU outputs cannot sum to 1.5 when both inputs sum to at most 0.
+        # Disable tightening/repair here so the proof visits both branch phases.
+        with tempfile.TemporaryDirectory() as directory:
+            split_log = Path(directory) / "relu_events.jsonl"
+            logger = SplitEventLogger(split_log, reset_log=True)
+            trace = SolveTrace()
+            _, sat = reluplex(
+                rows, bounds, [("z1_0", "h1_0"), ("z1_1", "h1_1")],
+                trace=trace, split_logger=logger, derive_bound=False,
+                derive_in_search=False, pivot_tighten=False,
+                local_repair_max_iter=0, warm_start=False, report_unknown=True,
+            )
+            self.assertFalse(sat)
+            feedback_events = [e for e in trace.events if e.component == "reluplex_branch"]
+            live_trace = trace_from_branch_log(branch_log_path(split_log))
+            feedback = [(e.branch_x, e.meta["phase"], e.meta.get("unsat_origin"))
+                        for e in feedback_events]
+            live = [(e.branch_x, e.meta["phase"], e.meta.get("unsat_origin"))
+                    for e in live_trace.events]
+            self.assertEqual(live, feedback)
+            self.assertEqual(
+                feedback,
+                [("z1_0", "+", "propagated"), ("z1_1", "+", "found"),
+                 ("z1_1", "-", "found"), ("z1_0", "-", "found")],
+            )
+            roots = build_relu_search_tree(live_trace, overall_status="UNSAT")
+            self.assertEqual(roots[0]["unsatRole"], "propagated")
+            self.assertEqual(
+                [child["unsatRole"] for child in roots[0]["children"]],
+                ["found", "found"],
+            )
+
+    def test_live_branch_log_distinguishes_unsat_and_backjump_returns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            split_log = Path(directory) / "relu_events.jsonl"
+            logger = SplitEventLogger(split_log, reset_log=True)
+            parent = logger.branch_begin(
+                "z1_10", 1, 10, phase="+", depth=1, bound="[0, 1]",
+            )
+            found = logger.branch_begin(
+                "z2_20", 2, 20, phase="+", depth=2, bound="[0, 1]",
+            )
+            logger.branch_end(found, result="UNSAT", reason="BOUNDS_CONFLICT")
+            skipped = logger.branch_begin(
+                "z2_20", 2, 20, phase="-", depth=2, bound="[-1, 0]",
+            )
+            logger.branch_end(skipped, result="UNSAT", reason="BACKJUMP")
+            logger.branch_end(parent, result="UNSAT")
+            root = build_relu_search_tree(
+                trace_from_branch_log(branch_log_path(split_log)),
+                overall_status="UNSAT",
+            )[0]
+            self.assertEqual(root["unsatRole"], "propagated")
+            self.assertEqual(
+                [child["unsatRole"] for child in root["children"]],
+                ["found", "skipped"],
+            )
+            self.assertEqual(root["unsatSourceIds"], [root["children"][0]["id"]])
+
+    def test_live_branch_log_preserves_discovery_during_sat_return(self):
+        with tempfile.TemporaryDirectory() as directory:
+            split_log = Path(directory) / "relu_events.jsonl"
+            logger = SplitEventLogger(split_log, reset_log=True)
+            parent = logger.branch_begin(
+                "z1_10", 1, 10, phase="+", depth=1, bound="[0, 1]",
+            )
+            child = logger.branch_begin(
+                "z2_20", 2, 20, phase="-", depth=2, bound="[-1, 0]",
+            )
+            logger.branch_end(child, result="SAT")
+            live_root = build_relu_search_tree(
+                trace_from_branch_log(branch_log_path(split_log)),
+                overall_status="RUNNING",
+            )[0]
+            self.assertEqual(live_root["result"], "RUNNING")
+            self.assertIsNone(live_root["satRole"])
+            self.assertEqual(live_root["children"][0]["satRole"], "found")
+
+            logger.branch_end(parent, result="SAT")
+            final_root = build_relu_search_tree(
+                trace_from_branch_log(branch_log_path(split_log)),
+                overall_status="SAT",
+            )[0]
+            self.assertEqual(final_root["satRole"], "propagated")
+            self.assertEqual(
+                final_root["satSourceId"], final_root["children"][0]["id"]
+            )
+
     def test_branch_log_builds_live_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             split_log = Path(directory) / "relu_events.jsonl"
@@ -242,6 +493,8 @@ class RealtimeSearchTreeTests(unittest.TestCase):
             self.assertEqual(roots[0]["splitNumber"], 1)
             self.assertEqual(roots[0]["children"][0]["splitNumber"], 2)
             self.assertEqual(roots[0]["children"][0]["phase"], "-")
+            self.assertEqual(roots[0]["branchResult"], "SAT")
+            self.assertEqual(roots[0]["children"][0]["branchResult"], "UNSAT")
 
             output = Path(directory) / "relu_search_tree.html"
             theory_stats = {

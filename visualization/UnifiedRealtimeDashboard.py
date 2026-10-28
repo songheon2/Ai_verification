@@ -164,7 +164,14 @@ class UnifiedRealtimeDashboard:
       const cacheBuster = "?t=" + Date.now();
       for (const page of pages) {{
         if (document.getElementById(page.autoId).checked) {{
-          document.getElementById(page.id).src = page.uri + cacheBuster;
+          const frame = document.getElementById(page.id);
+          if (!frame.dataset.loaded) {{
+            frame.src = page.uri + cacheBuster;
+            frame.dataset.loaded = "true";
+          }} else {{
+            // Preserve the visible document and ask it to merge a snapshot.
+            frame.contentWindow.postMessage({{type: "relu-search-tree-refresh"}}, "*");
+          }}
         }}
       }}
     }}

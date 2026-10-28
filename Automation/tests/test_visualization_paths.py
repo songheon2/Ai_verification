@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from collections import Counter
+import json
 
 from visualization.RealtimeSplitVisualization import (
     SplitEventLogger,
@@ -14,6 +16,7 @@ from visualization.ReluSearchTree import (
     RealtimeSearchTreeVisualizer,
     branch_log_path,
     build_relu_search_tree,
+    build_stable_records,
     trace_from_branch_log,
     write_relu_search_tree_html,
 )
@@ -322,11 +325,10 @@ class ReLUSearchTreeTests(unittest.TestCase):
             self.assertIn('"ratio": 0.5', content)
             self.assertIn("탐색하지 않아도 되는 공간", content)
             self.assertIn("경계 유도 ReLU", content)
-            self.assertIn('.CLOSED{background:#172f58', content)
-            self.assertIn('.TIMEOUT{background:#4a3b0d', content)
+            self.assertIn('color-scheme:light', content)
             self.assertIn("SAT 발견", content)
             self.assertIn("SAT 전달", content)
-            self.assertIn("CLOSED (UNSAT)", content)
+            self.assertIn('<option value="CLOSED_UNSAT">', content)
             self.assertIn('"splitCount": 1', content)
             self.assertIn("하위 탐색 최대 깊이", content)
             self.assertNotIn("https://", content)
@@ -367,6 +369,64 @@ class ReLUFeedbackHistoryTests(unittest.TestCase):
 
 
 class RealtimeSearchTreeTests(unittest.TestCase):
+    def test_stable_location_uses_child_node_id_not_shared_split_number(self):
+        trace = SolveTrace(events=[
+            TraceEvent("reluplex_branch", 1, 6, 1, "z1_1", {"phase": "+", "result": "UNSAT", "split_number": 1}),
+            TraceEvent("reluplex_branch", 2, 3, 2, "z2_1", {"phase": "+", "result": "UNSAT", "split_number": 2}),
+            TraceEvent("reluplex_branch", 4, 5, 2, "z2_1", {"phase": "-", "result": "UNSAT", "split_number": 2}),
+            TraceEvent("reluplex_stable", 4.5, 4.6, 2, meta={"source": "search", "records": [
+                {"variable": "z3_8", "state": "inactive", "before": [-1, 1], "after": [-1, -0.1]},
+            ]}),
+        ])
+        children = build_relu_search_tree(trace)[0]["children"]
+        self.assertEqual([node["splitNumber"] for node in children], [2, 2])
+        record = build_stable_records(trace)[0]
+        self.assertEqual(record["nodeId"], children[1]["id"])
+        self.assertEqual(record["nodeId"], 3)
+        self.assertNotEqual(record["nodeId"], children[1]["splitNumber"])
+
+    def test_stable_records_preserve_derivation_scope_and_live_log(self):
+        from Reluplex import reluplex
+        from Automation.tests.test_automation import _random_relu_problem
+
+        for search in (True, False):
+            with self.subTest(search=search), tempfile.TemporaryDirectory() as directory:
+                rows, bounds, relus, *_ = _random_relu_problem(0)
+                trace, stats = SolveTrace(), {}
+                path = Path(directory) / "relu_events.jsonl"
+                logger = SplitEventLogger(path, reset_log=True)
+                options = dict(derive_in_search=search, local_repair_max_iter=0,
+                               full_tighten_every=1, max_recursion=100)
+                _, baseline = reluplex(rows, dict(bounds), relus, **options)
+                _, actual = reluplex(rows, dict(bounds), relus, trace=trace,
+                                     stats=stats, split_logger=logger, **options)
+                self.assertEqual(actual, baseline)
+                records = build_stable_records(trace)
+                self.assertEqual(records, build_stable_records(
+                    trace_from_branch_log(branch_log_path(path))))
+                counts = Counter(record["source"] for record in records)
+                self.assertEqual(counts["initial"], stats["DERIVE_FIXED_RELUS"])
+                self.assertEqual(counts["search"], stats.get("SEARCH_DERIVE_FIXED", 0))
+                self.assertEqual(counts["pivot"], stats.get("PIVOT_TIGHTEN_FIXED", 0))
+                self.assertGreater(counts["search"] + counts["pivot"], 0)
+                for record in records:
+                    self.assertEqual(record["result"], "STABLE")
+                    if record["source"] == "initial":
+                        self.assertIsNone(record["branchId"])
+                    else:
+                        self.assertIsNotNone(record["branchId"])
+                    if record["state"] == "active":
+                        self.assertGreaterEqual(record["after"][0], 0)
+                    else:
+                        self.assertLessEqual(record["after"][1], 0)
+                report = Path(directory) / "tree.html"
+                write_relu_search_tree_html(trace, report, overall_status="SAT" if actual else "UNSAT")
+                payload, _ = json.JSONDecoder().raw_decode(
+                    report.read_text(encoding="utf-8").split('const INITIAL_DATA = ', 1)[1])
+                self.assertEqual(payload["stableRecords"], records)
+                self.assertEqual(payload["nodeCount"], sum(
+                    event.component == "reluplex_branch" for event in trace.events))
+
     def test_solver_records_direct_conflicts_and_returns_in_trace_and_live_log(self):
         from Reluplex import reluplex
 

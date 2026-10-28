@@ -274,6 +274,15 @@ class SplitEventLogger:
             "unsat_origin": unsat_origin,
         })
 
+    def stable(self, *, depth: int, source: str, records: List[Dict],
+               round_index: Optional[int] = None) -> None:
+        """Batch newly fixed ReLUs without treating them as search branches."""
+        self._append_branch({
+            "event": "relu_stable", "depth": depth, "source": source,
+            "records": records,
+            "round_index": self._round_index if round_index is None else round_index,
+        })
+
     def _append_branch(self, values: Dict) -> None:
         with self._lock:
             record = {

@@ -311,6 +311,28 @@ def reluplex(
         if stats is not None:
             stats[key] = stats.get(key, 0) + amount
 
+    record_stable = trace is not None or hasattr(split_logger, "stable")
+
+    def _record_stable(fixed, before, after, depth: int, source: str) -> None:
+        if not record_stable or not fixed:
+            return
+        records = []
+        for (x, y), state in sorted(fixed.items()):
+            key = (relu_metadata or {}).get((x, y)) or _parse_neuron_var(x)
+            records.append({
+                "variable": x, "output": y, "state": state,
+                "layer": key[0] if key else None,
+                "index": key[1] if key else None,
+                "before": [value if isfinite(value) else None for value in before[x]],
+                "after": [value if isfinite(value) else None for value in after[x]],
+            })
+        metadata = {"source": source, "records": records,
+                    "round_index": base_progress_context.get("round_index")}
+        with span(trace, "reluplex_stable", depth=depth, **metadata):
+            pass
+        if hasattr(split_logger, "stable"):
+            split_logger.stable(depth=depth, **metadata)
+
     def _closed(depth: int, kind: str) -> None:
         """UNSAT으로 닫힌 가지(잎)를 센다.
 
@@ -511,6 +533,7 @@ def reluplex(
                     depth, "DERIVE",
                     deps_now.conflict if deps_now is not None else None,
                 )
+            _record_stable(fixed_here, bounds_now, tightened, depth, "search")
             bounds_now = tightened
             if fixed_here:
                 current_row_defs, active = _enforce_fixed(
@@ -555,6 +578,7 @@ def reluplex(
             # 피벗하며 좁힌 경계를 노드 경계에 합친다. 자식은 bounds_now를
             # 물려받으므로 여기서 합쳐야 다음 분기 선택과 자식 노드에 쓰인다.
             # 원인 마스크도 tableau에서 같이 가져온다.
+            stable_before = {x: bounds_now[x] for x, _ in active} if record_stable else None
             merged = False
             for var, b in tableau.bounds.items():
                 lo, hi = bounds_now.get(var, (float('-inf'), float('inf')))
@@ -580,6 +604,7 @@ def reluplex(
                     depth, "DERIVE",
                     deps_now.conflict if deps_now is not None else None,
                 )
+            _record_stable(fixed_here, stable_before, tightened, depth, "pivot")
             bounds_now = tightened
             if not fixed_here:
                 break
@@ -1004,6 +1029,7 @@ def reluplex(
                 stats['DERIVE_INFEASIBLE'] = stats.get('DERIVE_INFEASIBLE', 0) + 1
             _closed(0, "DERIVE")
             return None, False
+        _record_stable(fixed, bounds, tightened, 0, "initial")
         if fixed:
             active_row_defs, active_bounds = apply_fixed_relus(
                 row_defs, tightened, fixed

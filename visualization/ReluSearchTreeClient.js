@@ -42,15 +42,29 @@
   let stablePage = Math.max(0, Number(savedState.stablePage) || 0);
   let DATA;
   let ALL = [];
+  let SCOPED = [];
+  let scopeIds = new Set();
+  let scopeRootId = savedState.scopeRootId ?? null;
+  const scopeViews = new Map(Object.entries(savedState.scopeViews || {}));
+  let subtreeSearch = savedState.subtreeSearch === true;
+  let subtreeSearchRoots = [];
+  const subtreeTargetIds = new Set();
+  let autoExpandSubtree = savedState.autoExpandSubtree ?? (scopeRootId !== null);
+  const subtreeCollapsedIds = new Set(savedState.subtreeCollapsedIds || []);
   let NODE_BY_ID = new Map();
   const BRANCH_GROWTH = new Map();
   let latestNodeId = null;
   const finalPathIds = new Set();
-  const recentPathIds = new Set();
-  let recentTargetId = null;
+  const recentPathIds = new Set(scopeViews.get(scopeViewKey())?.recentPathIds || []);
+  let recentTargetId = scopeViews.get(scopeViewKey())?.recentTargetId ?? null;
   let trackLatestPath = savedState.trackLatestPath === true;
+  let ancestorSearch = savedState.ancestorSearch === true;
+  let ancestorFeedback = '';
+  const ancestorPathIds = new Set();
+  const ancestorTargetIds = new Set();
   let MATCHED = new Map();
   let renderedFlat = null;
+  let renderedScopeRootId;
   let TIMELINE = [];
   let snapshotFrame = null;
   let snapshotPending = false;
@@ -133,11 +147,13 @@
     return selected === 'ALL' || node.result === selected || node.branchResult === selected || nodeStatusClass(node) === selected || (node.result === 'CLOSED' && selected === `CLOSED_${node.branchResult}`);
   }
   function matches(node) {
+    if (ancestorSearch) return ancestorPathIds.has(node.id);
+    if (subtreeSearch) return scopeIds.has(node.id);
     const layer = $('#layerFilter').value.trim(), neuron = $('#neuronFilter').value.trim();
-    return matchesStatus(node, $('#statusFilter').value) && (!layer || String(node.layer) === layer) && (!neuron || String(node.neuron) === neuron);
+    return scopeIds.has(node.id) && matchesStatus(node, $('#statusFilter').value) && (!layer || String(node.layer) === layer) && (!neuron || String(node.neuron) === neuron);
   }
   function flatFilter() {
-    return $('#statusFilter').value !== 'FINAL' && ($('#statusFilter').value !== 'ALL' || $('#layerFilter').value.trim() !== '' || $('#neuronFilter').value.trim() !== '');
+    return !ancestorSearch && !subtreeSearch && $('#statusFilter').value !== 'FINAL' && ($('#statusFilter').value !== 'ALL' || $('#layerFilter').value.trim() !== '' || $('#neuronFilter').value.trim() !== '');
   }
   function indexData(data) {
     const previous = NODE_BY_ID;
@@ -151,10 +167,6 @@
       for (let i = node.children.length - 1; i >= 0; --i) pending.push(node.children[i]);
     }
     NODE_BY_ID = new Map(ALL.map(node => [node.id, node]));
-    const latest = ALL.reduce((last, node) => !last || node.order > last.order ? node : last, null);
-    latestNodeId = latest?.id ?? null;
-    finalPathIds.clear();
-    for (let node = latest; node; node = NODE_BY_ID.get(node.parentId)) finalPathIds.add(node.id);
     for (const id of BRANCH_GROWTH.keys()) {
       if (!NODE_BY_ID.has(id)) BRANCH_GROWTH.delete(id);
     }
@@ -167,19 +179,74 @@
         }
       }
     }
+    updateScopeIndex();
     updateFilterIndex();
   }
+  function scopeViewKey() { return subtreeSearch ? 'subtree-search' : String(scopeRootId); }
+  function scopeRoots() {
+    if (subtreeSearch) return subtreeSearchRoots;
+    return scopeRootId === null ? DATA.roots : [NODE_BY_ID.get(scopeRootId)];
+  }
+  function updateScopeIndex() {
+    if (scopeRootId !== null && !NODE_BY_ID.has(scopeRootId)) scopeRootId = null;
+    subtreeSearchRoots = []; subtreeTargetIds.clear();
+    if (subtreeSearch) {
+      const layer = $('#layerFilter').value.trim(), neuron = $('#neuronFilter').value.trim();
+      const included = new Set();
+      for (const node of ALL) {
+        const target = String(node.layer) === layer && String(node.neuron) === neuron;
+        if (target) {
+          subtreeTargetIds.add(node.id);
+          if (!included.has(node.parentId)) subtreeSearchRoots.push(node);
+        }
+        if (target || included.has(node.parentId)) included.add(node.id);
+      }
+    }
+    SCOPED = [];
+    const pending = [...scopeRoots()].reverse();
+    while (pending.length) {
+      const node = pending.pop();
+      SCOPED.push(node);
+      for (let i = node.children.length - 1; i >= 0; --i) pending.push(node.children[i]);
+    }
+    scopeIds = new Set(SCOPED.map(node => node.id));
+    const latest = SCOPED.reduce((last, node) => !last || node.order > last.order ? node : last, null);
+    latestNodeId = latest?.id ?? null;
+    finalPathIds.clear();
+    for (let node = latest; node && scopeIds.has(node.id); node = NODE_BY_ID.get(node.parentId)) finalPathIds.add(node.id);
+  }
   function updateFilterIndex() {
+    ancestorPathIds.clear(); ancestorTargetIds.clear();
+    if (ancestorSearch) {
+      const layer = $('#layerFilter').value.trim(), neuron = $('#neuronFilter').value.trim();
+      for (const target of ALL) {
+        if (String(target.layer) !== layer || String(target.neuron) !== neuron) continue;
+        ancestorTargetIds.add(target.id);
+        for (let node = target; node && !ancestorPathIds.has(node.id); node = NODE_BY_ID.get(node.parentId)) ancestorPathIds.add(node.id);
+      }
+    }
     MATCHED = new Map();
-    for (let i = ALL.length - 1; i >= 0; --i) {
-      const node = ALL[i];
+    for (let i = SCOPED.length - 1; i >= 0; --i) {
+      const node = SCOPED[i];
       MATCHED.set(node.id, matches(node) || (!flatFilter() && node.children.some(child => MATCHED.get(child.id))));
     }
     TIMELINE = [...ALL].sort((a, b) => (a.completedAt ?? Number.MAX_VALUE) - (b.completedAt ?? Number.MAX_VALUE) || a.order - b.order);
     TIMELINE.forEach((node, index) => { node.completionOrder = index + 1; });
     const DURATION_TIMELINE = [...ALL].sort((a, b) => b.duration - a.duration || a.order - b.order);
     DURATION_TIMELINE.forEach((node, index) => { node.durationOrder = index + 1; });
-    if ($('#statusFilter').value === 'FINAL') expandMatchingTree();
+    if (ancestorSearch || $('#statusFilter').value === 'FINAL') expandMatchingTree();
+    else if (autoExpandSubtree && (scopeRootId !== null || subtreeSearch) && !flatFilter()) {
+      expandMatchingTree();
+      for (const id of subtreeCollapsedIds) expandedIds.delete(id);
+    }
+  }
+
+  function setNodeExpanded(id, open) {
+    if (open) { expandedIds.add(id); subtreeCollapsedIds.delete(id); }
+    else {
+      expandedIds.delete(id);
+      if (autoExpandSubtree) subtreeCollapsedIds.add(id);
+    }
   }
 
   function dispose(view) {
@@ -204,6 +271,14 @@
     view.label = span('label', summary);
     view.phase = span('phase', summary);
     view.nodeId = span('meta', summary);
+    view.focus = document.createElement('button');
+    view.focus.type = 'button'; view.focus.className = 'subtree-focus';
+    view.focus.textContent = '이 가지 보기';
+    view.focus.addEventListener('click', event => {
+      event.preventDefault(); event.stopPropagation();
+      changeScope(view.id, true);
+    });
+    summary.appendChild(view.focus);
     view.split = span('meta', summary);
     view.badge = span('badge', summary);
     view.stable = span('badge STABLE', summary);
@@ -222,9 +297,8 @@
       acknowledgeGrowth(node);
       // Record the click synchronously, before an arriving snapshot can patch
       // this row. The native toggle event is otherwise delivered later.
-      if (!flatFilter() && node.children.length) {
-        if (details.open) expandedIds.delete(view.id);
-        else expandedIds.add(view.id);
+      if (!flatFilter() && node.children.some(child => MATCHED.get(child.id))) {
+        setNodeExpanded(view.id, !details.open);
       }
       patchView(view, node);
       saveState();
@@ -232,8 +306,7 @@
     details.addEventListener('toggle', () => {
       if (view.disposed || flatFilter() || details.open === expandedIds.has(view.id)) return;
       acknowledgeGrowth(NODE_BY_ID.get(view.id));
-      if (details.open) expandedIds.add(view.id);
-      else expandedIds.delete(view.id);
+      setNodeExpanded(view.id, details.open);
       // Keep descendants' expansion choices, but discard their DOM on collapse.
       patchView(view, NODE_BY_ID.get(view.id));
       saveState();
@@ -250,6 +323,8 @@
     setClass(view.phase, 'phase ' + (node.phase === '+' ? 'plus' : 'minus'));
     setText(view.phase, node.phase);
     setText(view.nodeId, `노드 #${node.id}`);
+    view.focus.disabled = scopeRootId === node.id;
+    view.focus.setAttribute('aria-label', `노드 #${node.id} 이 가지 보기`);
     setText(view.split, `Split #${node.splitNumber ?? '?'}`);
     setClass(view.badge, 'badge ' + color);
     setText(view.badge, resultLabel(node));
@@ -259,10 +334,12 @@
     patchGrowth(view);
     setText(view.count, `하위 가지 ${(node.subtreeSize - 1).toLocaleString()}개`);
     if (view.summary.matches(':hover, :focus')) view.summary.title = tip(node);
-    const hasChildren = !flatFilter() && node.children.length > 0;
+    const hasChildren = !flatFilter() && node.children.some(child => MATCHED.get(child.id));
     view.details.classList.toggle('leaf', !hasChildren);
     view.details.classList.toggle('recent-path', recentPathIds.has(node.id));
     view.details.classList.toggle('recent-target', node.id === recentTargetId);
+    view.details.classList.toggle('ancestor-target', ancestorSearch && ancestorTargetIds.has(node.id));
+    view.details.classList.toggle('subtree-target', subtreeSearch && subtreeTargetIds.has(node.id));
     const open = hasChildren && expandedIds.has(node.id);
     if (view.details.open !== open) view.details.open = open;
     if (open) {
@@ -289,15 +366,33 @@
       else container.insertBefore(view.li, cursor);
     }
   }
+  function renderScopeBar() {
+    const root = NODE_BY_ID.get(scopeRootId);
+    setText($('#scopeLabel'), root ? `현재 보는 가지: 노드 #${root.id} · ${neuronLabel(root)} (${root.phase})` : '전체 트리');
+    setText($('#scopeCount'), root ? `하위 가지 ${(root.subtreeSize - 1).toLocaleString()}개` : `가지 ${DATA.nodeCount.toLocaleString()}개`);
+    if (subtreeSearch) {
+      setText($('#scopeLabel'), `서브 트리 검색 · L${$('#layerFilter').value}:N${$('#neuronFilter').value}`);
+      setText($('#scopeCount'), `시작 노드 ${subtreeSearchRoots.length.toLocaleString()}개 · 가지 ${SCOPED.length.toLocaleString()}개`);
+    }
+    $('#scopeParent').disabled = !root;
+    $('#scopeAll').disabled = !root && !subtreeSearch;
+    $('#recentPath').title = root ? '선택한 가지 안에서 가장 최근에 추가된 노드까지 펼칩니다' : '루트부터 가장 최근에 추가된 가지까지 펼칩니다';
+    $('#findAncestors').setAttribute('aria-pressed', String(ancestorSearch));
+    $('#findSubtrees').setAttribute('aria-pressed', String(subtreeSearch));
+    const targets = subtreeSearch ? subtreeTargetIds : ancestorTargetIds;
+    setText($('#ancestorInfo'), ancestorSearch || subtreeSearch ? (targets.size ? `일치 ${targets.size.toLocaleString()}개 · ${subtreeSearch ? '하위 트리' : '상위 경로'} 표시 중` : '일치하는 탐색 노드가 없습니다.') : ancestorFeedback);
+  }
   function renderTree() {
     $('#treeEmpty')?.remove();
     const flat = flatFilter();
-    if (renderedFlat !== flat) {
+    if (renderedFlat !== flat || renderedScopeRootId !== scopeRootId) {
       for (const view of rootViews.values()) dispose(view);
       rootViews.clear();
       renderedFlat = flat;
+      renderedScopeRootId = scopeRootId;
     }
-    reconcile($('#tree'), rootViews, flat ? ALL : DATA.roots);
+    renderScopeBar();
+    reconcile($('#tree'), rootViews, flat ? SCOPED : scopeRoots());
     if (!rootViews.size) {
       const empty = document.createElement('li');
       empty.id = 'treeEmpty'; empty.className = 'empty';
@@ -357,8 +452,9 @@
   function renderStableRecords() {
     if (!$('#stablePanel').open) return;
     const scope = $('#stableScope').value, order = $('#stableOrder').value;
-    const layer = $('#layerFilter').value.trim(), neuron = $('#neuronFilter').value.trim();
+    const layer = subtreeSearch ? '' : $('#layerFilter').value.trim(), neuron = subtreeSearch ? '' : $('#neuronFilter').value.trim();
     const records = (DATA.stableRecords || []).filter(record =>
+      ((scopeRootId === null && !subtreeSearch) || scopeIds.has(record.nodeId ?? record.branchId)) &&
       (scope === 'all' || (record.source === 'initial') === (scope === 'initial')) &&
       (!layer || String(record.layer) === layer) && (!neuron || String(record.neuron) === neuron));
     const compareNeuron = (a, b) => (a.layer ?? Number.MAX_VALUE) - (b.layer ?? Number.MAX_VALUE) || (a.neuron ?? Number.MAX_VALUE) - (b.neuron ?? Number.MAX_VALUE);
@@ -385,7 +481,7 @@
         view.location = document.createElement('button'); view.scope.appendChild(view.location);
         view.location.onclick = () => {
           const target = NODE_BY_ID.get(view.record.nodeId ?? view.record.branchId);
-          if (target) { expandedIds.clear(); revealNodePath(target); }
+          if (target) { autoExpandSubtree = false; subtreeCollapsedIds.clear(); expandedIds.clear(); revealNodePath(target); }
         };
         stableViews.set(record.id, view);
       }
@@ -435,9 +531,59 @@
     setText($('#boundDetail'), hasBound ? `전체 ${bd.total.toLocaleString()}개 중 경계로 ${bd.fixed.toLocaleString()}개 고정` : '경계 유도 결과를 기다리는 중');
     $('#boundBar').style.width = hasBound && bd.total ? `${bd.fixed / bd.total * 100}%` : '0%';
   }
+  function captureScopeView() {
+    return {
+      expandedIds: [...expandedIds], recentPathIds: [...recentPathIds], recentTargetId,
+      ancestorSearch, subtreeSearch,
+      autoExpandSubtree, subtreeCollapsedIds: [...subtreeCollapsedIds],
+      status: $('#statusFilter').value, layer: $('#layerFilter').value, neuron: $('#neuronFilter').value,
+      treeScrollLeft: $('#treeViewport').scrollLeft, treeScrollTop: $('#treeViewport').scrollTop,
+      timelinePage, stablePage, timelineScroll: readPanelScroll('timeline'), stableScroll: readPanelScroll('stable'),
+      pageScrollX: window.scrollX, pageScrollY: window.scrollY,
+    };
+  }
+  function changeScope(id, expandSubtree = false) {
+    if ((id === scopeRootId && !subtreeSearch) || (id !== null && !NODE_BY_ID.has(id))) return;
+    const previous = captureScopeView();
+    scopeViews.set(scopeViewKey(), previous);
+    scopeRootId = id;
+    const restored = expandSubtree ? {} : scopeViews.get(String(id)) || {};
+    subtreeSearch = restored.subtreeSearch === true;
+    autoExpandSubtree = expandSubtree || restored.autoExpandSubtree === true;
+    subtreeCollapsedIds.clear();
+    for (const nodeId of restored.subtreeCollapsedIds || []) subtreeCollapsedIds.add(nodeId);
+    ancestorSearch = restored.ancestorSearch === true;
+    ancestorFeedback = '';
+    expandedIds.clear();
+    recentPathIds.clear();
+    for (const nodeId of restored.recentPathIds || []) recentPathIds.add(nodeId);
+    recentTargetId = restored.recentTargetId ?? null;
+    $('#statusFilter').value = statusOptions.includes(restored.status) ? restored.status : 'ALL';
+    $('#layerFilter').value = restored.layer || '';
+    $('#neuronFilter').value = restored.neuron || '';
+    timelinePage = restored.timelinePage || 0; stablePage = restored.stablePage || 0;
+    updateScopeIndex();
+    for (const nodeId of restored.expandedIds || []) if (scopeIds.has(nodeId)) expandedIds.add(nodeId);
+    if (expandSubtree) for (const node of SCOPED) if (node.children.length) expandedIds.add(node.id);
+    updateFilterIndex();
+    if (id !== null) acknowledgeGrowth(NODE_BY_ID.get(id));
+    renderMetrics(); renderTree(); renderTimeline(); renderStableRecords();
+    sizeTreeViewport();
+    $('#treeViewport').scrollLeft = restored.treeScrollLeft || 0;
+    $('#treeViewport').scrollTop = restored.treeScrollTop || 0;
+    restorePanelScroll('timeline', restored.timelineScroll || 0);
+    restorePanelScroll('stable', restored.stableScroll || 0);
+    $('#treeViewport').focus({preventScroll: true});
+    window.scrollTo(restored.pageScrollX ?? previous.pageScrollX, restored.pageScrollY ?? previous.pageScrollY);
+    saveState();
+  }
   function saveState() {
+    scopeViews.set(scopeViewKey(), captureScopeView());
     window.name = STATE_PREFIX + JSON.stringify({
       path: stateKey, expandedIds: [...expandedIds], timelinePage, trackLatestPath,
+      scopeRootId, scopeViews: Object.fromEntries(scopeViews),
+      autoExpandSubtree, subtreeCollapsedIds: [...subtreeCollapsedIds],
+      ancestorSearch, subtreeSearch,
       stablePage, stableScope: $('#stableScope').value, stableOrder: $('#stableOrder').value,
       reportPanels: Object.fromEntries(reportPanels.map(panel => [panel.key, panel.element.open])),
       timelineOrder:$('#timelineOrder').value, status: $('#statusFilter').value,
@@ -503,7 +649,41 @@
   function revealRecentPath(focus = true) {
     revealNodePath(NODE_BY_ID.get(latestNodeId), focus);
   }
+  function findAncestorPaths() { findNeuronTrees(false); }
+  function findSubtrees() { findNeuronTrees(true); }
+  function findNeuronTrees(subtrees) {
+    const layer = $('#layerFilter').value.trim(), neuron = $('#neuronFilter').value.trim();
+    if (!layer || !neuron || ![layer, neuron].every(value => /^\d+$/.test(value) && Number.isSafeInteger(Number(value)))) {
+      ancestorFeedback = !layer || !neuron ? '레이어와 뉴런 번호를 입력하세요.' : '0 이상의 정수 번호를 입력하세요.';
+      renderScopeBar();
+      return;
+    }
+    scopeViews.set(scopeViewKey(), captureScopeView());
+    scopeRootId = null;
+    $('#statusFilter').value = 'ALL';
+    $('#layerFilter').value = String(Number(layer));
+    $('#neuronFilter').value = String(Number(neuron));
+    ancestorSearch = !subtrees; subtreeSearch = subtrees;
+    ancestorFeedback = ''; trackLatestPath = false;
+    autoExpandSubtree = subtrees; subtreeCollapsedIds.clear();
+    timelinePage = 0; stablePage = 0;
+    expandedIds.clear(); recentPathIds.clear(); recentTargetId = null;
+    updateScopeIndex(); updateFilterIndex();
+    for (const id of subtrees ? scopeIds : ancestorPathIds) BRANCH_GROWTH.delete(id);
+    renderMetrics(); renderTree(); renderTimeline(); renderStableRecords();
+    sizeTreeViewport();
+    $('#treeViewport').scrollTo(0, 0);
+    let target = null;
+    const targets = subtrees ? subtreeTargetIds : ancestorTargetIds;
+    for (const node of ALL) if (targets.has(node.id) && (!target || node.order > target.order)) target = node;
+    const summary = views.get(target?.id)?.summary;
+    if (summary) { summary.focus({preventScroll: true}); scrollTreeNode(summary, true); }
+    else $('#treeViewport').focus({preventScroll: true});
+    restorePanelScroll('timeline', 0); restorePanelScroll('stable', 0);
+    saveState();
+  }
   function scrollTreeNode(summary, center) {
+    sizeTreeViewport();
     const viewport = $('#treeViewport');
     if (center) {
       viewport.style.scrollMarginTop = `${$('header').offsetHeight + 12}px`;
@@ -525,8 +705,9 @@
     if (Math.abs(x - viewport.scrollLeft) > 1 || Math.abs(y - viewport.scrollTop) > 1) viewport.scrollTo({left: x, top: y, behavior: 'instant'});
   }
   function revealNodePath(target, focus = true) {
-    if (!target) return;
-    if (flatFilter() || !MATCHED.get(target.id)) {
+    if (!target || !scopeIds.has(target.id)) return;
+    if (ancestorSearch || flatFilter() || !MATCHED.get(target.id)) {
+      ancestorSearch = false; ancestorFeedback = '';
       $('#statusFilter').value = 'ALL';
       $('#layerFilter').value = '';
       $('#neuronFilter').value = '';
@@ -535,7 +716,7 @@
     }
     recentPathIds.clear();
     recentTargetId = target.id;
-    for (let node = target; node && !recentPathIds.has(node.id); node = NODE_BY_ID.get(node.parentId)) {
+    for (let node = target; node && scopeIds.has(node.id) && !recentPathIds.has(node.id); node = NODE_BY_ID.get(node.parentId)) {
       recentPathIds.add(node.id);
       if (node.id !== target.id) expandedIds.add(node.id);
     }
@@ -582,8 +763,19 @@
     }
     renderPanelToggle(); saveState();
   };
-  $('#defaultView').onclick = () => { expandedIds.clear(); renderTree(); $('#treeViewport').scrollTo(0, 0); saveState(); };
+  $('#defaultView').onclick = () => {
+    autoExpandSubtree = false; subtreeCollapsedIds.clear();
+    if (ancestorSearch) {
+      ancestorSearch = false; ancestorFeedback = '';
+      $('#layerFilter').value = ''; $('#neuronFilter').value = '';
+      updateFilterIndex(); renderTimeline(); renderStableRecords();
+    }
+    expandedIds.clear(); renderTree(); $('#treeViewport').scrollTo(0, 0); saveState();
+  };
+  $('#scopeAll').onclick = () => changeScope(null);
+  $('#scopeParent').onclick = () => changeScope(NODE_BY_ID.get(scopeRootId)?.parentId ?? null);
   $('#recentPath').onclick = () => {
+    autoExpandSubtree = false; subtreeCollapsedIds.clear();
     expandedIds.clear();
     revealRecentPath();
   };
@@ -594,19 +786,27 @@
     saveState();
   };
   function expandMatchingTree() {
-    for (const node of ALL) {
-      if (MATCHED.get(node.id) && node.children.length) expandedIds.add(node.id);
+    for (const node of SCOPED) {
+      if (MATCHED.get(node.id) && node.children.some(child => MATCHED.get(child.id))) expandedIds.add(node.id);
     }
   }
   $('#expandAll').onclick = () => {
+    autoExpandSubtree = scopeRootId !== null || subtreeSearch; subtreeCollapsedIds.clear();
     expandMatchingTree();
     renderTree(); saveState();
   };
-  $('#collapseAll').onclick = () => { for (const root of DATA.roots) expandedIds.delete(root.id); renderTree(); saveState(); };
-  const filterChanged = () => { timelinePage = 0; stablePage = 0; updateFilterIndex(); expandMatchingTree(); renderTree(); $('#treeViewport').scrollTo(0, 0); renderTimeline(); renderStableRecords(); saveState(); };
+  $('#collapseAll').onclick = () => { for (const root of scopeRoots()) setNodeExpanded(root.id, false); renderTree(); saveState(); };
+  const filterChanged = () => { ancestorSearch = false; subtreeSearch = false; ancestorFeedback = ''; subtreeCollapsedIds.clear(); timelinePage = 0; stablePage = 0; updateScopeIndex(); updateFilterIndex(); expandMatchingTree(); renderTree(); $('#treeViewport').scrollTo(0, 0); renderTimeline(); renderStableRecords(); saveState(); };
   $('#statusFilter').onchange = filterChanged;
   $('#layerFilter').oninput = filterChanged;
   $('#neuronFilter').oninput = filterChanged;
+  $('#findAncestors').onclick = findAncestorPaths;
+  $('#findSubtrees').onclick = findSubtrees;
+  for (const input of [$('#layerFilter'), $('#neuronFilter')]) {
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); findAncestorPaths(); }
+    });
+  }
   $('#timelineOrder').onchange = () => { timelinePage = 0; renderTimeline(); saveState(); };
   $('#timelinePrev').onclick = () => { timelinePage--; renderTimeline(); $('#timeline').scrollTop = 0; saveState(); };
   $('#timelineNext').onclick = () => { timelinePage++; renderTimeline(); $('#timeline').scrollTop = 0; saveState(); };
@@ -618,6 +818,7 @@
   window.addEventListener('pagehide', saveState);
 
   const sizeTreeViewport = () => $('#treeViewport').style.setProperty('--tree-header-height', `${$('header').offsetHeight}px`);
+  window.addEventListener('resize', sizeTreeViewport);
   new ResizeObserver(sizeTreeViewport).observe($('header'));
   indexData(INITIAL_DATA);
   if (DATA.status !== 'RUNNING') trackLatestPath = false;

@@ -161,6 +161,19 @@ class ReactiveTreeBrowserTests(unittest.TestCase):
             snapshot("UNKNOWN")
 
             result_pages = {}
+            live_subtree_stages = []
+            for stage in range(6):
+                live_trace = SolveTrace(events=[
+                    TraceEvent("reluplex_branch", 1, None, 1, "z1_1", {"phase": "+", "result": "RUNNING"}),
+                    TraceEvent("reluplex_branch", 2, 3, 2, "z2_10", {"phase": "-", "result": "UNSAT"}),
+                    *[TraceEvent("reluplex_branch", depth + 2, None, depth, f"z{depth}_20", {"phase": "+", "result": "RUNNING"})
+                      for depth in range(2, min(stage, 4) + 3)],
+                ])
+                if stage == 5:
+                    live_trace.events.append(TraceEvent("reluplex_branch", 20, None, 3, "z3_20", {"phase": "-", "result": "RUNNING"}))
+                live_path = root / f"live_subtree_{stage}.html"
+                write_relu_search_tree_html(live_trace, live_path, overall_status="RUNNING")
+                live_subtree_stages.append(live_path.read_bytes())
             deep_trace = SolveTrace(events=[
                 TraceEvent("reluplex_branch", depth, 500 - depth, depth, f"z{depth}_1", {"phase": "+", "result": "TIMEOUT"})
                 for depth in range(1, 81)
@@ -198,6 +211,8 @@ class ReactiveTreeBrowserTests(unittest.TestCase):
                         content, mime = b"ok", "text/plain"
                     elif url.path == "/tree.html":
                         content, mime = stages[current_stage[0]], "text/html; charset=utf-8"
+                    elif url.path == "/live-subtree.html":
+                        content, mime = live_subtree_stages[current_stage[0]], "text/html; charset=utf-8"
                     elif url.path in result_pages:
                         content, mime = result_pages[url.path], "text/html; charset=utf-8"
                     elif url.path == "/panel.png":

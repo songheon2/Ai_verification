@@ -219,6 +219,8 @@ def reluplex(
     full_tighten_every: int = 1000,
     backjump: bool = False,
     check_backjump: bool = False,
+    under_approx: float = 0.0,
+    under_approx_share: float = 0.3,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     derive_in_search: 분기로 좁아진 경계로 노드마다 경계 유도를 다시 돌린다
@@ -253,6 +255,15 @@ def reluplex(
         CONFLICT_BITS / CONFLICT_DEPTH로 "모순이 경로의 몇 할에 기대는가"를 잴 수 있다.
     check_backjump: 테스트용. 건너뛸 가지를 실제로 풀어 보고 SAT이면
         AssertionError를 낸다 (원인 기록이 틀렸는지 검증).
+    under_approx: 과소근사의 eps (논문 부록 IV). 0이면 끈다. 켜면 먼저 경계가
+        0 근처인 ReLU를 강제로 고정한 좁은 문제를 푼다 — 입력 하한이 -eps 이상이면
+        하한을 0으로 올려 활성으로, 입력이나 출력 상한이 eps 이하이면 상한을
+        0으로 내려 비활성으로 고정한다(둘 다면 남는 구간이 큰 쪽). 원래 문제의
+        일부만 보는 것이라 여기서 찾은 해는 원래 문제의 해(반례)지만, 불가능이
+        나와도 원래 문제는 가능할 수 있다. 그래서 반례를 못 찾으면 원래 문제를
+        처음부터 다시 푼다.
+    under_approx_share: 과소근사 단계에 쓸 시간 비율 (남은 시간 기준).
+        deadline이 없으면 과소근사 단계는 끝날 때까지 돈다.
     """
     if search_derive_rows not in ("original", "tableau", "both"):
         raise ValueError(f"알 수 없는 search_derive_rows: {search_derive_rows}")
@@ -291,6 +302,9 @@ def reluplex(
     # Record whether the returning call detected a conflict itself or only
     # combined child results; the tree must not infer discovery from UNSAT alone.
     last_unsat_origin: List[Optional[str]] = [None]
+    # 과소근사 단계에서만 0보다 크다 (_under_approx_phase가 켜고 끈다)
+    ua_eps = 0.0
+    ua_fixed_total = [0]    # 과소근사 단계에서 실제로 강제 고정한 ReLU 수
 
     def _full(depth: int) -> int:
         """원인을 모를 때: 깊이 1..depth의 분기 전부."""
@@ -461,6 +475,44 @@ def reluplex(
             _append_rows(tableau, new_rows)
         return current_row_defs, [p for p in active if p not in fixed_here]
 
+    def _under_approx_fix(
+        bounds_now: Dict[str, Tuple[float, float]],
+        active: List[Tuple[str, str]],
+        deps_now: Optional[BoundDeps],
+    ) -> Dict[Tuple[str, str], str]:
+        """과소근사 (논문 부록 IV): 경계가 0 근처인 ReLU를 강제로 고정한다.
+
+        입력 x의 하한이 [-eps, 0)이면 하한을 0으로 올려 활성으로, x나 출력 y의
+        상한이 (0, eps]이면 x의 상한을 0으로 내려 비활성으로 고정한다. 둘 다
+        해당하면 남는 구간이 큰 쪽을 고른다. 버리는 것은 폭 eps 이하의 얇은
+        구간뿐이지만 그 ReLU의 분기가 통째로 없어진다. bounds_now는 제자리에서
+        고치고, 고정할 쌍을 _enforce_fixed 형식으로 돌려준다.
+        """
+        inf = float('inf')
+        fixed: Dict[Tuple[str, str], str] = {}
+        for x, y in active:
+            x_lo, x_hi = bounds_now.get(x, (-inf, inf))
+            y_hi = bounds_now.get(y, (-inf, inf))[1]
+            if not (x_lo < 0.0 < x_hi):
+                continue
+            near_on = x_lo >= -ua_eps
+            near_off = min(x_hi, y_hi) <= ua_eps
+            if near_on and (not near_off or x_hi >= -x_lo):
+                bounds_now[x] = (0.0, x_hi)
+                fixed[(x, y)] = "active"
+                if deps_now is not None:
+                    reason = deps_now.lo.get(x, 0)
+                    deps_now.set_lo(x, reason)
+                    deps_now.fixed[(x, y)] = reason
+            elif near_off:
+                bounds_now[x] = (x_lo, 0.0)
+                fixed[(x, y)] = "inactive"
+                if deps_now is not None:
+                    reason = deps_now.hi.get(x, 0) | deps_now.hi.get(y, 0)
+                    deps_now.set_hi(x, reason)
+                    deps_now.fixed[(x, y)] = reason
+        return fixed
+
     def _rec(
         bounds_now: Dict[str, Tuple[float, float]],
         depth: int,
@@ -541,6 +593,19 @@ def reluplex(
                     deps_now,
                 )
                 _bump("SEARCH_DERIVE_FIXED", len(fixed_here))
+
+        # ── 과소근사 단계에서만: 경계가 0 근처인 ReLU를 강제로 고정 ──
+        if ua_eps > 0.0 and active:
+            ua_before = {x: bounds_now[x] for x, _ in active} if record_stable else None
+            ua_fixed = _under_approx_fix(bounds_now, active, deps_now)
+            if ua_fixed:
+                _record_stable(ua_fixed, ua_before, bounds_now, depth, "under_approx")
+                current_row_defs, active = _enforce_fixed(
+                    ua_fixed, depth, current_row_defs, bounds_now, warm, active,
+                    deps_now,
+                )
+                _bump("UA_FIXED", len(ua_fixed))
+                ua_fixed_total[0] += len(ua_fixed)
 
         if warm is not None:
             # 부모의 basis를 물려받고, 좁아진 bound만 반영해 이어서 푼다.
@@ -1009,6 +1074,42 @@ def reluplex(
             return _limit("RELUPLEX_RECURSION_LIMIT")
         return _limit(repair_unknown_reason or "RELUPLEX_REPAIR_INCONCLUSIVE")
 
+    def _under_approx_phase(
+        bounds0: Dict[str, Tuple[float, float]],
+        rows0: List[Tuple[str, Dict[str, float]]],
+    ) -> Tuple[Optional[Dict[str, float]], bool, bool]:
+        """과소근사를 켠 채 탐색한다. 반환: (해, sat, 결과가 정확한가).
+
+        보통은 (해, True)만 믿을 수 있다. 다만 탐색 내내 한 번도 강제로 고정하지
+        않았다면 원래 탐색과 똑같은 탐색을 끝까지 한 것이므로 UNSAT도 정확하다
+        (세 번째 값 True) — 이때는 원래 탐색을 다시 하지 않는다.
+
+        시간은 남은 시간의 under_approx_share만 쓴다. _rec와 simplex는 deadline을
+        이 함수의 바깥 변수로 읽으므로, 잠시 앞당겼다가 끝나면 되돌린다.
+        """
+        nonlocal ua_eps, deadline
+        saved_deadline = deadline
+        started = time.perf_counter()
+        if deadline is not None:
+            now = time.monotonic()
+            deadline = now + under_approx_share * max(0.0, deadline - now)
+        ua_eps = under_approx
+        ua_fixed_total[0] = 0
+        try:
+            model, sat = _rec(bounds0, 0, rows0)
+            _bump("UA_RESULT_SAT" if sat else "UA_RESULT_UNSAT")
+            return model, sat, ua_fixed_total[0] == 0
+        except SolverLimitReached as exc:
+            # 과소근사 단계의 시간 초과나 한도는 원래 탐색으로 넘어갈 이유일 뿐이다
+            _bump(f"UA_RESULT_{exc.reason}")
+            return None, False, False
+        finally:
+            ua_eps = 0.0
+            deadline = saved_deadline
+            _bump("UA_SECONDS", time.perf_counter() - started)
+            if stats is not None:
+                stats["UA_NODES"] = stats.get("SEARCH_NODES", 0)
+
     # [누락되었던 부분 복구] reluplex 함수의 마지막 반환문!
     # ── 경계 유도 (논문 4절 Tighter Bound Derivation) ──
     # 탐색을 시작하기 전에 구간 전파로 변수 경계를 좁히고, 그 결과 항상 켜짐/
@@ -1039,6 +1140,23 @@ def reluplex(
             relus = [p for p in relus if p not in fixed]
         else:
             active_bounds = tightened
+
+    # ── 과소근사 단계 (논문 부록 IV) ──
+    # 경계가 0 근처인 ReLU를 강제로 고정한 좁은 문제를 남은 시간의 일부 동안
+    # 먼저 푼다. 반례를 찾으면 그것이 원래 문제의 반례다. 불가능이 나오거나
+    # 시간을 다 쓰면 그 결과는 버리고 원래 문제를 처음부터 푼다. 단, 한 번도
+    # 강제로 고정하지 않고 끝났다면 그 탐색이 곧 원래 탐색이므로 결과를 쓴다
+    # (sat_relu처럼 0 근처 경계가 없는 문제에서 같은 탐색을 두 번 하지 않는다).
+    if under_approx > 0.0 and relus:
+        model, sat, exact = _under_approx_phase(active_bounds, active_row_defs)
+        if sat or exact:
+            if exact:
+                _bump("UA_EXACT")
+            return model, sat
+        if stats is not None:
+            stats['CLOSED_MEASURE'] = 0.0
+        if seed is not None:
+            rng.seed(seed)      # 원래 탐색은 과소근사를 안 켰을 때와 같은 경로로
 
     return _rec(active_bounds, 0, active_row_defs)
 

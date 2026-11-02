@@ -937,5 +937,79 @@ class FullTightenTests(unittest.TestCase):
         self.assertGreater(fired, 0)
 
 
+class UnderApproximationTests(unittest.TestCase):
+    """과소근사 (논문 부록 IV): 먼저 좁힌 문제를 풀고, 반례가 없으면 원래 문제를 푼다."""
+
+    def test_counterexample_outside_under_approximation_is_still_found(self):
+        # o1 = x + z1 + z2 <= -0.003, o2 = x - z1 - z2 <= -0.003 을 더하면 x <= -0.003
+        # 이지만 구간 계산으로는 보이지 않는다. 반례는 ReLU가 꺼진 x in [-0.008, -0.003]
+        # 에만 있는데, eps=0.01 과소근사는 하한 -0.008을 0으로 올려 켜짐으로 고정한다.
+        inf = float("inf")
+        rows = [
+            ("o1", {"x": 1.0, "z1": 1.0, "z2": 1.0}),
+            ("o2", {"x": 1.0, "z1": -1.0, "z2": -1.0}),
+        ]
+        bounds = {
+            "o1": (-inf, -0.003), "o2": (-inf, -0.003), "x": (-0.008, 1.0),
+            "z1": (-1.0, 1.0), "z2": (-1.0, 1.0), "y": (-inf, inf),
+        }
+        stats = {}
+        model, sat = reluplex(rows, dict(bounds), [("x", "y")], under_approx=0.01, stats=stats)
+        self.assertEqual(stats.get("UA_FIXED"), 1)
+        self.assertEqual(stats.get("UA_RESULT_UNSAT"), 1)   # 좁힌 문제에는 반례가 없다
+        self.assertTrue(sat)                                 # 원래 문제에서 다시 찾는다
+        self.assertLessEqual(model["x"], -0.003 + 1e-9)
+        self.assertAlmostEqual(model["y"], 0.0)
+
+    def test_under_approximation_keeps_verdicts(self):
+        found_early = 0
+        for seed in range(40):
+            rows, bounds, relus, forward, theta = _random_relu_problem(seed)
+            _model, plain_sat = reluplex(rows, dict(bounds), relus, max_recursion=100)
+            for eps in (0.05, 0.2):
+                with self.subTest(seed=seed, under_approx=eps):
+                    stats = {}
+                    model, sat = reluplex(
+                        rows, dict(bounds), relus, under_approx=eps,
+                        stats=stats, max_recursion=100,
+                    )
+                    self.assertEqual(sat, plain_sat)
+                    if sat:
+                        self.assertGreaterEqual(
+                            forward([model["x0"], model["x1"]]), theta - 1e-6
+                        )
+                    else:
+                        # 원래 탐색의 닫은 비율만 센다 (과소근사 단계는 증명이 아니다)
+                        self.assertEqual(stats.get("CLOSED_MEASURE"), 1.0)
+                    found_early += stats.get("UA_RESULT_SAT", 0)
+        self.assertGreater(found_early, 0)
+
+    def test_search_without_any_forced_fix_is_not_repeated(self):
+        """eps가 너무 작아 아무것도 고정하지 않으면 과소근사 탐색이 곧 원래 탐색이다.
+
+        그 결과(UNSAT 포함)를 그대로 쓰고 원래 탐색을 다시 하지 않아야 한다.
+        """
+        exact_unsat = 0
+        for seed in range(20):
+            rows, bounds, relus, _forward, _theta = _random_relu_problem(seed)
+            plain = {}
+            _model, plain_sat = reluplex(rows, dict(bounds), relus, stats=plain, max_recursion=100)
+            with self.subTest(seed=seed):
+                stats = {}
+                _model, sat = reluplex(
+                    rows, dict(bounds), relus, under_approx=1e-12, stats=stats,
+                    max_recursion=100,
+                )
+                self.assertEqual(sat, plain_sat)
+                self.assertEqual(stats.get("UA_FIXED", 0), 0)
+                self.assertEqual(stats.get("SEARCH_NODES"), plain.get("SEARCH_NODES"))
+                # 루트 경계 유도만으로 끝난 문제는 과소근사 단계가 돌지 않는다
+                if not sat and stats.get("UA_RESULT_UNSAT"):
+                    self.assertEqual(stats.get("UA_EXACT"), 1)
+                    self.assertEqual(stats.get("CLOSED_MEASURE"), 1.0)
+                    exact_unsat += 1
+        self.assertGreater(exact_unsat, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

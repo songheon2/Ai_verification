@@ -43,6 +43,19 @@ class ReactiveTreeBrowserTests(unittest.TestCase):
   if (new URLSearchParams(location.search).has('tree-snapshot')) return;
   const assert = (ok, message) => { if (!ok) throw Error(message); };
   try {
+    const sort = document.querySelector('#treeOrder');
+    const resultFilter = document.querySelector('#statusFilter');
+    assert(sort && sort.parentElement === resultFilter.parentElement, 'sort grouped with result filter');
+    const chooseSort = value => {
+      sort.value = value;
+      sort.dispatchEvent(new Event('change'));
+      return [...document.querySelectorAll('#tree > li details')].map(row => Number(row.dataset.id));
+    };
+    assert(chooseSort('layer').join(',') === '1,2,3', 'layer sort includes all nodes');
+    assert(chooseSort('duration')[0] === 3, 'duration sorts longest first');
+    assert(chooseSort('completion')[0] === 3, 'completed node before running nodes');
+    assert(JSON.parse(window.name.slice('relu-search-tree-ui:'.length)).treeOrder === 'completion', 'sort persisted');
+    chooseSort('node');
     const root = document.querySelector('details[data-id="1"]');
     root.querySelector('summary').click();
     assert(document.querySelectorAll('#tree details').length === 2, 'one child level');

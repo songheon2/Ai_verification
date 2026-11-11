@@ -4,6 +4,7 @@ body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,sa
 header{position:sticky;top:0;z-index:3;background:#fffffff2;border-bottom:1px solid #dbe3ed;padding:16px 22px}
 h1{font-size:20px;margin:0 0 8px}
 .summary,.controls{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+.tree-filters{display:inline-flex;gap:6px;align-items:center;padding:6px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc}
 .ancestor-search{display:flex;gap:6px;align-items:center;flex-wrap:wrap;max-width:100%;min-width:0;padding:6px;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc}
 .ancestor-search input{width:112px;min-width:0;flex:1 1 100px}
 .ancestor-search button{white-space:nowrap}

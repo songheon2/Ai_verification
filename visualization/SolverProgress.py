@@ -131,6 +131,9 @@ class SolverProgressLogger:
         self._simplex_sequence = 0
         self._constraint_details: Dict[tuple[int, str], Dict[str, Any]] = {}
         self._emitted_constraint_details: set[tuple[str, bool]] = set()
+        if self.witness_context.get("model_name"):
+            self._append("run_context", witness_context=self.witness_context,
+                         force_flush=True)
 
     def _flush_locked(self) -> None:
         if self._stream is None:
@@ -501,7 +504,9 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
     for raw in events:
         event = dict(raw)
         kind = event.get("event")
-        if kind == "round_start":
+        if kind == "run_context":
+            solver_result["witness_context"] = event.get("witness_context", {})
+        elif kind == "round_start":
             index = int(event["round"])
             rounds.setdefault(index, {"round": index}).update({"start_time_ns": event.get("time_ns")})
         elif kind == "round_end":
@@ -925,6 +930,10 @@ def draw_solver_dashboard(
 
     latest_round = rounds[-1] if rounds else {}
     solver = feedback.get("solver", {})
+    model_name = solver.get("witness_context", {}).get("model_name")
+    if model_name:
+        fig.text(0.98, 0.035, f"Network: {model_name}",
+                 ha="right", va="bottom", fontsize=9, color="#111827")
     fig.text(
         0.01,
         0.01,
@@ -1226,6 +1235,10 @@ def draw_dpll_theory_panel(
         f"rounds={feedback['counts']['rounds']} | solver={solver.get('status', 'RUNNING')} / {solver.get('reason', '-')}",
         fontsize=9,
     )
+    model_name = solver.get("witness_context", {}).get("model_name")
+    if model_name:
+        fig.text(0.98, 0.035, f"Network: {model_name}",
+                 ha="right", va="bottom", fontsize=9, color="#111827")
     witness_lines = _sat_witness_lines(feedback)
     if witness_lines:
         import textwrap

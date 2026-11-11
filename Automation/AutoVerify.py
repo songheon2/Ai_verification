@@ -1044,6 +1044,7 @@ def run_vnnlib_verification(
                 reset_log=True,
                 enabled_panels=realtime_solver_panels,
                 simplex_detail_stride=100,
+                witness_context={"model_name": Path(model_path).name},
             )
             initial_progress_logger.request_update()
             initial_progress_visualizer.flush()
@@ -1167,6 +1168,7 @@ def run_vnnlib_verification(
                 feedback_solver_enabled and not realtime_solver_enabled
             ),
             witness_context={
+                "model_name": Path(model_path).name,
                 "kind": "vnnlib_unsafe",
                 "inputs": {
                     name: {"coeffs": dict(substitutions[name].coeffs),

@@ -21,6 +21,8 @@
   savedState.status = legacyFilters[savedState.status] || savedState.status;
   const statusOptions = [...$('#statusFilter').options].map(option => option.value);
   if (statusOptions.includes(savedState.status)) $('#statusFilter').value = savedState.status;
+  const treeOrders = ['node', 'layer', 'duration', 'completion'];
+  if (treeOrders.includes(savedState.treeOrder)) $('#treeOrder').value = savedState.treeOrder;
   if (['completion', 'visit', 'duration'].includes(savedState.timelineOrder)) $('#timelineOrder').value = savedState.timelineOrder;
   $('#layerFilter').value = savedState.layer || '';
   $('#neuronFilter').value = savedState.neuron || '';
@@ -153,7 +155,14 @@
     return scopeIds.has(node.id) && matchesStatus(node, $('#statusFilter').value) && (!layer || String(node.layer) === layer) && (!neuron || String(node.neuron) === neuron);
   }
   function flatFilter() {
-    return !ancestorSearch && !subtreeSearch && $('#statusFilter').value !== 'FINAL' && ($('#statusFilter').value !== 'ALL' || $('#layerFilter').value.trim() !== '' || $('#neuronFilter').value.trim() !== '');
+    return $('#treeOrder').value !== 'node' || (!ancestorSearch && !subtreeSearch && $('#statusFilter').value !== 'FINAL' && ($('#statusFilter').value !== 'ALL' || $('#layerFilter').value.trim() !== '' || $('#neuronFilter').value.trim() !== ''));
+  }
+  function compareTreeNodes(a, b) {
+    const order = $('#treeOrder').value;
+    if (order === 'layer') return (a.layer ?? Infinity) - (b.layer ?? Infinity) || (a.neuron ?? Infinity) - (b.neuron ?? Infinity) || a.id - b.id;
+    if (order === 'duration') return b.duration - a.duration || a.id - b.id;
+    if (order === 'completion') return (a.completedAt ?? Infinity) - (b.completedAt ?? Infinity) || a.id - b.id;
+    return a.id - b.id;
   }
   function indexData(data) {
     const previous = NODE_BY_ID;
@@ -352,7 +361,7 @@
     } else removeChildren(view);
   }
   function reconcile(container, currentViews, nodes) {
-    const desired = nodes.filter(node => MATCHED.get(node.id));
+    const desired = nodes.filter(node => MATCHED.get(node.id)).sort(compareTreeNodes);
     const wanted = new Set(desired.map(node => node.id));
     for (const [id, view] of currentViews) {
       if (!wanted.has(id)) { dispose(view); currentViews.delete(id); }
@@ -536,7 +545,7 @@
       expandedIds: [...expandedIds], recentPathIds: [...recentPathIds], recentTargetId,
       ancestorSearch, subtreeSearch,
       autoExpandSubtree, subtreeCollapsedIds: [...subtreeCollapsedIds],
-      status: $('#statusFilter').value, layer: $('#layerFilter').value, neuron: $('#neuronFilter').value,
+      status: $('#statusFilter').value, treeOrder: $('#treeOrder').value, layer: $('#layerFilter').value, neuron: $('#neuronFilter').value,
       treeScrollLeft: $('#treeViewport').scrollLeft, treeScrollTop: $('#treeViewport').scrollTop,
       timelinePage, stablePage, timelineScroll: readPanelScroll('timeline'), stableScroll: readPanelScroll('stable'),
       pageScrollX: window.scrollX, pageScrollY: window.scrollY,
@@ -559,6 +568,7 @@
     for (const nodeId of restored.recentPathIds || []) recentPathIds.add(nodeId);
     recentTargetId = restored.recentTargetId ?? null;
     $('#statusFilter').value = statusOptions.includes(restored.status) ? restored.status : 'ALL';
+    $('#treeOrder').value = treeOrders.includes(restored.treeOrder) ? restored.treeOrder : 'node';
     $('#layerFilter').value = restored.layer || '';
     $('#neuronFilter').value = restored.neuron || '';
     timelinePage = restored.timelinePage || 0; stablePage = restored.stablePage || 0;
@@ -586,7 +596,7 @@
       ancestorSearch, subtreeSearch,
       stablePage, stableScope: $('#stableScope').value, stableOrder: $('#stableOrder').value,
       reportPanels: Object.fromEntries(reportPanels.map(panel => [panel.key, panel.element.open])),
-      timelineOrder:$('#timelineOrder').value, status: $('#statusFilter').value,
+      timelineOrder:$('#timelineOrder').value, status: $('#statusFilter').value, treeOrder: $('#treeOrder').value,
       layer: $('#layerFilter').value, neuron: $('#neuronFilter').value,
       scrollX: window.scrollX, scrollY: window.scrollY, timelineScroll: readPanelScroll('timeline'),
       treeScrollLeft: $('#treeViewport').scrollLeft, treeScrollTop: $('#treeViewport').scrollTop,
@@ -798,6 +808,10 @@
   $('#collapseAll').onclick = () => { for (const root of scopeRoots()) setNodeExpanded(root.id, false); renderTree(); saveState(); };
   const filterChanged = () => { ancestorSearch = false; subtreeSearch = false; ancestorFeedback = ''; subtreeCollapsedIds.clear(); timelinePage = 0; stablePage = 0; updateScopeIndex(); updateFilterIndex(); expandMatchingTree(); renderTree(); $('#treeViewport').scrollTo(0, 0); renderTimeline(); renderStableRecords(); saveState(); };
   $('#statusFilter').onchange = filterChanged;
+  $('#treeOrder').onchange = () => {
+    updateFilterIndex(); renderTree();
+    $('#treeViewport').scrollTo(0, 0); saveState();
+  };
   $('#layerFilter').oninput = filterChanged;
   $('#neuronFilter').oninput = filterChanged;
   $('#findAncestors').onclick = findAncestorPaths;

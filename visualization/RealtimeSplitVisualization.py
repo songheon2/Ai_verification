@@ -283,6 +283,12 @@ class SplitEventLogger:
             "round_index": self._round_index if round_index is None else round_index,
         })
 
+    def mechanism(self, *, depth: int, kind: str, **metadata) -> None:
+        self._append_branch({
+            "event": "relu_mechanism", "depth": depth, "kind": kind,
+            "round_index": self._round_index, **metadata,
+        })
+
     def _append_branch(self, values: Dict) -> None:
         with self._lock:
             record = {

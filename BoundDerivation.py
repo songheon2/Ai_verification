@@ -162,6 +162,7 @@ def derive_bounds(
     max_passes: int = 20,
     tol: float = 1e-9,
     deps: Optional[BoundDeps] = None,
+    on_change=None,
 ) -> Tuple[Bounds, Dict[Tuple[str, str], str], bool]:
     """구간 전파를 고정점까지 돌린다.
 
@@ -177,6 +178,14 @@ def derive_bounds(
     b: Bounds = {v: tuple(x) for v, x in bounds.items()}  # type: ignore[misc]
     relu_list = list(relus)
     fixed: Dict[Tuple[str, str], str] = {}
+    apply_bound = _tighten
+    if on_change is not None:
+        def apply_bound(current, variable, *args):
+            before = current[variable]
+            result = _tighten(current, variable, *args)
+            if result:
+                on_change(variable, before, current[variable])
+            return result
 
     for _ in range(max_passes):
         changed = False
@@ -214,7 +223,7 @@ def derive_bounds(
             # 아래 역방향과 같은 이유로, 좁힐 게 없으면 _tighten을 건너뛴다
             if s_lo > cur_lo or s_hi < cur_hi or cur_lo > cur_hi:
                 d_lo, d_hi = _row_deps(terms, deps) if deps is not None else (0, 0)
-                r = _tighten(b, name, s_lo, s_hi, tol, deps, d_lo, d_hi)
+                r = apply_bound(b, name, s_lo, s_hi, tol, deps, d_lo, d_hi)
                 if r is None:
                     return b, fixed, True
                 changed |= r
@@ -262,7 +271,7 @@ def derive_bounds(
                     cv_lo = deps.lo.get(name, 0) | r_hi
                     cv_hi = deps.hi.get(name, 0) | r_lo
                     d_lo, d_hi = (cv_lo, cv_hi) if c > 0 else (cv_hi, cv_lo)
-                r = _tighten(b, v, v_lo, v_hi, tol, deps, d_lo, d_hi)
+                r = apply_bound(b, v, v_lo, v_hi, tol, deps, d_lo, d_hi)
                 if r is None:
                     return b, fixed, True
                 changed |= r
@@ -279,14 +288,14 @@ def derive_bounds(
             if deps is not None:
                 dxl, dxh = deps.lo.get(x, 0), deps.hi.get(x, 0)
             # y >= 0 이고 y >= x  (relu의 정의)
-            r = _tighten(b, y, max(0.0, x_lo if x_lo != -INF else 0.0), INF, tol,
+            r = apply_bound(b, y, max(0.0, x_lo if x_lo != -INF else 0.0), INF, tol,
                          deps, dxl if x_lo > 0.0 else 0, 0)
             if r is None:
                 return b, fixed, True
             changed |= r
             # y <= max(0, u(x))
             if x_hi != INF:
-                r = _tighten(b, y, -INF, max(0.0, x_hi), tol, deps, 0, dxh)
+                r = apply_bound(b, y, -INF, max(0.0, x_hi), tol, deps, 0, dxh)
                 if r is None:
                     return b, fixed, True
                 changed |= r
@@ -299,11 +308,11 @@ def derive_bounds(
                 fixed[(x, y)] = "active"        # 항상 켜짐 → y = x
                 if deps is not None:
                     deps.fixed[(x, y)] = dxl
-                r = _tighten(b, y, x_lo, x_hi, tol, deps, dxl, dxh)
+                r = apply_bound(b, y, x_lo, x_hi, tol, deps, dxl, dxh)
                 if r is None:
                     return b, fixed, True
                 changed |= r
-                r = _tighten(b, x, y_lo, y_hi, tol, deps, dyl, dyh)
+                r = apply_bound(b, x, y_lo, y_hi, tol, deps, dyl, dyh)
                 if r is None:
                     return b, fixed, True
                 changed |= r
@@ -311,7 +320,7 @@ def derive_bounds(
                 fixed[(x, y)] = "inactive"      # 항상 꺼짐 → y = 0
                 if deps is not None:
                     deps.fixed[(x, y)] = dxh
-                r = _tighten(b, y, 0.0, 0.0, tol, deps, 0, dxh)
+                r = apply_bound(b, y, 0.0, 0.0, tol, deps, 0, dxh)
                 if r is None:
                     return b, fixed, True
                 changed |= r
@@ -321,7 +330,7 @@ def derive_bounds(
                 fixed[(x, y)] = "inactive"
                 if deps is not None:
                     deps.fixed[(x, y)] = dyh
-                r = _tighten(b, x, -INF, 0.0, tol, deps, 0, dyh)
+                r = apply_bound(b, x, -INF, 0.0, tol, deps, 0, dyh)
                 if r is None:
                     return b, fixed, True
                 changed |= r
@@ -330,7 +339,7 @@ def derive_bounds(
                 fixed[(x, y)] = "active"
                 if deps is not None:
                     deps.fixed[(x, y)] = dyl
-                r = _tighten(b, x, y_lo, y_hi, tol, deps, dyl, dyh)
+                r = apply_bound(b, x, y_lo, y_hi, tol, deps, dyl, dyh)
                 if r is None:
                     return b, fixed, True
                 changed |= r

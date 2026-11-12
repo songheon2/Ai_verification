@@ -27,6 +27,23 @@
       auto.checked = true; refreshPages(); auto.checked = false;
       await waitFor(() => snapshots > before, 'snapshot applied');
     };
+    const beforeAutoEnable = snapshots;
+    const initialFrameSrc = frame.src;
+    auto.checked = true;
+    auto.dispatchEvent(new Event('change'));
+    auto.checked = false;
+    await waitFor(() => snapshots > beforeAutoEnable, 'checkbox immediately requests snapshot without polling');
+    assert(frame.contentDocument === doc && frame.src === initialFrameSrc, 'auto refresh preserves the visible document');
+    assert(getComputedStyle(frame).backgroundColor === 'rgb(255, 255, 255)' && getComputedStyle(frame).colorScheme === 'light', 'initial iframe cannot flash a dark background');
+    const panel = panels[0];
+    await waitFor(() => !panel.pending, 'initial image preload');
+    const previousImage = document.getElementById(panel.id), previousUri = panel.uri;
+    panel.uri = '/missing-image';
+    refreshPanel(panel);
+    assert(document.getElementById(panel.id) === previousImage, 'old image remains visible during loading');
+    await waitFor(() => !panel.pending, 'failed image preload');
+    assert(document.getElementById(panel.id) === previousImage, 'failed update preserves the previous image');
+    panel.uri = previousUri;
     const click = async id => {
       const target = details(id);
       const wasOpen = target.open;
@@ -310,7 +327,12 @@
     assert(trackingButton().getAttribute('aria-pressed') === 'true' && trackingDetails(108).classList.contains('recent-target'), 'reload restores tracking and latest path');
     assert(!trackingDoc.querySelector('#timelinePanel').open && !trackingDoc.querySelector('#stablePanel').open, 'reload restores both collapsed panels');
     const restoredViewport = trackingDoc.querySelector('#treeViewport');
-    trackingDoc.querySelector('#tree').style.paddingBottom = '160px';
+    // This case specifically covers a fully visible target. Larger fonts can
+    // otherwise require legitimate horizontal scrolling to reveal its verdict.
+    restoredViewport.style.minWidth = '900px';
+    // Keep the next two rows visible even when larger text makes the header
+    // taller and therefore reduces the tree viewport's available height.
+    trackingDoc.querySelector('#tree').style.paddingBottom = `${Math.min(160, restoredViewport.clientHeight)}px`;
     restoredViewport.scrollTop = restoredViewport.scrollHeight;
     const visibleScrollTop = restoredViewport.scrollTop, visibleScrollLeft = restoredViewport.scrollLeft;
     let visibleScrollCalls = 0;

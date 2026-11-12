@@ -457,7 +457,7 @@ class RealtimeSearchTreeTests(unittest.TestCase):
             feedback = [(e.branch_x, e.meta["phase"], e.meta.get("unsat_origin"))
                         for e in feedback_events]
             live = [(e.branch_x, e.meta["phase"], e.meta.get("unsat_origin"))
-                    for e in live_trace.events]
+                    for e in live_trace.events if e.component == "reluplex_branch"]
             self.assertEqual(live, feedback)
             self.assertEqual(
                 feedback,
@@ -595,6 +595,62 @@ class RealtimeSearchTreeTests(unittest.TestCase):
             self.assertIn("auto refresh", content)
             self.assertIn('clearInterval(imageTimer)', content)
             self.assertIn('message.status === "RUNNING"', content)
+
+
+class TheoryFlowLabelTests(unittest.TestCase):
+    def test_many_rounds_stay_above_network_footer(self):
+        import matplotlib.pyplot as plt
+        from visualization.SolverProgress import draw_dpll_theory_panel
+        events = [{'event':'run_context','witness_context':{
+            'model_name':'ACASXU_run2a_1_1_batch_2000.onnx','model_layer_sizes':[5,50,50,50,50,50,50,5]}}]
+        for index in range(1,17):
+            events.extend([{'event':'theory_result','round':index,'result':'THEORY_CONFLICT'},
+                           {'event':'round_end','round':index,'result':'THEORY_CONFLICT','duration_seconds':1}])
+        figure, axes = draw_dpll_theory_panel(events)
+        try:
+            figure.canvas.draw()
+            renderer = figure.canvas.get_renderer()
+            flow = axes.flat[3]
+            text = flow.texts[0]
+            box = text.get_window_extent(renderer)
+            network = next(label for label in figure.texts if label.get_text().startswith('Network:'))
+            footer_box = network.get_window_extent(renderer)
+            self.assertIn('R16 |',text.get_text())
+            self.assertGreaterEqual(box.y0, flow.get_window_extent(renderer).y0)
+            self.assertGreater(box.y0, footer_box.y1 + 10)
+            self.assertTrue(text.get_clip_on())
+        finally:
+            plt.close(figure)
+
+    def test_two_round_example_and_pipe_separators(self):
+        import matplotlib.pyplot as plt
+        from DPLL import parse_prop
+        from DPLL_T import dpll_t_detailed
+        from visualization.SolverProgress import (
+            SolverProgressLogger, read_solver_progress, draw_dpll_theory_panel, draw_theory_panel,
+        )
+        formula = parse_prop('(ineq(1,x,1) and not ineq(1,x,0)) or (ineq(1,x,1) and ineq(1,x,0))')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'solver.jsonl'
+            progress = SolverProgressLogger(path)
+            result = dpll_t_detailed(formula, progress=progress, max_rounds=10, timeout_seconds=2)
+            progress.close()
+            events = read_solver_progress(path)
+        self.assertEqual(result.rounds, 2)
+        self.assertEqual([event['result'] for event in events if event['event']=='theory_result'],
+                         ['THEORY_CONFLICT', 'THEORY_SAT'])
+        for draw in (draw_dpll_theory_panel, draw_theory_panel):
+            figure, _axes = draw(events)
+            try:
+                results_axis = next(axis for axis in figure.axes if axis.get_title()=='Theory Solver Result')
+                self.assertEqual(results_axis.get_xlabel(), 'Count')
+                self.assertEqual([label.get_text() for label in results_axis.texts], ['1','1'])
+                flow = next(axis for axis in figure.axes if 'selected atoms' in axis.get_title(loc='left'))
+                self.assertEqual(flow.get_title(loc='left'), 'Round | selected atoms | Simplex | theory result')
+                self.assertTrue(any('R1 |' in label.get_text() and 'R2 |' in label.get_text() for label in flow.texts))
+                self.assertFalse(any('→' in label.get_text() for label in flow.texts))
+            finally:
+                plt.close(figure)
 
 
 if __name__ == "__main__":

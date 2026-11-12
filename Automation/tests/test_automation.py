@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -482,13 +483,54 @@ class AutomationIntegrationTests(unittest.TestCase):
             "--model", "model.bin",
             "--vnnlib", "property.vnnlib",
             "--visualization-mode", "realtime",
-            "--realtime-panels", "relu",
+            "--panels", "relu",
             "--realtime-refresh-ms", "50",
             "--realtime-playback-ms", "750",
         ])
         self.assertEqual(args.realtime_panels, ["relu"])
         self.assertEqual(args.realtime_refresh_ms, 50)
         self.assertEqual(args.realtime_playback_ms, 750)
+
+    def test_mechanism_panels_are_independent_in_all_modes(self):
+        import json
+        import tempfile
+        text = '''(declare-const X_0 Real) (declare-const X_1 Real)
+        (declare-const Y_0 Real) (assert (= X_0 0)) (assert (= X_1 0)) (assert (<= Y_0 0))'''
+        for mode in ('realtime', 'feedback', 'both'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                prop = root / 'property.vnnlib'
+                prop.write_text(text, encoding='utf-8')
+                result = run_vnnlib_verification(
+                    str(self.model_path), str(prop), visualization_mode=mode,
+                    realtime_panels=['mechanisms'],
+                    visualization_output_dir=str(root / 'run'),
+                )
+                mechanism = Path(result['solver_mechanisms_output'])
+                self.assertTrue(mechanism.exists())
+                html = mechanism.read_text(encoding='utf-8')
+                data = json.loads(html.split('const INITIAL_DATA = ', 1)[1].split(';', 1)[0])
+                self.assertEqual(set(data['panels']), {'bounds', 'backjump', 'numerical', 'underapprox'})
+                self.assertNotIn('relu_search_tree_output', result)
+                self.assertNotIn('split_heatmap_output', result)
+                self.assertNotIn('relu_feedback_output', result)
+                if mode != 'feedback':
+                    realtime = result['visualization']['realtime']
+                    self.assertEqual(realtime['panel_outputs'], {})
+                    dashboard = Path(realtime['dashboard_output'])
+                    self.assertNotEqual(dashboard, mechanism)
+                    page = dashboard.read_text(encoding='utf-8')
+                    self.assertIn('id="solver-mechanisms-dashboard"', page)
+                    self.assertNotIn('id="relu-tree-dashboard"', page)
+                    self.assertNotIn('image_output', realtime)
+                    self.assertNotIn('RUNNING', data['status'])
+
+    def test_visualization_cli_accepts_grouped_mechanisms(self):
+        args = build_parser().parse_args([
+            'verify-vnnlib', '--model', 'model.bin', '--vnnlib', 'property.vnnlib',
+            '--panels', 'mechanisms',
+        ])
+        self.assertEqual(args.realtime_panels, ['mechanisms'])
 
     def test_realtime_frame_is_reset_before_model_encoding(self):
         import Automation.AutoVerify as auto_verify
@@ -533,7 +575,9 @@ class AutomationIntegrationTests(unittest.TestCase):
                     solver_realtime_output=str(solver_realtime),
                 )
 
-            self.assertEqual(observed["log"], "")
+            initial_events = [json.loads(line) for line in observed["log"].splitlines()]
+            self.assertEqual([event["event"] for event in initial_events], ["run_context"])
+            self.assertEqual(initial_events[0]["witness_context"]["model_name"], self.model_path.name)
             self.assertTrue(observed["image"].startswith(b"\x89PNG\r\n\x1a\n"))
             self.assertNotEqual(observed["image"], b"old-run-image")
 

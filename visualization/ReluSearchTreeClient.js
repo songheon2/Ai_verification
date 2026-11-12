@@ -611,6 +611,7 @@
   }
   function applySnapshot(data) {
     if (!data || !Array.isArray(data.roots)) return;
+    if (data.snapshotVersion != null && data.snapshotVersion === DATA.snapshotVersion) return;
     const scrollX = window.scrollX, scrollY = window.scrollY, timelineScroll = readPanelScroll('timeline');
     const stableScroll = readPanelScroll('stable');
     const treeScrollLeft = $('#treeViewport').scrollLeft, treeScrollTop = $('#treeViewport').scrollTop;
@@ -638,7 +639,7 @@
       document.body.appendChild(snapshotFrame);
     }
     snapshotPending = true;
-    const url = new URL(location.href);
+    const url = new URL(DATA.snapshotFile || location.href, location.href);
     url.searchParams.set('tree-snapshot', '1'); url.searchParams.set('t', Date.now());
     snapshotFrame.src = url.href;
   }

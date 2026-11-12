@@ -619,6 +619,9 @@ def simplex(
     stats: Optional[Dict[str, Any]] = None,
     tighten_bounds: bool = False,
     full_tighten_every: int = 0,
+    mechanism_callback=None,
+    numerical_callback=None,
+    bound_change_callback=None,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     Simplex 알고리즘 (Algorithm 3 스타일).
@@ -735,6 +738,8 @@ def simplex(
     call_id = None
     iteration_count = 0
     pivot_count = 0
+    mechanism_counts = {"cycles": 0, "pivot_tightened": 0,
+                        "full_tighten": 0, "full_tightened": 0, "bound_conflicts": 0}
     if progress is not None:
         call_id = progress.simplex_start(
             round_index=context.get("round_index"),
@@ -746,6 +751,9 @@ def simplex(
         )
 
     def _finish(result: str) -> None:
+        if mechanism_callback is not None:
+            mechanism_callback(**mechanism_counts, result=result,
+                               origin=str(context.get("origin", "simplex")))
         if progress is not None and call_id is not None:
             progress.simplex_end(
                 call_id,
@@ -778,6 +786,15 @@ def simplex(
         if tighten_bounds and tableau.deps is not None else None
     )
 
+    def _tighten_observed(row, source):
+        bound = tableau.bounds[row.basic_var]
+        before = (bound.lower, bound.upper)
+        result = _tighten_from_row(tableau, row)
+        if result and bound_change_callback is not None:
+            after = tableau.bounds[row.basic_var]
+            bound_change_callback(row.basic_var, before, (after.lower, after.upper), source=source)
+        return result
+
     def _drift_needs_restore() -> Optional[bool]:
         """오차를 재고 필요하면 복원한다.
 
@@ -786,14 +803,28 @@ def simplex(
         """
         nonlocal restores, state_hash, seen_states
         drift = _tableau_drift(tableau)
+        observation = None
+        if numerical_callback is not None:
+            residual = sum(abs(tableau.assign[name] - sum(c * tableau.assign[var] for var, c in coeffs.items()))
+                           for name, coeffs in tableau.origin_rows)
+            observation = dict(action="check", drift=drift, residual=residual, threshold=DRIFT_TOL,
+                               pivot=pivot_count, lineage_pivots=tableau.pivots_since_check)
         if stats is not None:
             stats["SIMPLEX_DRIFT_CHECKS"] = stats.get("SIMPLEX_DRIFT_CHECKS", 0) + 1
             if drift > stats.get("SIMPLEX_MAX_DRIFT", 0.0):
                 stats["SIMPLEX_MAX_DRIFT"] = drift
         if drift <= DRIFT_TOL:
+            if observation is not None:
+                numerical_callback(**observation, outcome="within_tolerance")
             tableau.pivots_since_check = 0
             return False
         if bounds_at_start is not None:
+            if bound_change_callback is not None:
+                for var, original in bounds_at_start.items():
+                    current = tableau.bounds[var]
+                    before, after = (current.lower, current.upper), (original.lower, original.upper)
+                    if before != after:
+                        bound_change_callback(var, before, after, source="restore")
             tableau.bounds.clear()
             tableau.bounds.update(
                 (var, Bound(lower=b.lower, upper=b.upper))
@@ -804,8 +835,14 @@ def simplex(
             tableau.deps.hi = dict(deps_at_start[1])
         tableau.conflict = None
         if restores >= MAX_RESTORES_PER_CALL or not _restore_tableau(tableau):
+            if observation is not None:
+                numerical_callback(**observation, outcome="restore_failed")
             return None
         restores += 1
+        if observation is not None:
+            numerical_callback(**observation, outcome="restored", after_drift=_tableau_drift(tableau),
+                               after_residual=sum(abs(tableau.assign[name] - sum(c * tableau.assign[var] for var, c in coeffs.items()))
+                                                  for name, coeffs in tableau.origin_rows))
         if stats is not None:
             stats["SIMPLEX_RESTORES"] = stats.get("SIMPLEX_RESTORES", 0) + 1
         # 기저가 처음 상태로 돌아갔으므로 순환 감지도 새로 시작한다
@@ -949,6 +986,12 @@ def simplex(
             return (None, False)
 
         # ── 피벗 수행 ──
+        if numerical_callback is not None and (pivot_count == 0 or (pivot_count + 1) % 100 == 0):
+            numerical_callback(action="pivot", pivot=pivot_count + 1,
+                               coefficient=abs(violated_row.coeffs[pivot_xi]), row_max=amax,
+                               zero_threshold=zero_thr,
+                               excluded_small=sum(0 < abs(c) <= zero_thr for c in violated_row.coeffs.values()),
+                               mode="random_threshold" if randomize else "max_coefficient")
         if progress is not None and call_id is not None:
             progress.simplex_pivot(
                 call_id,
@@ -990,6 +1033,10 @@ def simplex(
                 seen_states = {state_hash}
         elif state_hash in seen_states:
             random_steps_left = RANDOM_PIVOT_STEPS
+            mechanism_counts["cycles"] += 1
+            if progress is not None and call_id is not None and hasattr(progress, "simplex_cycle"):
+                progress.simplex_cycle(call_id, iteration=iteration,
+                                       pivot=pivot_count, random_steps=RANDOM_PIVOT_STEPS)
             if stats is not None:
                 stats["SIMPLEX_CYCLES_DETECTED"] = stats.get("SIMPLEX_CYCLES_DETECTED", 0) + 1
         else:
@@ -1020,7 +1067,7 @@ def simplex(
         # 방금 기저로 들어온 변수(pivot_xi)의 row로 그 경계를 좁힌다.
         # violated_row는 _pivot()이 제자리에서 "pivot_xi = ..." row로 바꿔 두었다.
         if tighten_bounds:
-            tightened = _tighten_from_row(tableau, violated_row)
+            tightened = _tighten_observed(violated_row, "lp-pivot") if bound_change_callback is not None else _tighten_from_row(tableau, violated_row)
             if tightened is None:
                 # 비기저변수를 경계 안에서 어떻게 움직여도 이 row를 만족시킬 수
                 # 없다 → UNSAT. 피벗 불가 UNSAT과 똑같이 row 계수에 기대는
@@ -1033,10 +1080,12 @@ def simplex(
                         continue
                 if stats is not None:
                     stats["PIVOT_TIGHTEN_UNSAT"] = stats.get("PIVOT_TIGHTEN_UNSAT", 0) + 1
+                mechanism_counts["bound_conflicts"] += 1
                 _finish("UNSAT")
                 return (None, False)
             if tightened and stats is not None:
                 stats["PIVOT_TIGHTENED"] = stats.get("PIVOT_TIGHTENED", 0) + 1
+            mechanism_counts["pivot_tightened"] += bool(tightened)
 
         # N번째 피벗마다 모든 row로 기저변수 경계를 좁힌다 (논문 5절의 주기적
         # 전체 강화). 피벗마다 하는 강화는 방금 바뀐 row 하나만 보지만, 다른 row도
@@ -1047,7 +1096,7 @@ def simplex(
             conflict_found = False
             n_tightened = 0
             for row in tableau.rows:
-                tightened = _tighten_from_row(tableau, row)
+                tightened = _tighten_observed(row, "lp-full") if bound_change_callback is not None else _tighten_from_row(tableau, row)
                 if tightened is None:
                     conflict_found = True
                     break
@@ -1061,6 +1110,8 @@ def simplex(
                     stats.get("SIMPLEX_FULL_TIGHTEN_SECONDS", 0.0)
                     + time.perf_counter() - started
                 )
+            mechanism_counts["full_tighten"] += 1
+            mechanism_counts["full_tightened"] += n_tightened
             if conflict_found:
                 # 피벗마다 강화의 모순과 똑같이 row 계수에 기대는 판정이다
                 if tableau.pivots_since_check >= DRIFT_CHECK_AT_EXIT:
@@ -1073,6 +1124,7 @@ def simplex(
                     stats["SIMPLEX_FULL_TIGHTEN_UNSAT"] = (
                         stats.get("SIMPLEX_FULL_TIGHTEN_UNSAT", 0) + 1
                     )
+                mechanism_counts["bound_conflicts"] += 1
                 _finish("UNSAT")
                 return (None, False)
 

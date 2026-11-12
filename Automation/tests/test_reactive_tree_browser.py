@@ -33,7 +33,13 @@ class ReactiveTreeBrowserTests(unittest.TestCase):
     @unittest.skipUnless(chromium_path(), "Chromium browser is not installed")
     def test_self_contained_file_refreshes_without_reloading_visible_tree(self):
         trace = SolveTrace(events=[
+            TraceEvent("reluplex_mechanism", 0.5, 0.5, 0, None, {"kind": "settings", "backjump": False}),
             TraceEvent("reluplex_branch", 1, None, 1, "z1_1", {"phase": "+", "result": "RUNNING"}),
+            TraceEvent("reluplex_mechanism", 1.5, 1.5, 1, None,
+                       {"kind": "repair", "rule": "update_f", "variable": "z1_1",
+                        "before": [1, 0], "after": [1, 1], "pivoted": True}),
+            TraceEvent("reluplex_mechanism", 1.6, 1.6, 1, None,
+                       {"kind": "bounds", "source": "search", "changed": 2, "fixed": 1}),
             TraceEvent("reluplex_branch", 2, None, 2, "z2_2", {"phase": "+", "result": "RUNNING"}),
             TraceEvent("reluplex_branch", 3, 4, 3, "z3_3", {"phase": "+", "result": "UNSAT"}),
         ])
@@ -57,6 +63,9 @@ class ReactiveTreeBrowserTests(unittest.TestCase):
     assert(JSON.parse(window.name.slice('relu-search-tree-ui:'.length)).treeOrder === 'completion', 'sort persisted');
     chooseSort('node');
     const root = document.querySelector('details[data-id="1"]');
+    assert(!document.querySelector('#mechanismRepair') && !document.querySelector('.mechanism-badges'), 'tree excludes mechanism panel and badges');
+    root.querySelector('summary').dispatchEvent(new Event('mouseenter'));
+    assert(!root.querySelector('summary').title.includes('Update_f (h ← ReLU(z))'), 'mechanism details removed from tree tooltip');
     root.querySelector('summary').click();
     assert(document.querySelectorAll('#tree details').length === 2, 'one child level');
     let snapshots = 0;
@@ -85,7 +94,9 @@ class ReactiveTreeBrowserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="reactive-relu-file-") as directory:
             root = Path(directory)
             report = root / "tree.html"
-            write_relu_search_tree_html(trace, report, overall_status="RUNNING")
+            write_relu_search_tree_html(trace, report, overall_status="RUNNING", live_snapshots=True, snapshot_version=1)
+            write_relu_search_tree_html(trace, report, overall_status="RUNNING", live_snapshots=True,
+                                        snapshot_only=True, snapshot_version=2)
             report.write_text(report.read_text(encoding="utf-8").replace("</body>", harness + "</body>"), encoding="utf-8")
             result = subprocess.run([
                 chromium_path(), "--headless", "--no-sandbox", "--disable-gpu",

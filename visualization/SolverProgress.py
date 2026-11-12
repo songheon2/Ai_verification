@@ -128,6 +128,7 @@ class SolverProgressLogger:
         self._simplex_numbers: Dict[str, int] = {}
         self._simplex_rounds: Dict[str, Optional[int]] = {}
         self._simplex_metadata: Dict[str, Dict[str, Any]] = {}
+        self._simplex_cycle_counts: Counter[str] = Counter()
         self._simplex_sequence = 0
         self._constraint_details: Dict[tuple[int, str], Dict[str, Any]] = {}
         self._emitted_constraint_details: set[tuple[str, bool]] = set()
@@ -438,6 +439,12 @@ class SolverProgressLogger:
             force_update=False,
         )
 
+    def simplex_cycle(self, call_id: str, *, iteration: int, pivot: int, random_steps: int) -> None:
+        with self._lock:
+            self._simplex_cycle_counts[call_id] += 1
+        self._append("simplex_cycle", call_id=call_id, iteration=iteration,
+                     pivot=pivot, random_steps=random_steps)
+
     def simplex_end(
         self,
         call_id: str,
@@ -455,6 +462,7 @@ class SolverProgressLogger:
             call_number = self._simplex_numbers.pop(call_id, None)
             self._simplex_rounds.pop(call_id, None)
             metadata = self._simplex_metadata.pop(call_id, {})
+            cycles = self._simplex_cycle_counts.pop(call_id, 0)
         terminal_event = "simplex_call" if self.compact_simplex_calls else "simplex_end"
         self._append(
             terminal_event,
@@ -465,6 +473,7 @@ class SolverProgressLogger:
             duration_seconds=max(0.0, (time_ns() - started) / 1_000_000_000),
             iterations=iterations,
             pivots=pivots,
+            cycles=cycles,
             force_flush=result not in {"SAT", "UNSAT"},
             force_update=False,
         )
@@ -570,6 +579,11 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
                     for key, value in event.items()
                     if key not in {"event", "timestamp", "time_ns"}
                 }
+        elif kind == "simplex_cycle":
+            call = calls.setdefault(str(event["call_id"]), {"call_id": str(event["call_id"])})
+            call["cycles"] = int(call.get("cycles", 0)) + 1
+            if len(call.setdefault("cycle_events", [])) < 32:
+                call["cycle_events"].append({key: event.get(key) for key in ("iteration", "pivot", "random_steps")})
         elif kind == "simplex_pivot":
             call_id = str(event.get("call_id"))
             call = calls.setdefault(call_id, {"call_id": call_id})
@@ -588,6 +602,7 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
                 "duration_seconds": float(event.get("duration_seconds", 0.0)),
                 "iterations": int(event.get("iterations", 0)),
                 "pivots": int(event.get("pivots", 0)),
+                "cycles": int(event.get("cycles", calls.get(call_id, {}).get("cycles", 0))),
             }
             if kind == "simplex_call":
                 completed.update(
@@ -697,8 +712,13 @@ def _result_color(result: Optional[str]) -> str:
         return "#16a34a"
     if result in {"UNSAT", "THEORY_UNSAT", "BOOLEAN_UNSAT"}:
         return "#dc2626"
+    if result in {"CONFLICT", "THEORY_CONFLICT"}:
+        return "#9333ea"
+    if result in {"TIMEOUT", "THEORY_TIMEOUT"}:
+        return "#ea580c"
+    if result in {None, "RUNNING", "THEORY_RUNNING"}:
+        return "#2563eb"
     if result in {
-        "TIMEOUT",
         "ITERATION_LIMIT",
         "SIMPLEX_ITERATION_LIMIT",
         "STALLED",
@@ -711,7 +731,19 @@ def _result_color(result: Optional[str]) -> str:
         "STRICT_INEQUALITY_INCONCLUSIVE",
     }:
         return "#f59e0b"
-    return "#2563eb"
+    return "#64748b"
+
+
+def _simplex_result_legend(axis, calls) -> None:
+    from matplotlib.lines import Line2D
+
+    results = ["SAT", "UNSAT"]
+    results.extend(sorted({str(call.get("result", "RUNNING")) for call in calls} - set(results)))
+    handles = [Line2D([], [], color=_result_color(result), linewidth=3, label=result)
+               for result in results]
+    extra_handles, _ = axis.get_legend_handles_labels()
+    axis.legend(handles=handles + extra_handles, loc="upper left",
+                bbox_to_anchor=(1.02, 1.0), borderaxespad=0, ncol=1, fontsize=9)
 
 
 def _set_integer_ticks(axis, direction: str) -> None:
@@ -882,6 +914,22 @@ def draw_solver_dashboard(
     ax_work.set_ylabel("Pivots within call")
     ax_work.grid(alpha=0.3)
 
+    cycle_calls = [(number, call) for number, call in zip(call_numbers, calls)
+                   if call.get("cycles", 0)]
+    if cycle_calls:
+        for axis, field in ((ax_duration, "duration_seconds"), (ax_work, "pivots")):
+            axis.scatter([number for number, _ in cycle_calls],
+                         [call.get(field, 0) for _, call in cycle_calls],
+                         marker="^", s=38, color="#7c3aed", zorder=5,
+                         label="Cycle detected / random pivot")
+            axis.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0),
+                        borderaxespad=0, ncol=1, fontsize=9)
+        ax_work.text(0.02, 0.96,
+                     f"Cycles: {sum(call['cycles'] for _, call in cycle_calls)} "
+                     f"in {len(cycle_calls)} calls", transform=ax_work.transAxes,
+                     va="top", fontsize=10, color="#6d28d9")
+
+    _simplex_result_legend(ax_duration, calls)
     selected = feedback.get("top_violated_constraints", [])[:8]
     if selected:
         labels = [_constraint_label(item) for item in reversed(selected)]
@@ -895,7 +943,7 @@ def draw_solver_dashboard(
     ax_vars.grid(axis="x", alpha=0.3)
 
     ax_links.axis("off")
-    ax_links.set_title("DPLL → theory atoms → Simplex calls → theory result", loc="left")
+    ax_links.set_title("DPLL | theory atoms | Simplex calls | theory result", loc="left")
     all_calls = feedback["simplex_calls"]
     call_number_by_id = {
         str(call.get("call_id")): index for index, call in enumerate(all_calls, start=1)
@@ -915,8 +963,8 @@ def draw_solver_dashboard(
         ]
         link_lines.append(
             f"R{round_index}  atoms=({', '.join(atom_labels) or '-'})"
-            f"  →  {', '.join(call_labels) or 'no Simplex'}"
-            f"  →  {round_item.get('theory_result', round_item.get('result', 'RUNNING'))}"
+            f"  |  {', '.join(call_labels) or 'no Simplex'}"
+            f"  |  {round_item.get('theory_result', round_item.get('result', 'RUNNING'))}"
         )
     ax_links.text(
         0.01,
@@ -932,8 +980,14 @@ def draw_solver_dashboard(
     solver = feedback.get("solver", {})
     model_name = solver.get("witness_context", {}).get("model_name")
     if model_name:
-        fig.text(0.98, 0.035, f"Network: {model_name}",
-                 ha="right", va="bottom", fontsize=9, color="#111827")
+        fig.text(0.98, 0.055, f"Network: {model_name}",
+                 ha="right", va="bottom", fontsize=11, color="#111827")
+        layer_sizes = solver.get("witness_context", {}).get("model_layer_sizes", [])
+        if layer_sizes:
+            structure = " -> ".join(str(size) for size in layer_sizes)
+            fig.text(0.98, 0.035,
+                     f"Structure (input -> hidden -> output): {structure} | ReLU: {sum(layer_sizes[1:-1])}",
+                     ha="right", va="bottom", fontsize=10, color="#374151")
     fig.text(
         0.01,
         0.01,
@@ -950,11 +1004,11 @@ def draw_solver_dashboard(
     )
     fig.subplots_adjust(
         left=0.08,
-        right=0.98,
+        right=0.80,
         top=0.94,
         bottom=0.08,
         hspace=0.58,
-        wspace=0.24,
+        wspace=1.05,
     )
     return fig, axes
 
@@ -1009,7 +1063,7 @@ def _compact_theory_flow_lines(
         theory_result = _theory_outcome(item) or "NOT RUN"
         lines.append(
             f"R{round_index} | selected atoms {len(atoms)} ({atom_summary}) | Simplex {len(round_calls)}\n"
-            f"   {call_summary} → {theory_result}"
+            f"   {call_summary} | {theory_result}"
         )
     return lines
 
@@ -1078,13 +1132,16 @@ def draw_theory_panel(events_or_path, *, title: str = "DPLL ↔ Theory Flow"):
     labels = list(results)
     values = [results[label] for label in labels]
     ax_results.barh(labels, values, color=[_result_color(label) for label in labels])
-    ax_results.set_xticks([])
-    ax_results.set_title("Theory results")
-    ax_results.set_xlabel("")
+    ax_results.set_title("Theory Solver Result")
+    ax_results.set_xlabel("Count")
+    _set_integer_ticks(ax_results, "x")
+    ax_results.set_xlim(0, max(values, default=1) * 1.2)
+    for row, count in enumerate(values):
+        ax_results.annotate(str(count), (count, row), xytext=(5, 0), textcoords="offset points", va="center")
 
     link_lines = _compact_theory_flow_lines(feedback, rounds)
     ax_links.axis("off")
-    ax_links.set_title("Round → selected atoms → Simplex → theory result", loc="left")
+    ax_links.set_title("Round | selected atoms | Simplex | theory result", loc="left")
     ax_links.text(
         0.01,
         0.96,
@@ -1167,7 +1224,7 @@ def draw_dpll_theory_panel(
     fig, axes = plt.subplots(
         2,
         2,
-        figsize=(15, 9),
+        figsize=(15, max(9, 6 + 0.5 * len(rounds))),
         gridspec_kw={"height_ratios": [1, 1.25], "width_ratios": [1, 1.7]},
     )
     fig.suptitle(title, fontsize=16, fontweight="bold")
@@ -1212,13 +1269,16 @@ def draw_dpll_theory_panel(
     labels = list(results)
     values = [results[label] for label in labels]
     ax_results.barh(labels, values, color=[_result_color(label) for label in labels])
-    ax_results.set_xticks([])
-    ax_results.set_title("Theory results")
-    ax_results.set_xlabel("")
+    ax_results.set_title("Theory Solver Result")
+    ax_results.set_xlabel("Count")
+    _set_integer_ticks(ax_results, "x")
+    ax_results.set_xlim(0, max(values, default=1) * 1.2)
+    for row, count in enumerate(values):
+        ax_results.annotate(str(count), (count, row), xytext=(5, 0), textcoords="offset points", va="center")
 
     link_lines = _compact_theory_flow_lines(feedback, rounds)
     ax_links.axis("off")
-    ax_links.set_title("Round → selected atoms → Simplex → theory result", loc="left")
+    ax_links.set_title("Round | selected atoms | Simplex | theory result", loc="left")
     ax_links.text(
         0.01,
         0.96,
@@ -1227,6 +1287,7 @@ def draw_dpll_theory_panel(
         va="top",
         family="monospace",
         fontsize=8.5,
+        clip_on=True,
     )
     solver = feedback.get("solver", {})
     fig.text(
@@ -1237,8 +1298,14 @@ def draw_dpll_theory_panel(
     )
     model_name = solver.get("witness_context", {}).get("model_name")
     if model_name:
-        fig.text(0.98, 0.035, f"Network: {model_name}",
-                 ha="right", va="bottom", fontsize=9, color="#111827")
+        fig.text(0.98, 0.055, f"Network: {model_name}",
+                 ha="right", va="bottom", fontsize=11, color="#111827")
+        layer_sizes = solver.get("witness_context", {}).get("model_layer_sizes", [])
+        if layer_sizes:
+            structure = " -> ".join(str(size) for size in layer_sizes)
+            fig.text(0.98, 0.035,
+                     f"Structure (input -> hidden -> output): {structure} | ReLU: {sum(layer_sizes[1:-1])}",
+                     ha="right", va="bottom", fontsize=10, color="#374151")
     witness_lines = _sat_witness_lines(feedback)
     if witness_lines:
         import textwrap
@@ -1258,15 +1325,17 @@ def draw_dpll_theory_panel(
                 0.01, cursor, label, transform=ax_links.transAxes,
                 va="top", family="monospace", fontsize=9,
                 color="#111827", fontweight="bold",
+                clip_on=True,
             )
             cursor -= 0.052
             ax_links.text(
                 0.01, cursor, "\n".join(value_lines),
                 transform=ax_links.transAxes, va="top",
                 family="monospace", fontsize=9, color="#166534",
+                clip_on=True,
             )
             cursor -= 0.052 * len(value_lines) + 0.035
-    fig.subplots_adjust(left=0.07, right=0.98, top=0.91, bottom=0.08, hspace=0.38, wspace=0.5)
+    fig.subplots_adjust(left=0.07, right=0.98, top=0.91, bottom=0.14, hspace=0.38, wspace=0.5)
     return fig, axes
 
 
@@ -1340,8 +1409,25 @@ def draw_simplex_panel(
     ax_work.set_ylabel("Pivots within call")
     ax_work.grid(alpha=0.3)
 
+    cycle_calls = [(number, call) for number, call in zip(call_numbers, calls)
+                   if call.get("cycles", 0)]
+    if cycle_calls:
+        for axis, field in ((ax_duration, "duration_seconds"), (ax_work, "pivots")):
+            axis.scatter([number for number, _ in cycle_calls],
+                         [call.get(field, 0) for _, call in cycle_calls],
+                         marker="^", s=38, color="#7c3aed", zorder=5,
+                         label="Cycle detected / random pivot")
+            axis.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0),
+                        borderaxespad=0, ncol=1, fontsize=9)
+        ax_work.text(0.02, 0.96,
+                     f"Cycles: {sum(call['cycles'] for _, call in cycle_calls)} "
+                     f"in {len(cycle_calls)} calls", transform=ax_work.transAxes,
+                     va="top", fontsize=10, color="#6d28d9")
+
     if show_round_boundaries:
         _annotate_simplex_rounds((ax_duration, ax_work), calls)
+
+    _simplex_result_legend(ax_duration, calls)
 
     result_counts = Counter(item.get("result", "RUNNING") for item in calls)
     result_labels = list(result_counts)
@@ -1373,7 +1459,7 @@ def draw_simplex_panel(
         f"calls={feedback['counts']['simplex_calls']} | pivots={feedback['counts']['simplex_pivots']}",
         fontsize=9,
     )
-    fig.subplots_adjust(left=0.07, right=0.98, top=0.91, bottom=0.08, hspace=0.38, wspace=0.62)
+    fig.subplots_adjust(left=0.07, right=0.80, top=0.91, bottom=0.08, hspace=0.38, wspace=1.05)
     return fig, axes
 
 

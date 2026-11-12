@@ -199,6 +199,7 @@ from visualization.RealtimeSplitVisualization import (
     split_metadata_path,
 )
 from visualization.ReluSearchTree import write_relu_search_tree_html
+from visualization.SolverMechanisms import mechanism_report_path
 from visualization.SolverProgress import (
     SolverProgressLogger,
     SolverProgressPanelVisualizer,
@@ -888,8 +889,10 @@ def run_vnnlib_verification(
         realtime=realtime_enabled,
         feedback=feedback_enabled,
     )
-    allowed_realtime_panels = {"relu", "dpll-theory", "simplex"}
+    mechanism_panel_names = {"bounds", "backjump", "numerical", "underapprox"}
+    allowed_realtime_panels = {"relu", "dpll-theory", "simplex", "mechanisms"}
     selected_realtime_panels = set(realtime_panels or allowed_realtime_panels)
+    selected_mechanisms = sorted(mechanism_panel_names) if "mechanisms" in selected_realtime_panels else []
     unknown_realtime_panels = selected_realtime_panels - allowed_realtime_panels
     if unknown_realtime_panels:
         names = ", ".join(sorted(unknown_realtime_panels))
@@ -897,6 +900,8 @@ def run_vnnlib_verification(
     if realtime_enabled and not selected_realtime_panels:
         raise ValueError("realtime mode에는 하나 이상의 panel이 필요합니다")
     realtime_relu_enabled = realtime_enabled and "relu" in selected_realtime_panels
+    realtime_capture_enabled = realtime_enabled and (realtime_relu_enabled or bool(selected_mechanisms))
+    feedback_capture_enabled = feedback_enabled and ("relu" in selected_realtime_panels or bool(selected_mechanisms))
     realtime_solver_panels = set()
     if realtime_enabled and "dpll-theory" in selected_realtime_panels:
         realtime_solver_panels.add("dpll_theory")
@@ -938,10 +943,10 @@ def run_vnnlib_verification(
         relu_feedback_output = str(default_paths.feedback_history)
     relu_search_tree_output = (
         str(default_paths.feedback_search_tree)
-        if (feedback_relu_enabled or realtime_relu_enabled)
+        if (feedback_capture_enabled or realtime_capture_enabled)
         else None
     )
-    if realtime_relu_enabled and realtime_log_output is None:
+    if realtime_capture_enabled and realtime_log_output is None:
         realtime_log_output = str(default_paths.realtime_log)
     if realtime_relu_enabled and realtime_split_output is None:
         realtime_split_output = str(default_paths.realtime_image)
@@ -1025,11 +1030,13 @@ def run_vnnlib_verification(
             )
             initial_split_logger.request_update()
             initial_split_visualizer.flush()
+        if realtime_capture_enabled:
             write_relu_search_tree_html(
                 SolveTrace(),
                 relu_search_tree_output,
                 overall_status="RUNNING",
                 title="Realtime ReLU Search Tree",
+                mechanism_panels=selected_mechanisms,
             )
 
         if realtime_solver_enabled:
@@ -1044,27 +1051,25 @@ def run_vnnlib_verification(
                 reset_log=True,
                 enabled_panels=realtime_solver_panels,
                 simplex_detail_stride=100,
-                witness_context={"model_name": Path(model_path).name},
+                witness_context={"model_name": Path(model_path).name,
+                                 "model_layer_sizes": list(info.layer_sizes)},
             )
             initial_progress_logger.request_update()
             initial_progress_visualizer.flush()
             initial_progress_logger.close()
 
-        dashboard_base = (
-            Path(realtime_split_output)
-            if realtime_relu_enabled
-            else Path(solver_realtime_output)
-        )
+        dashboard_base = Path(realtime_split_output or solver_realtime_output or default_paths.realtime_image)
+        embedded_pages = {}
+        if realtime_relu_enabled:
+            embedded_pages["relu-tree"] = relu_search_tree_output
+        if selected_mechanisms:
+            embedded_pages["solver-mechanisms"] = mechanism_report_path(relu_search_tree_output)
         realtime_dashboard_path = dashboard_base.with_suffix(".html")
         UnifiedRealtimeDashboard(
             realtime_panel_outputs,
             realtime_dashboard_path,
             refresh_interval_ms=realtime_refresh_ms,
-            embedded_pages=(
-                {"relu-tree": relu_search_tree_output}
-                if realtime_relu_enabled and relu_search_tree_output is not None
-                else None
-            ),
+            embedded_pages=embedded_pages,
         ).write(open_browser=open_realtime_view)
 
     input_vars = [f"x{index}" for index in range(info.input_size)]
@@ -1136,7 +1141,7 @@ def run_vnnlib_verification(
         result[section]["original_" + source_key] = str(source)
         result[section][source_key] = str(destination.resolve())
 
-    if feedback_relu_enabled and trace is None:
+    if feedback_capture_enabled and trace is None:
         trace = SolveTrace()
 
     progress = None
@@ -1169,6 +1174,7 @@ def run_vnnlib_verification(
             ),
             witness_context={
                 "model_name": Path(model_path).name,
+                "model_layer_sizes": list(info.layer_sizes),
                 "kind": "vnnlib_unsafe",
                 "inputs": {
                     name: {"coeffs": dict(substitutions[name].coeffs),
@@ -1200,13 +1206,14 @@ def run_vnnlib_verification(
             profile_stages=profile_stages,
             # feedback-only는 SolveTrace의 in-memory span으로 사후 그래프를 만들며
             # solving 중 split JSONL open/write/flush를 수행하지 않는다.
-            split_mode="realtime" if realtime_relu_enabled else "off",
+            split_mode="realtime" if realtime_capture_enabled else "off",
             split_log_path=realtime_log_output,
             realtime_output_path=realtime_split_output if realtime_relu_enabled else None,
             realtime_tree_output_path=(
-                relu_search_tree_output if realtime_relu_enabled else None
+                relu_search_tree_output if realtime_capture_enabled else None
             ),
             realtime_tree_title=f"ReLU Search Tree: {Path(model_path).name}",
+            mechanism_panels=selected_mechanisms,
             realtime_open_view=False,
             realtime_playback_ms=realtime_playback_ms,
             realtime_window_seconds=realtime_window_seconds,
@@ -1247,6 +1254,9 @@ def run_vnnlib_verification(
                 "search_tree_output": relu_search_tree_output,
             })
             result["relu_search_tree_output"] = relu_search_tree_output
+        if selected_mechanisms:
+            realtime_result["solver_mechanisms_output"] = str(mechanism_report_path(relu_search_tree_output))
+            result["solver_mechanisms_output"] = str(mechanism_report_path(relu_search_tree_output))
         if realtime_solver_enabled:
             realtime_result["solver_progress"] = {
                 "log_output": solver_progress_log_output,
@@ -1307,7 +1317,7 @@ def run_vnnlib_verification(
             plt.close(fig)
             result["relu_feedback_output"] = relu_feedback_output
 
-        if feedback_relu_enabled and relu_search_tree_output is not None:
+        if feedback_capture_enabled and relu_search_tree_output is not None:
             write_relu_search_tree_html(
                 trace,
                 relu_search_tree_output,
@@ -1315,8 +1325,12 @@ def run_vnnlib_verification(
                 overall_reason=solver_result.reason,
                 title=f"ReLU Search Tree: {Path(model_path).name}",
                 theory_stats=solver_result.theory_stats,
+                mechanism_panels=selected_mechanisms,
             )
-            result["relu_search_tree_output"] = relu_search_tree_output
+            if feedback_relu_enabled:
+                result["relu_search_tree_output"] = relu_search_tree_output
+            if selected_mechanisms:
+                result["solver_mechanisms_output"] = str(mechanism_report_path(relu_search_tree_output))
 
         if feedback_relu_enabled:
             feedback_result = result["visualization"].setdefault("feedback", {})
@@ -1330,6 +1344,9 @@ def run_vnnlib_verification(
                 feedback_result["relu_log_output"] = realtime_log_output
             else:
                 feedback_result["relu_event_source"] = "memory"
+
+    if feedback_enabled and selected_mechanisms:
+        result["visualization"].setdefault("feedback", {})["solver_mechanisms_output"] = str(mechanism_report_path(relu_search_tree_output))
 
     if feedback_solver_enabled and solver_feedback_output is not None:
         if realtime_solver_enabled:
@@ -1591,6 +1608,8 @@ def _print_vnnlib_verification(result: Mapping[str, Any]) -> None:
         print(f"  ReLU full-period feedback: {result['relu_feedback_output']}")
     if result.get("relu_search_tree_output"):
         print(f"  ReLU search tree: {result['relu_search_tree_output']}")
+    if result.get("solver_mechanisms_output"):
+        print(f"  Solver mechanisms: {result['solver_mechanisms_output']}")
     visualization = result.get("visualization", {})
     if visualization.get("mode", "off") != "off":
         print(f"  visualization: {visualization['mode']}")
@@ -1710,10 +1729,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     vnnlib_parser.add_argument(
-        "--realtime-panels",
+        "--panels",
+        dest="realtime_panels",
         nargs="+",
-        choices=("relu", "dpll-theory", "simplex"),
-        help="실행·생성할 시각화 패널 선택; both에서는 feedback에도 적용 (기본: 모두)",
+        choices=("relu", "dpll-theory", "simplex", "mechanisms"),
+        help="시각화 패널 선택 (realtime/feedback 공통, 기본: 모두). mechanisms: 네 검증 기법 통합 프레임",
     )
     vnnlib_parser.add_argument(
         "--realtime-refresh-ms",

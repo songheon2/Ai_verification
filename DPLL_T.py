@@ -274,6 +274,7 @@ def dpll_t_detailed(
     realtime_output_path: Optional[str] = None,
     realtime_tree_output_path: Optional[str] = None,
     realtime_tree_title: str = "Realtime ReLU Search Tree",
+    mechanism_panels=None,
     realtime_open_view: bool = False,
     realtime_playback_ms: int = 0,
     realtime_window_seconds: float = 300.0,
@@ -340,6 +341,7 @@ def dpll_t_detailed(
                 realtime_tree_output_path,
                 theory_stats=theory_stats,
                 title=realtime_tree_title,
+                mechanism_panels=mechanism_panels,
             )
             previous_callback = update_callback
 

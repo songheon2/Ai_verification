@@ -793,11 +793,11 @@ def _constraint_label(item: Mapping[str, Any]) -> str:
 def _annotate_violation_variable_types(axis) -> None:
     """Explain generated variable names without competing with the chart data."""
     axis.text(
-        0.0,
+        1.0,
         -0.16,
         "h: ReLU output  ·  z: value before ReLU  ·  ineq_slack: inequality auxiliary variable",
         transform=axis.transAxes,
-        ha="left",
+        ha="right",
         va="top",
         fontsize=7,
         color="#64748b",
@@ -1224,7 +1224,7 @@ def draw_dpll_theory_panel(
     fig, axes = plt.subplots(
         2,
         2,
-        figsize=(15, max(9, 6 + 0.5 * len(rounds))),
+        figsize=(min(15, 10.5 + max(0, len(rounds) - 1) * 0.5), 7.2),
         gridspec_kw={"height_ratios": [1, 1.25], "width_ratios": [1, 1.7]},
     )
     fig.suptitle(title, fontsize=16, fontweight="bold")
@@ -1235,16 +1235,21 @@ def draw_dpll_theory_panel(
         max(0.0, float(item.get("duration_seconds", 0.0))) for item in rounds
     ]
     colors = [_result_color(item.get("result")) for item in rounds]
-    ax_duration.bar(round_ids, durations, color=colors)
+    round_bars = ax_duration.bar(round_ids, durations, color=colors)
     ax_duration.set_xticks(round_ids)
     for x_pos, duration, item in zip(round_ids, durations, rounds):
         ax_duration.annotate(
-            str(item.get("result", "RUNNING")),
-            (x_pos, duration),
-            xytext=(0, 3),
+            f"{item.get('result', 'RUNNING')}\n{duration:.3f} s",
+            (x_pos, duration / 2),
+            xytext=(0, 0),
             textcoords="offset points",
             ha="center",
+            va="center",
             fontsize=7,
+            multialignment="center",
+            linespacing=1.3,
+            bbox={"boxstyle": "square,pad=0.45", "facecolor": "white",
+                  "edgecolor": "none", "alpha": 0.85},
         )
     ax_duration.set_title("Round duration and result")
     ax_duration.set_xlabel("DPLL round")
@@ -1253,7 +1258,7 @@ def draw_dpll_theory_panel(
     ax_duration.grid(axis="y", alpha=0.3)
 
     call_counts = [int(item.get("simplex_calls", 0)) for item in rounds]
-    ax_calls.bar(round_ids, call_counts, color="#2563eb")
+    call_bars = ax_calls.bar(round_ids, call_counts, color="#2563eb")
     ax_calls.set_xticks(round_ids)
     ax_calls.set_title("Simplex calls per round")
     ax_calls.set_xlabel("DPLL round")
@@ -1261,7 +1266,10 @@ def draw_dpll_theory_panel(
     _set_integer_ticks(ax_calls, "y")
     ax_calls.grid(axis="y", alpha=0.3)
     for x_pos, count in zip(round_ids, call_counts):
-        ax_calls.annotate(str(count), (x_pos, count), ha="center", va="bottom")
+        ax_calls.annotate(str(count), (x_pos, count / 2), xytext=(0, 0),
+                          textcoords="offset points", ha="center", va="center", fontsize=9,
+                          bbox={"boxstyle": "square,pad=0.45", "facecolor": "white",
+                                "edgecolor": "none", "alpha": 0.85})
 
     results = Counter(
         outcome for item in rounds if (outcome := _theory_outcome(item)) is not None
@@ -1279,7 +1287,7 @@ def draw_dpll_theory_panel(
     link_lines = _compact_theory_flow_lines(feedback, rounds)
     ax_links.axis("off")
     ax_links.set_title("Round | selected atoms | Simplex | theory result", loc="left")
-    ax_links.text(
+    flow_text = ax_links.text(
         0.01,
         0.96,
         "\n".join(link_lines) if link_lines else "No theory selection yet",
@@ -1291,19 +1299,19 @@ def draw_dpll_theory_panel(
     )
     solver = feedback.get("solver", {})
     fig.text(
-        0.01,
+        0.09,
         0.01,
         f"rounds={feedback['counts']['rounds']} | solver={solver.get('status', 'RUNNING')} / {solver.get('reason', '-')}",
         fontsize=9,
     )
     model_name = solver.get("witness_context", {}).get("model_name")
     if model_name:
-        fig.text(0.98, 0.055, f"Network: {model_name}",
+        fig.text(0.91, 0.055, f"Network: {model_name}",
                  ha="right", va="bottom", fontsize=11, color="#111827")
         layer_sizes = solver.get("witness_context", {}).get("model_layer_sizes", [])
         if layer_sizes:
             structure = " -> ".join(str(size) for size in layer_sizes)
-            fig.text(0.98, 0.035,
+            fig.text(0.91, 0.035,
                      f"Structure (input -> hidden -> output): {structure} | ReLU: {sum(layer_sizes[1:-1])}",
                      ha="right", va="bottom", fontsize=10, color="#374151")
     witness_lines = _sat_witness_lines(feedback)
@@ -1335,7 +1343,21 @@ def draw_dpll_theory_panel(
                 clip_on=True,
             )
             cursor -= 0.052 * len(value_lines) + 0.035
-    fig.subplots_adjust(left=0.07, right=0.98, top=0.91, bottom=0.14, hspace=0.38, wspace=0.5)
+    fig.subplots_adjust(left=0.09, right=0.91, top=0.91, bottom=0.14, hspace=0.38, wspace=0.5)
+    flow_line_count = max(1, sum(line.count("\n") + 1 for line in link_lines))
+    available_points = ax_links.get_position().height * fig.get_figheight() * 72 * 0.90
+    flow_text.set_fontsize(min(8.5, available_points / (1.2 * flow_line_count)))
+    renderer = fig.canvas.get_renderer()
+    for bars, axis, values in ((call_bars, ax_calls, call_counts),):
+        for bar, label, x_pos, value in zip(bars, axis.texts, round_ids, values):
+            label.update_positions(renderer)
+            label.update_bbox_position_size(renderer)
+            box = label.get_bbox_patch().get_window_extent(renderer)
+            area = bar.get_window_extent(renderer)
+            if area.height < box.height + 8 or area.width < box.width + 8:
+                label.xy = (x_pos, value)
+                label.set_verticalalignment("bottom")
+                label.set_position((0, 6))
     return fig, axes
 
 
@@ -1367,7 +1389,7 @@ def draw_simplex_panel(
 
     feedback = _feedback_from(events_or_path)
     calls = feedback["simplex_calls"]
-    fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+    fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.2))
     ax_duration, ax_work, ax_results, ax_violations = axes.flat
     fig.suptitle(title, fontsize=16, fontweight="bold")
     call_numbers = list(range(1, len(calls) + 1))
@@ -1459,7 +1481,19 @@ def draw_simplex_panel(
         f"calls={feedback['counts']['simplex_calls']} | pivots={feedback['counts']['simplex_pivots']}",
         fontsize=9,
     )
-    fig.subplots_adjust(left=0.07, right=0.80, top=0.91, bottom=0.08, hspace=0.38, wspace=1.05)
+    # Keep useful plot area in each quadrant; long legend labels must not
+    # reserve the width of another graph.
+    import textwrap
+    for axis in axes.flat:
+        legend = axis.get_legend()
+        if legend is not None:
+            for label in legend.get_texts():
+                label.set_text(textwrap.fill(label.get_text(), width=18))
+                label.set_fontsize(8)
+    fig.subplots_adjust(left=0.07, right=0.93, top=0.91, bottom=0.09, hspace=0.48, wspace=0.50)
+    if ax_work.get_legend() is not None:
+        position = ax_work.get_position()
+        ax_work.set_position([position.x0, position.y0, position.width - 0.13, position.height])
     return fig, axes
 
 

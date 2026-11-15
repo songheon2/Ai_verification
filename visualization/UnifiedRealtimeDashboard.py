@@ -8,6 +8,7 @@ from typing import Mapping, Optional
 from urllib.parse import quote
 
 from visualization.RenderProcess import REALTIME_RENDER_INTERVAL_SECONDS
+from visualization.ReluNeuronHover import HOVER_SCRIPT
 import webbrowser
 
 
@@ -72,7 +73,7 @@ class UnifiedRealtimeDashboard:
             title, alt = PANEL_SPECS[name]
             element_id = f"{name}-dashboard"
             sections.append(
-                "    <section>\n"
+                f'    <section class="{name}-section">\n'
                 f"      <h2>{title}</h2>\n"
                 f'      <img id="{element_id}" alt="{alt}">\n'
                 "    </section>"
@@ -93,12 +94,13 @@ class UnifiedRealtimeDashboard:
         for name, page_path in self.embedded_pages.items():
             title, iframe_title = PAGE_SPECS[name]
             element_id = f"{name}-dashboard"
+            section_class = ' class="mechanisms-section"' if name == "solver-mechanisms" else ""
             sections.append(
-                "    <section>\n"
+                f"    <section{section_class}>\n"
                 f"      <h2>{title}</h2>\n"
                 '      <label class="auto-refresh"><input type="checkbox" '
                 f'id="{element_id}-auto" checked> auto refresh</label>\n'
-                f'      <iframe id="{element_id}" title="{iframe_title}"></iframe>\n'
+                f'      <iframe id="{element_id}" title="{iframe_title}" allowfullscreen></iframe>\n'
                 "    </section>"
             )
             try:
@@ -130,11 +132,17 @@ class UnifiedRealtimeDashboard:
     header {{ position: sticky; top: 0; z-index: 2; padding: 14px 20px; background: #111827ee; backdrop-filter: blur(8px); }}
     h1 {{ margin: 0; font-size: 22px; }}
     header p {{ margin: 4px 0 0; color: #94a3b8; }}
-    main {{ max-width: 1550px; margin: 0 auto; padding: 18px; display: grid; gap: 18px; }}
+    main {{ max-width: 1550px; margin: 0 auto; padding: 18px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }}
+    .mechanisms-section {{ width: min(1680px, calc(100vw - 36px)); justify-self: center; box-sizing: border-box; }}
     section {{ padding: 14px; background: #1e293b; border: 1px solid #334155; border-radius: 12px; }}
+    .dpll-theory-section, .simplex-section, .relu-section {{ width: min(100%, 1080px); justify-self: center; box-sizing: border-box; }}
+    .dpll-theory-section {{ width: min(var(--dpll-panel-width, 1080px), calc(100vw - 36px)); }}
     h2 {{ margin: 0 0 10px; font-size: 18px; }}
     img {{ display: block; width: 100%; min-height: 120px; object-fit: contain; background: white; border-radius: 8px; }}
+    #dpll-theory-dashboard, #simplex-dashboard, #relu-dashboard {{ width: 100%; height: auto; margin-inline: auto; }}
+    #dpll-theory-dashboard:not([src]), #simplex-dashboard:not([src]), #relu-dashboard:not([src]) {{ aspect-ratio: 35 / 24; }}
     iframe {{ display: block; width: 100%; height: 760px; border: 0; background: white; color-scheme: light; border-radius: 8px; }}
+    #solver-mechanisms-dashboard {{ height: auto; aspect-ratio: 3 / 2; min-height: 900px; }}
     .auto-refresh {{ display: inline-flex; gap: 6px; align-items: center; margin: -2px 0 10px; color: #cbd5e1; font-size: 13px; }}
     #status {{ color: #22c55e; font-weight: bold; }}
   </style>
@@ -148,6 +156,7 @@ class UnifiedRealtimeDashboard:
 {chr(10).join(sections)}
   </main>
   <script>
+    {HOVER_SCRIPT}
     const panels = {panel_json};
     const pages = {page_json};
     let verificationComplete = false;
@@ -163,9 +172,14 @@ class UnifiedRealtimeDashboard:
         if (panel.finalQueued) {{ panel.finalQueued = false; refreshPanel(panel, true); }}
       }};
       next.onload = () => {{
+        if (panel.id === "dpll-theory-dashboard" && next.naturalHeight > 0) {{
+          const width = Math.max(1050, Math.min(1500, 720 * next.naturalWidth / next.naturalHeight));
+          current.closest("section").style.setProperty("--dpll-panel-width", (width + 30) + "px");
+        }}
         next.id = current.id;
         next.alt = current.alt;
         current.replaceWith(next);
+        if (panel.id === "relu-dashboard") attachReluNeuronHover(next,panel.uri);
         finished();
       }};
       next.onerror = finished;

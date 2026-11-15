@@ -342,6 +342,7 @@ def dpll_t_detailed(
                 theory_stats=theory_stats,
                 title=realtime_tree_title,
                 mechanism_panels=mechanism_panels,
+                model_layer_sizes=model_layer_sizes,
             )
             previous_callback = update_callback
 

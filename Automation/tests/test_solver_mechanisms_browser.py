@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from Automation.tests.test_reactive_tree_browser import chromium_path
@@ -29,7 +30,8 @@ class MechanismBrowserTests(unittest.TestCase):
                           "settings": [{"backjump": True, "drift_threshold": 1e-6}], "eventCount": count,
                           "boundRounds": [{"round_index": 1, "ranges": [
                               {"variable": "z1_0", "state": "unstable", "before": [None,None], "after": [-2,3]},
-                              {"variable": "z1_1", "state": "active", "before": [0,5], "after": [1,2]}]}],
+                              {"variable": "z1_1", "state": "active", "before": [0,5], "after": [1,2]},
+                              {"variable": "z2_49_vnnlib_199", "state": "unstable", "before": [-1,2], "after": [-1,2]}]}],
                           "numericalChecks": [event] if count else [],
                           "numericalPivots": [{"sequence": 3,"coefficient": 1, "zero_threshold": 1e-12}],
                           "eventsByKind": {"numerical": [event] if count else [],
@@ -48,8 +50,9 @@ class MechanismBrowserTests(unittest.TestCase):
                     {"kind":"stable","variable":f"z2_{index}","state":"active","source":"search",
                      "sequence":100+index,"depth":1,"round_index":1,"before":[-1,2],"after":[0,2]}
                     for index in range(65)] if count else []
-                path = write_solver_mechanisms_html(report, root / f"report-{count}.html", status=status,
-                                                    live_snapshots=True, snapshot_version=count + 1)
+                with patch('visualization.LiveSnapshot.INLINE_DATA_LIMIT', 1):
+                    path = write_solver_mechanisms_html(report, root / f"report-{count}.html", status=status,
+                                                        live_snapshots=True, snapshot_version=count + 1)
                 stages.append(path.read_bytes())
                 snapshots.append(snapshot_path(path).read_bytes())
             limited = write_solver_mechanisms_html(report, root / 'limited.html', status='SAT', panels=['numerical','underapprox']).read_bytes()
@@ -61,6 +64,41 @@ class MechanismBrowserTests(unittest.TestCase):
     const frame = document.querySelector('#report');
     await wait(()=>frame.contentDocument?.querySelector('#numericalValue')?.textContent.includes('오차 검사 0'));
     const doc = frame.contentDocument, filter = doc.querySelector('#mechanismFilter');
+    await wait(()=>doc.body.getAttribute('aria-busy')==='false');
+    const recordsPanel=doc.querySelector('#occurrenceRecords');
+    assert(recordsPanel && !recordsPanel.open,'occurrence records are collapsed by default');
+    assert(!doc.querySelector('#events .event'),'collapsed records do not build hidden rows');
+    frame.style.width='1400px';frame.style.height='850px';
+    await wait(()=>frame.contentWindow.innerWidth>=1390);
+    frame.contentWindow.dispatchEvent(new frame.contentWindow.Event('resize'));
+    await new Promise(resolve=>setTimeout(resolve,100));
+    assert([...doc.querySelectorAll('.card')].every(card=>card.getBoundingClientRect().bottom<=frame.contentWindow.innerHeight),'all four techniques fit in the desktop viewport');
+    assert(recordsPanel.getBoundingClientRect().bottom<=frame.contentWindow.innerHeight,'collapsed records header also fits');
+    const compactChartHeight=doc.querySelector('.chart').getBoundingClientRect().height;
+    const modeBox=doc.querySelector('#boundFollowMode').getBoundingClientRect();
+    const playBox=doc.querySelector('#boundPlay').getBoundingClientRect();
+    assert(Math.abs(modeBox.top-playBox.top)<4,'playback buttons sit on the mode toolbar row');
+    assert(doc.querySelector('#boundPending').closest('.bound-toolbar'),'pending count sits on the toolbar row');
+    const toolbarRight=doc.querySelector('.bound-toolbar').getBoundingClientRect().right;
+    assert(Math.abs(doc.querySelector('#boundPending').getBoundingClientRect().right-toolbarRight)<2,'playback and pending count align to toolbar right edge');
+    const chartHeights=[...doc.querySelectorAll('.chart')].map(chart=>chart.getBoundingClientRect().height);
+    assert(Math.max(...chartHeights)-Math.min(...chartHeights)<2,'all four charts share the same display height: '+chartHeights.join(',')+' controls '+[...doc.querySelectorAll('.card-content')].map(item=>item.getBoundingClientRect().height).join(',')+' variable '+doc.documentElement.style.getPropertyValue('--mechanism-controls-height')+' min '+frame.contentWindow.getComputedStyle(doc.querySelector('.card-content')).minHeight);
+    assert([...doc.querySelectorAll('.card')].every(card=>frame.contentWindow.getComputedStyle(card).paddingLeft==='8px'),'four cards share moderate inner margins');
+    const unchangedTextSize=frame.contentWindow.getComputedStyle(doc.querySelector('.value')).fontSize;
+    frame.style.height='1240px';
+    frame.contentWindow.dispatchEvent(new frame.contentWindow.Event('resize'));
+    await new Promise(resolve=>setTimeout(resolve,100));
+    assert(doc.querySelector('.chart').getBoundingClientRect().height>compactChartHeight+100,'larger page grows the picture area substantially');
+    assert(frame.contentWindow.getComputedStyle(doc.querySelector('.value')).fontSize===unchangedTextSize,'picture enlargement does not enlarge UI text');
+    let fullscreenCalls=0;
+    const originalFullscreen=doc.documentElement.requestFullscreen;
+    doc.documentElement.requestFullscreen=()=>{fullscreenCalls++;return Promise.resolve();};
+    doc.querySelector('#expandCharts').click();
+    assert(fullscreenCalls===1,'large-picture button requests the full display');
+    doc.documentElement.requestFullscreen=originalFullscreen;
+    assert(doc.querySelectorAll('.card')[0].getBoundingClientRect().top===doc.querySelectorAll('.card')[1].getBoundingClientRect().top,'techniques form two columns');
+    recordsPanel.querySelector('summary').click();
+    assert(recordsPanel.open,'records expand synchronously');
     assert(!doc.querySelector('#tree'), 'independent report has no search tree');
     assert(doc.querySelectorAll('.card').length===4, 'four mechanism cards');
     assert(doc.querySelectorAll('.chart').length===4, 'four dedicated mechanism charts');
@@ -71,7 +109,9 @@ class MechanismBrowserTests(unittest.TestCase):
     assert(doc.querySelectorAll('.chart-empty').length===2, 'all-boundary option preserves original chart behavior');
     assert(!doc.querySelector('#repairValue,#cyclesValue'),'wrong mechanism panels removed');
     assert(doc.querySelector('#underapproxValue').textContent.includes('미적용'),'underapprox is explicitly not applied');
-    assert(parseFloat(frame.contentWindow.getComputedStyle(doc.body).fontSize)>=20,'larger readable body text');
+    assert(frame.contentWindow.getComputedStyle(doc.body).fontSize==='18px','moderate mechanism body text');
+    assert(frame.contentWindow.getComputedStyle(doc.querySelector('.value')).fontSize==='16px','moderate mechanism values');
+    assert(frame.contentWindow.getComputedStyle(doc.querySelector('.chart')).paddingLeft==='5px','chart padding remains modest but nonzero');
     assert(!doc.querySelector('.description,.chart-note'),'explanatory footnotes removed');
     assert(!doc.body.textContent.includes('항목별 의미가 다르므로'),'old chart note removed');
     assert(doc.documentElement.scrollWidth<=doc.documentElement.clientWidth,'charts fit narrow iframe');
@@ -85,11 +125,20 @@ class MechanismBrowserTests(unittest.TestCase):
     filter.value='bounds';filter.dispatchEvent(new frame.contentWindow.Event('change'));
     assert(doc.querySelectorAll('#events .event').length===65,'all stable records rendered beyond old 50 limit');
     assert([...doc.querySelectorAll('#events .event')].every(row=>row.textContent.includes('STABLE')),'bounds occurrence list contains stable fixations only');
-    assert(doc.querySelector('#events').textContent.includes('z2_0') && doc.querySelector('#events').textContent.includes('z2_64'),'first and last stable records retained');
+    assert(doc.querySelector('#events').textContent.includes('L2:N0') && doc.querySelector('#events').textContent.includes('L2:N64'),'first and last stable records retained');
+    assert(doc.documentElement.scrollHeight>frame.contentWindow.innerHeight,'expanded records scroll the report page');
+    assert(frame.contentWindow.getComputedStyle(doc.querySelector('#events')).maxHeight==='none','records are not trapped in a short inner scrollbar');
+    recordsPanel.querySelector('summary').click();
+    assert(!recordsPanel.open,'records collapse synchronously');
+    recordsPanel.querySelector('summary').click();
+    assert(recordsPanel.open && doc.querySelectorAll('#events .event').length===65,'reopening preserves all records');
     filter.value='numerical';filter.dispatchEvent(new frame.contentWindow.Event('change'));
     scope.value='stable';scope.dispatchEvent(new frame.contentWindow.Event('change'));
     assert(doc.querySelector('#boundStep').max==='65','stable mode keeps every fixation in playback');
     assert(doc.querySelectorAll('.chart')[0].textContent.includes('STABLE'),'stable playback shows fixation rather than ordinary update');
+    assert(doc.querySelector('#boundsValue').textContent.startsWith('R'),'bound playback uses R round prefix');
+    assert(doc.querySelector('#boundsValue').textContent.includes('z (ReLU 적용 전)'),'pre-activation role has a short explanation');
+    assert([...doc.querySelector('#boundRound').options].every(option=>option.textContent.startsWith('R')),'bound round selector uses R prefix');
     scope.value='all';scope.dispatchEvent(new frame.contentWindow.Event('change'));
     assert(doc.querySelector('#boundStep').value==='1','playback begins at first change, not latest');
     assert(doc.querySelector('#boundPending').textContent==='+1개 재생 대기','pending changes counted separately');
@@ -110,10 +159,17 @@ class MechanismBrowserTests(unittest.TestCase):
     assert(filter.value==='numerical' && metric.value==='residual' && epsilon.value==='0.5','terminal refresh keeps controls');
     assert(doc.querySelector('#boundStep').value==='1','new snapshots do not skip queued changes');
     assert(doc.querySelector('#boundPending').textContent==='+3개 재생 대기','new snapshots grow pending count without skipping');
+    const preservedEvent=doc.querySelector('#events .event');
     doc.querySelector('#boundSearchMode').click();
-    const query=doc.querySelector('#boundSearch');query.value='z1_0';query.dispatchEvent(new frame.contentWindow.Event('input'));
+    assert(doc.querySelector('#events .event')===preservedEvent,'button redraw does not rebuild occurrence records');
+    const layerQuery=doc.querySelector('#boundLayerSearch'),query=doc.querySelector('#boundNeuronSearch');
+    layerQuery.value='1';layerQuery.dispatchEvent(new frame.contentWindow.Event('input'));
+    query.value='0 (z)';query.dispatchEvent(new frame.contentWindow.Event('input'));
     assert(doc.querySelector('#boundSearchControls').hidden===false,'search mode controls visible');
-    assert(doc.querySelector('#boundNeuron').options.length===1,'search filters neuron options');
+    assert(doc.querySelector('#boundNeuron').value==='z1_0','separate layer and neuron fields select the intended variable');
+    query.click();
+    assert(doc.querySelectorAll('#boundNeuronSearchChoices [role="option"]').length===3,'filled neuron input shows all recorded values in the layer');
+    doc.querySelector('#boundNeuronSearchChoices [data-value="0 (z)"]').click();
     assert(doc.querySelector('#boundSearchPlayback').hidden===false,'neuron history slider is shown in search mode');
     const neuronStep=doc.querySelector('#boundSearchStep');
     assert(neuronStep.max==='2' && neuronStep.value==='1','neuron history contains only selected neuron changes');
@@ -126,21 +182,22 @@ class MechanismBrowserTests(unittest.TestCase):
     assert(neuronStep.value==='1','neuron previous arrow steps within filtered history');
     doc.querySelector('#boundSearchNext').click();
     assert(neuronStep.value==='2','neuron next arrow steps within filtered history');
-    query.value='z1_1';query.dispatchEvent(new frame.contentWindow.Event('input'));
+    query.value='1 (z)';query.dispatchEvent(new frame.contentWindow.Event('input'));
     assert(neuronStep.max==='1' && neuronStep.disabled,'single-change neuron has a disabled slider');
-    query.value='z1_0';query.dispatchEvent(new frame.contentWindow.Event('input'));
+    query.value='0 (z)';query.dispatchEvent(new frame.contentWindow.Event('input'));
     assert(neuronStep.value==='2','each neuron keeps its own history position');
     frame.contentWindow.postMessage({type:'relu-search-tree-refresh',final:true},'*');
     await new Promise(resolve=>setTimeout(resolve,100));
     assert(neuronStep.value==='2','snapshot refresh preserves searched neuron position');
     await new Promise(resolve=>setTimeout(resolve,3200));
-    assert(doc.querySelectorAll('.chart')[0].textContent.includes('z1_0'),'search remains pinned while following is off');
+    assert(doc.querySelectorAll('.chart')[0].textContent.includes('L1:N0 (z)'),'search remains pinned while following is off');
     doc.querySelector('#boundFollowMode').click();
     assert(doc.querySelector('#boundSearchPlayback').hidden,'search slider hides during global following');
     const started=performance.now();
     await wait(()=>doc.querySelector('#boundStep').value==='2');
     assert(performance.now()-started>=2900,'playback advances at approximately three seconds');
-    assert(doc.querySelectorAll('.chart')[0].textContent.includes('h1_0'),'next change is shown without skipping');
+    assert(doc.querySelectorAll('.chart')[0].textContent.includes('L1:N0 (h)'),'next change is shown without skipping');
+    assert(doc.querySelector('#boundsValue').textContent.includes('h (ReLU 출력)'),'output role has a short explanation');
     const step=doc.querySelector('#boundStep'),skipStarted=performance.now();
     doc.querySelector('#boundNext').click();
     assert(step.value==='3' && performance.now()-skipStarted<500,'right arrow immediately skips current wait');
@@ -148,10 +205,20 @@ class MechanismBrowserTests(unittest.TestCase):
     await wait(()=>step.value==='4');
     assert(doc.querySelector('#boundPlay').textContent==='다시 재생','queued playback finishes after solver terminal status');
     assert(doc.querySelector('#boundPending').textContent==='+0개 재생 대기','pending count reaches zero after playback');
+    doc.querySelector('#boundSearchMode').click();scope.value='all';scope.dispatchEvent(new frame.contentWindow.Event('change'));
+    layerQuery.value='2';layerQuery.dispatchEvent(new frame.contentWindow.Event('input'));
+    query.value='49 (z)';query.dispatchEvent(new frame.contentWindow.Event('input'));
+    assert(doc.querySelector('#boundNeuron').options.length===1 && doc.querySelector('#boundNeuron').value==='z2_49_vnnlib_199','formatted neuron names remain searchable with raw identifiers preserved');
+    assert(doc.querySelector('#boundNeuron').selectedOptions[0].textContent==='L2:N49 (z)','dropdown hides internal suffix');
+    assert(doc.querySelectorAll('.chart')[0].textContent.includes('L2:N49 (z)') && !doc.querySelectorAll('.chart')[0].textContent.includes('_vnnlib_'),'chart uses layer and neuron notation');
+    layerQuery.click();
+    assert(doc.querySelectorAll('#boundLayerSearchChoices [role="option"]').length===2,'filled layer field shows all available layers');
+    assert(!doc.querySelector('#boundSearch'),'old single neuron-name search is removed');
     const limitedFrame=document.createElement('iframe'); limitedFrame.src='/limited.html';document.body.append(limitedFrame);
     await wait(()=>limitedFrame.contentDocument?.querySelectorAll('.chart').length===4);
     const limitedDoc=limitedFrame.contentDocument;
     assert(limitedDoc.querySelectorAll('.card:not([hidden])').length===2,'only selected mechanism panels visible');
+    assert([...limitedDoc.querySelectorAll('.card[hidden]')].every(card=>limitedFrame.contentWindow.getComputedStyle(card).display==='none'),'compact flex layout respects disabled panels');
     assert(![...limitedDoc.querySelector('#mechanismFilter').options].some(option=>option.value==='bounds'),'disabled mechanism absent from filter');
     assert(limitedDoc.querySelectorAll('.card')[0].hidden && !limitedDoc.querySelectorAll('.card')[2].hidden,'numerical independent from bounds');
     const result=document.createElement('pre');result.id='browser-test-result';result.textContent='PASS: independent mechanism refresh';document.body.appendChild(result);

@@ -5,6 +5,17 @@ import tempfile
 from time import sleep
 
 
+def replace_atomic_file(source, destination):
+    for attempt in range(4):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt == 3:
+                raise
+            sleep(0.05 * (2 ** attempt))
+
+
 def write_atomic_text(path, document):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -16,14 +27,8 @@ def write_atomic_text(path, document):
         ) as stream:
             temporary = Path(stream.name)
             stream.write(document)
-        for attempt in range(4):
-            try:
-                os.replace(temporary, path)
-                return path
-            except PermissionError:
-                if attempt == 3:
-                    raise
-                sleep(0.05 * (2 ** attempt))
+        replace_atomic_file(temporary, path)
+        return path
     finally:
         if temporary is not None:
             try:

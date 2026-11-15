@@ -1037,6 +1037,7 @@ def run_vnnlib_verification(
                 overall_status="RUNNING",
                 title="Realtime ReLU Search Tree",
                 mechanism_panels=selected_mechanisms,
+                model_layer_sizes=info.layer_sizes,
             )
 
         if realtime_solver_enabled:
@@ -1326,6 +1327,7 @@ def run_vnnlib_verification(
                 title=f"ReLU Search Tree: {Path(model_path).name}",
                 theory_stats=solver_result.theory_stats,
                 mechanism_panels=selected_mechanisms,
+                model_layer_sizes=info.layer_sizes,
             )
             if feedback_relu_enabled:
                 result["relu_search_tree_output"] = relu_search_tree_output

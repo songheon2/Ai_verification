@@ -29,33 +29,6 @@ import time
 _NEURON_VAR_RE = re.compile(r"^[zh](\d+)_(\d+)(?:_.*)?$")
 
 
-class _RepairBudget:
-    """Node-local failure budget, independent of successful repair attempts."""
-
-    def __init__(self, failure_limit, attempt_limit):
-        self.failure_limit = failure_limit
-        self.attempt_limit = attempt_limit
-        self.attempts = 0
-        self.failures = 0
-        self.by_pair = {}
-        self.unfixable = None
-
-    def charge(self, pair):
-        self.failures += 1
-        self.by_pair[pair] = self.by_pair.get(pair, 0) + 1
-
-    def observe(self, pair, violations, previous_violations):
-        current = set(violations)
-        reviolated = current - set(previous_violations)
-        success = pair not in current
-        direct_failure = not success
-        affected = reviolated | ({pair} if direct_failure else set())
-        self.failures += int(bool(affected))
-        for affected_pair in affected:
-            self.by_pair[affected_pair] = self.by_pair.get(affected_pair, 0) + 1
-        return success, direct_failure, len(reviolated)
-
-
 def _parse_neuron_var(name: str) -> Optional[Tuple[int, int]]:
     match = _NEURON_VAR_RE.match(name)
     return (int(match.group(1)), int(match.group(2))) if match is not None else None
@@ -237,7 +210,6 @@ def reluplex(
     progress: Optional[Any] = None,
     progress_context: Optional[Dict[str, Any]] = None,
     branch_rule: str = "violated",
-    local_repair_max_attempts: Optional[int] = None,
     warm_start: bool = True,
     seed: Optional[int] = 0,
     stats: Optional[Dict[str, Any]] = None,
@@ -250,11 +222,8 @@ def reluplex(
     check_backjump: bool = False,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
-    local_repair_max_iter: 탐색 노드별 수정 실패 시도 예산.
-        수정 후 미해결 또는 새 위반·재위반이 있으면 전체 시도당 1회 소비한다.
-        그 외 성공은 소비하지 않는다. branch_tau는 뉴런별 실패 상한.
-    local_repair_max_attempts: 성공을 포함한 전체 시도 횟수의 별도 안전 상한.
-        None이면 max(100, 활성 ReLU 수*10, 실패 예산*10). 0이면 수정을 생략한다.
+    local_repair_max_iter: 탐색 노드별 전체 수정 시도 횟수 상한.
+        성공 여부와 관계없이 시도마다 1회 소비한다. branch_tau는 뉴런별 시도 상한.
     derive_in_search: 분기로 좁아진 경계로 노드마다 경계 유도를 다시 돌린다
         (논문 5절: "ReLU의 약 10%를 분기하면 경계 유도로 나머지가 전부
         제거되는 경우가 잦았다"). 모순이 나오면 LP를 풀지 않고 그 가지를
@@ -747,40 +716,29 @@ def reluplex(
             return _validated_sat(assign, current_row_defs, bounds_now)
 
         # ── ReLU 위반 수정 (논문 3절 Update_b / Update_f / PivotForRelu) ──
-        # ReLU 수정 뒤 Simplex까지 마친 결과로 성공 여부를 판별한다.
-        # 미해결 또는 새 위반·재위반이 있으면 시도 전체에 1회만 차감한다.
-        # 뉴런별 기록과 전체 시도 횟수, 시간 제한은 별도로 유지한다.
+        # 노드의 tableau를 제자리에서 고치고 Simplex로 경계를 다시 맞춘다.
+        # 성공 여부와 무관하게 시도마다 전체 및 뉴런별 수정 횟수를 늘린다.
         #
         # 예전 구현은 (1) tableau를 통째로 복사해 두 방향 모두 simplex를 끝까지
         # 풀고 할당만 가져왔다 — tableau는 원본 그대로라 다음 수정은 다시 처음
         # 상태에서 시작했다. (2) 횟수를 탐색 전체에서 누적하고 초기화하지 않아,
         # 탐색 초반에는 노드마다 repair를 20번까지 하고 포화된 뒤에는 1번만 했다.
         # ACAS Xu 20개(116초)에서 repair가 시간의 29~52%를 썼다.
-        attempt_limit = (max(100, 10 * len(active), 10 * local_repair_max_iter)
-                         if local_repair_max_attempts is None else max(0, local_repair_max_attempts))
-        budget = _RepairBudget(local_repair_max_iter, attempt_limit)
-        repair_count = budget.by_pair
+        repair_count: Dict[Tuple[str, str], int] = {}
         repair_unknown_reason = None
-        for _ in range(attempt_limit if local_repair_max_iter > 0 else 0):
+        for _ in range(local_repair_max_iter):
             check_deadline(deadline)
-            if budget.failures >= budget.failure_limit:
-                break
             pair = min(violations, key=lambda p: p[0])
             if repair_count.get(pair, 0) >= branch_tau:
                 break
-            budget.attempts += 1
-            _bump("REPAIR_ATTEMPTS")
-            previous_violations = set(violations)
+            repair_count[pair] = repair_count.get(pair, 0) + 1
             with span(trace, "reluplex_repair", depth=depth, branch_x=pair[0]) as repair_event:
                 if _apply_relu_fix(tableau, *pair, depth) is None:
                     # 어느 쪽으로도 범위 안에서 고칠 수 없다 → 분기로만 풀린다
-                    budget.charge(pair)
-                    budget.unfixable = pair
-                    _bump("REPAIR_FAILURES")
-                    _bump("REPAIR_FAILURE_BUDGET_USED")
+                    repair_count[pair] = branch_tau
                     _bump("REPAIR_UNFIXABLE")
                     if repair_event is not None:
-                        repair_event.meta.update(result="UNFIXABLE", failures=budget.failures)
+                        repair_event.meta.update(result="UNFIXABLE")
                     break
                 _bump("REPAIR_STEPS")
                 try:
@@ -819,24 +777,8 @@ def reluplex(
                 return _unsat(depth, "LP", tableau.conflict)
             assign = sol2
             violations = _check_relu_violations(assign, active)
-            success, failed, reviolated = budget.observe(pair, violations, previous_violations)
-            _bump("REPAIR_SUCCESSES", int(success))
-            _bump("REPAIR_FAILURES", int(failed))
-            _bump("REPAIR_REVIOLATIONS", reviolated)
-            budget_used = int(failed or reviolated > 0)
-            _bump("REPAIR_FAILURE_BUDGET_USED", budget_used)
-            if repair_event is not None:
-                repair_event.meta.update(result="RESOLVED" if success else "UNRESOLVED",
-                                         reviolated=reviolated, failures=budget.failures,
-                                         budget_used=budget_used,
-                                         pair_failures=repair_count.get(pair, 0))
             if not violations:
                 return _validated_sat(assign, current_row_defs, bounds_now)
-
-        if budget.failure_limit > 0 and budget.failures >= budget.failure_limit:
-            _bump("REPAIR_FAILURE_LIMIT_REACHED")
-        if local_repair_max_iter > 0 and budget.attempts >= attempt_limit:
-            _bump("REPAIR_ATTEMPT_LIMIT_REACHED")
 
         # ── 분기 변수(branch_x) 선택 ──
         # 원래 Reluplex 규칙은 "repair로 여러 번 고쳐봤는데 계속 말썽인 ReLU를
@@ -847,8 +789,8 @@ def reluplex(
         #   (b) 반대로 지금 위반 중인데 repair에 한 번도 안 뽑힌 ReLU는 후보에서
         #       빠진다. 그래서 쪼갤 게 남아있는데도 branch_x=None으로 포기하는
         #       경우가 생긴다.
-        # 후보는 "지금 위반 중이면서 아직 고정되지 않은 ReLU"다. 수정 불가인
-        # 쌍을 우선하고, 이후 실패·재위반 횟수 내림차순, 동점은 이름순이다.
+        # 후보는 "지금 위반 중이면서 아직 고정되지 않은 ReLU"다.
+        # 수정 시도 횟수 내림차순, 동점은 이름순으로 선택한다.
         # 실행을 결정적으로 만든다 — 예전에는 repair_count가 금세 포화돼서
         # sorted()가 사실상 삽입 순서(=뉴런 번호순)를 돌려주고 있었다.
         def _splittable(px: str) -> bool:
@@ -861,12 +803,12 @@ def reluplex(
             candidates = [p for p in violations if _splittable(p[0])]
             if candidates:
                 branch_x, relu_y = min(
-                    candidates, key=lambda p: (p != budget.unfixable, -repair_count.get(p, 0), p[0])
+                    candidates, key=lambda p: (-repair_count.get(p, 0), p[0])
                 )
         if branch_x is None:
             # legacy 경로 겸 폴백: 위반 중인 후보가 하나도 못 쪼개질 때는
             # 예전처럼 repair 이력 전체에서 고른다.
-            order = sorted(repair_count, key=lambda p: (p != budget.unfixable, -repair_count[p], p[0]))
+            order = sorted(repair_count, key=lambda p: (-repair_count[p], p[0]))
             for pair in order:
                 if _splittable(pair[0]):
                     branch_x, relu_y = pair

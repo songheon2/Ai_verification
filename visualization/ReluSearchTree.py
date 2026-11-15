@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from visualization.NetworkLayout import parse_neuron_var
 from visualization.AtomicFile import write_atomic_text
-from visualization.LiveSnapshot import snapshot_path, write_snapshot
+from visualization.LiveSnapshot import initial_page_data
 from visualization.SolveTrace import SolveTrace, TraceEvent
 from visualization.SolverMechanisms import mechanism_report_path, write_solver_mechanisms_html
 
@@ -291,6 +291,11 @@ def build_stable_records(trace: SolveTrace) -> List[Dict[str, Any]]:
     return records
 
 
+def preview_tree(full):
+    return {**full, "roots": [{**root, "children": []} for root in full["roots"][:20]],
+            "stableRecords": []}
+
+
 def write_relu_search_tree_html(
     trace: SolveTrace,
     output_path: str | Path,
@@ -303,8 +308,9 @@ def write_relu_search_tree_html(
     live_snapshots=False,
     snapshot_only=False,
     snapshot_version=None,
+    model_layer_sizes=None,
 ) -> Path:
-    """Write a standalone HTML report; no server or external library is required."""
+    """Write an offline report; large histories use an adjacent snapshot file."""
     roots = build_relu_search_tree(trace, overall_status=overall_status)
     serialized_nodes: List[Dict[str, Any]] = []
 
@@ -389,6 +395,7 @@ def write_relu_search_tree_html(
             mechanisms["totals"][field] = max(mechanisms["totals"].get(field, 0), stats.get(stat, 0))
     payload = {
         "title": title,
+        "modelLayerSizes": list(model_layer_sizes or []),
         "status": str(overall_status).upper(),
         "reason": overall_reason,
         "roots": roots,
@@ -423,11 +430,14 @@ def write_relu_search_tree_html(
         )
     if live_snapshots:
         payload["snapshotVersion"] = snapshot_version
-        payload["snapshotFile"] = snapshot_path(output_path).name
-        write_snapshot(output_path, payload, "relu-search-tree-snapshot")
+    data = initial_page_data(
+        output_path, payload, "relu-search-tree-snapshot",
+        preview_tree,
+        live_snapshots=live_snapshots, snapshot_only=snapshot_only,
+    )
     if snapshot_only:
         return Path(output_path)
-    data = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    data = data.replace("</", "<\\/")
     script = _TREE_SCRIPT.replace("__DATA__", data)
     document = _HTML.replace("__SCRIPT__", script).replace("__STYLES__", _TREE_STYLES).replace("__TITLE__", escape(title))
     return write_atomic_text(output_path, document)
@@ -654,6 +664,7 @@ class RealtimeSearchTreeVisualizer:
         title: str = "Realtime ReLU Search Tree",
         mechanism_panels=None,
         update_interval_seconds: float = 3.0,
+        model_layer_sizes=None,
     ) -> None:
         self.log_path = Path(log_path)
         self.output_path = Path(output_path)
@@ -662,6 +673,7 @@ class RealtimeSearchTreeVisualizer:
         self.theory_stats = theory_stats
         self.title = title
         self.mechanism_panels = mechanism_panels
+        self.model_layer_sizes = list(model_layer_sizes or [])
         self._lock = threading.Lock()
         self._pending = False
         self._worker: Optional[threading.Thread] = None
@@ -706,6 +718,7 @@ class RealtimeSearchTreeVisualizer:
             live_snapshots=True,
             snapshot_only=self._published and self.output_path.exists() and status == "RUNNING",
             snapshot_version=self._snapshot_version + 1,
+            model_layer_sizes=self.model_layer_sizes,
         )
         self._snapshot_version += 1
         self._published_signature = signature

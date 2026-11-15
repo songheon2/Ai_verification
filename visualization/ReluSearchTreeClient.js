@@ -43,10 +43,67 @@
   let timelinePage = Math.max(0, Number(savedState.timelinePage) || 0);
   let stablePage = Math.max(0, Number(savedState.stablePage) || 0);
   let DATA;
+  let SEARCH_CATALOG = new Map();
+  const searchCombos=[];
+  for (const [inputId, listId] of [['layerFilter','layerOptions'],['neuronFilter','neuronOptions']]) {
+    const input=$('#'+inputId), list=document.createElement('datalist');
+    list.id=listId;document.body.append(list);
+    input.setAttribute('autocomplete','off');
+    input.setAttribute('aria-label',inputId==='layerFilter'?'Layer 번호 입력 또는 선택':'Neuron 번호 입력 또는 선택');
+    const wrapper=document.createElement('div'),button=document.createElement('button'),popup=document.createElement('div');
+    wrapper.className='neuron-combo';button.type='button';button.textContent='▾';
+    button.setAttribute('aria-label',inputId==='layerFilter'?'전체 레이어 목록':'해당 레이어 기록 있는 뉴런 목록');
+    popup.id=inputId+'Choices';popup.className='neuron-choices';popup.hidden=true;popup.setAttribute('role','listbox');
+    input.setAttribute('role','combobox');input.setAttribute('aria-autocomplete','none');
+    input.setAttribute('aria-controls',popup.id);input.setAttribute('aria-expanded','false');
+    input.before(wrapper);wrapper.append(input,button,popup);
+    const close=()=>{popup.hidden=true;input.setAttribute('aria-expanded','false');};
+    const render=()=>{
+      if(popup.hidden)return;
+      popup.replaceChildren(...[...list.options].map(option=>{
+        const choice=document.createElement('button');choice.type='button';choice.textContent=option.label;
+        choice.dataset.value=option.value;choice.setAttribute('role','option');
+        choice.setAttribute('aria-selected',String(option.value===input.value));
+        choice.onclick=()=>{input.value=option.value;input.dispatchEvent(new Event('input',{bubbles:true}));close();input.focus({preventScroll:true});};
+        return choice;
+      }));
+      if(!popup.children.length){const empty=document.createElement('div');empty.className='meta';empty.textContent=inputId==='neuronFilter'?($('#layerFilter').value.trim()?'기록 있는 뉴런 없음':'레이어를 먼저 선택하세요'):'레이어 정보 없음';popup.append(empty);}
+    };
+    const open=()=>{for(const combo of searchCombos)combo.close();popup.hidden=false;input.setAttribute('aria-expanded','true');render();popup.scrollTop=0;};
+    button.onclick=()=>popup.hidden?open():close();input.addEventListener('click',open);
+    input.addEventListener('input',render);
+    input.addEventListener('keydown',event=>{if(event.key==='ArrowDown'){event.preventDefault();open();popup.querySelector('button')?.focus();}else if(event.key==='Escape')close();});
+    popup.addEventListener('keydown',event=>{
+      if(event.key==='Escape'){close();input.focus();return;}
+      if(!['ArrowDown','ArrowUp'].includes(event.key))return;
+      event.preventDefault();const choices=[...popup.querySelectorAll('button')],index=choices.indexOf(document.activeElement);
+      choices[Math.max(0,Math.min(choices.length-1,index+(event.key==='ArrowDown'?1:-1)))]?.focus();
+    });
+    searchCombos.push({wrapper,close,render});
+  }
+  document.addEventListener('click',event=>{for(const combo of searchCombos)if(!combo.wrapper.contains(event.target))combo.close();});
+  function syncSearchChoices() {
+    const replace=(id,entries)=>{
+      const list=$('#'+id),key=JSON.stringify(entries);
+      if(list.dataset.key===key)return;
+      list.dataset.key=key;
+      list.replaceChildren(...entries.map(([value,label])=>{
+        const option=document.createElement('option');option.value=String(value);option.label=label;return option;
+      }));
+    };
+    const layers=[...SEARCH_CATALOG.keys()].sort((a,b)=>a-b);
+    replace('layerOptions',layers.map(layer=>[layer,`Layer ${layer} · ${SEARCH_CATALOG.get(layer).size} neurons`]));
+    const selected=$('#layerFilter').value.trim();
+    const neurons=selected===''?new Set():
+      SEARCH_CATALOG.get(Number(selected)) || new Set();
+    replace('neuronOptions',[...neurons].sort((a,b)=>a-b).map(neuron=>[neuron,`Neuron ${neuron}`]));
+    for(const combo of searchCombos)combo.render();
+  }
   let ALL = [];
   let SCOPED = [];
   let scopeIds = new Set();
   let scopeRootId = savedState.scopeRootId ?? null;
+  let deferredScopeRootId = null;
   const scopeViews = new Map(Object.entries(savedState.scopeViews || {}));
   let subtreeSearch = savedState.subtreeSearch === true;
   let subtreeSearchRoots = [];
@@ -70,6 +127,37 @@
   let TIMELINE = [];
   let snapshotFrame = null;
   let snapshotPending = false;
+  const SCROLL_IDLE_MS = 220;
+  let lastScrollInput = -Infinity, scrollIdleTimer = null;
+  let queuedSnapshot = null, queuedSnapshotRequest = false, scrollbarDragging = false;
+  const scrollActive = () => performance.now() - lastScrollInput < SCROLL_IDLE_MS;
+  function settleScroll() {
+    if (scrollIdleTimer !== null) clearTimeout(scrollIdleTimer);
+    scrollIdleTimer = setTimeout(() => {
+      scrollIdleTimer = null;
+      if (scrollActive() || scrollbarDragging) {settleScroll();return;}
+      if (queuedSnapshot) {const latest=queuedSnapshot;queuedSnapshot=null;applySnapshot(latest,false);}
+      if (queuedSnapshotRequest) {queuedSnapshotRequest=false;requestSnapshot();}
+    }, SCROLL_IDLE_MS);
+  }
+  function noteScrollInput() {lastScrollInput=performance.now();settleScroll();}
+  document.addEventListener('wheel',noteScrollInput,{passive:true,capture:true});
+  document.addEventListener('touchmove',noteScrollInput,{passive:true,capture:true});
+  document.addEventListener('pointerdown',event=>{
+    const viewport=$('#treeViewport'),box=viewport.getBoundingClientRect();
+    scrollbarDragging=event.target===viewport &&
+      (event.clientX>=box.left+viewport.clientWidth || event.clientY>=box.top+viewport.clientHeight);
+    if(scrollbarDragging)noteScrollInput();
+  },{passive:true,capture:true});
+  document.addEventListener('pointermove',()=>{if(scrollbarDragging)noteScrollInput();},{passive:true,capture:true});
+  const endScrollbarDrag=()=>{if(scrollbarDragging){scrollbarDragging=false;noteScrollInput();}};
+  document.addEventListener('pointerup',endScrollbarDrag,{passive:true,capture:true});
+  document.addEventListener('pointercancel',endScrollbarDrag,{passive:true,capture:true});
+  window.addEventListener('blur',endScrollbarDrag);
+  document.addEventListener('keydown',event=>{
+    if(!event.target.closest?.('input,select,textarea,[contenteditable="true"]') &&
+       ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','PageUp','PageDown','Home','End',' '].includes(event.key))noteScrollInput();
+  },{capture:true});
   let standaloneTimer = null;
   let lastStatus = null;
 
@@ -167,7 +255,11 @@
   function indexData(data) {
     const previous = NODE_BY_ID;
     const hadSnapshot = DATA !== undefined;
-    DATA = data;
+    DATA = {...data,modelLayerSizes:data.modelLayerSizes?.length?data.modelLayerSizes:DATA?.modelLayerSizes || []};
+    document.body.setAttribute('aria-busy', String(Boolean(data.deferredData)));
+    if (!data.deferredData && deferredScopeRootId !== null) {
+      scopeRootId = deferredScopeRootId; deferredScopeRootId = null;
+    }
     ALL = [];
     const pending = [...DATA.roots].reverse();
     while (pending.length) {
@@ -188,6 +280,18 @@
         }
       }
     }
+    SEARCH_CATALOG = new Map();
+    const sizes=DATA.modelLayerSizes;
+    for(let layer=1;layer<sizes.length-1;layer++) {
+      SEARCH_CATALOG.set(layer,new Set());
+    }
+    for(const node of [...ALL,...(DATA.stableRecords || [])]) {
+      const layer=node.layer,neuron=node.neuron;
+      if(!Number.isInteger(layer)||!Number.isInteger(neuron))continue;
+      if(!SEARCH_CATALOG.has(layer))SEARCH_CATALOG.set(layer,new Set());
+      SEARCH_CATALOG.get(layer).add(neuron);
+    }
+    syncSearchChoices();
     updateScopeIndex();
     updateFilterIndex();
   }
@@ -197,7 +301,10 @@
     return scopeRootId === null ? DATA.roots : [NODE_BY_ID.get(scopeRootId)];
   }
   function updateScopeIndex() {
-    if (scopeRootId !== null && !NODE_BY_ID.has(scopeRootId)) scopeRootId = null;
+    if (scopeRootId !== null && !NODE_BY_ID.has(scopeRootId)) {
+      if (DATA.deferredData) deferredScopeRootId = scopeRootId;
+      scopeRootId = null;
+    }
     subtreeSearchRoots = []; subtreeTargetIds.clear();
     if (subtreeSearch) {
       const layer = $('#layerFilter').value.trim(), neuron = $('#neuronFilter').value.trim();
@@ -609,15 +716,16 @@
     if (window.parent !== window) window.parent.postMessage({type: 'relu-search-tree-status', status: DATA.status}, '*');
     if (DATA.status !== 'RUNNING' && standaloneTimer !== null) { clearInterval(standaloneTimer); standaloneTimer = null; }
   }
-  function applySnapshot(data) {
+  function applySnapshot(data, allowFollow = true) {
     if (!data || !Array.isArray(data.roots)) return;
     if (data.snapshotVersion != null && data.snapshotVersion === DATA.snapshotVersion) return;
+    if (scrollActive() || scrollbarDragging) {queuedSnapshot=data;settleScroll();return;}
     const scrollX = window.scrollX, scrollY = window.scrollY, timelineScroll = readPanelScroll('timeline');
     const stableScroll = readPanelScroll('stable');
     const treeScrollLeft = $('#treeViewport').scrollLeft, treeScrollTop = $('#treeViewport').scrollTop;
     const previousLatest = latestNodeId;
     indexData(data);
-    const follow = trackLatestPath && latestNodeId !== null && latestNodeId !== previousLatest;
+    const follow = allowFollow && trackLatestPath && latestNodeId !== null && latestNodeId !== previousLatest;
     if (DATA.status !== 'RUNNING') trackLatestPath = false;
     renderMetrics(); renderTree(); renderTimeline(); renderStableRecords();
     sizeTreeViewport();
@@ -631,6 +739,7 @@
   }
   function requestSnapshot() {
     if (snapshotPending || DATA.status !== 'RUNNING') return;
+    if(scrollActive() || scrollbarDragging){queuedSnapshotRequest=true;settleScroll();return;}
     if (!snapshotFrame) {
       snapshotFrame = document.createElement('iframe');
       snapshotFrame.hidden = true; snapshotFrame.id = 'treeSnapshotLoader';
@@ -757,8 +866,18 @@
   }
   for (const panel of reportPanels) {
     panel.element.open = savedState.reportPanels?.[panel.key] !== false;
-    panel.element.querySelector(':scope > summary').addEventListener('click', () => readPanelScroll(panel.key));
+    panel.appliedOpen = panel.element.open;
+    panel.element.querySelector(':scope > summary').addEventListener('click', event => {
+      event.preventDefault();
+      readPanelScroll(panel.key);
+      panel.element.open = !panel.element.open;
+      panel.appliedOpen = panel.element.open;
+      if (panel.element.open) { panel.render(); panel.list.scrollTop = panel.scroll; }
+      renderPanelToggle(); saveState();
+    });
     panel.element.addEventListener('toggle', () => {
+      if (panel.appliedOpen === panel.element.open) return;
+      panel.appliedOpen = panel.element.open;
       if (panel.element.open) {
         panel.render(); panel.list.scrollTop = panel.scroll;
       }
@@ -770,6 +889,7 @@
     for (const panel of reportPanels) {
       readPanelScroll(panel.key);
       panel.element.open = open;
+      panel.appliedOpen = open;
       if (open) { panel.render(); panel.list.scrollTop = panel.scroll; }
     }
     renderPanelToggle(); saveState();
@@ -813,7 +933,7 @@
     updateFilterIndex(); renderTree();
     $('#treeViewport').scrollTo(0, 0); saveState();
   };
-  $('#layerFilter').oninput = filterChanged;
+  $('#layerFilter').oninput = () => {syncSearchChoices();filterChanged();};
   $('#neuronFilter').oninput = filterChanged;
   $('#findAncestors').onclick = findAncestorPaths;
   $('#findSubtrees').onclick = findSubtrees;
@@ -847,4 +967,5 @@
   if (trackLatestPath) revealRecentPath(false);
   if (window.parent === window && DATA.status === 'RUNNING') standaloneTimer = setInterval(requestSnapshot, 2000);
   announceStatus();
+  if (DATA.snapshotFile) requestAnimationFrame(() => setTimeout(requestSnapshot, 0));
 })();

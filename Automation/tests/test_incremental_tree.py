@@ -1,5 +1,6 @@
 """Correctness and work-count checks for incremental realtime reports."""
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -7,7 +8,10 @@ from unittest.mock import patch
 
 from visualization.LiveSnapshot import snapshot_path
 from visualization.ReluSearchTree import BranchLogReader, RealtimeSearchTreeVisualizer, trace_from_branch_log
-from visualization.SolverMechanisms import mechanism_report_path
+from visualization.ReluSearchTree import write_relu_search_tree_html
+from visualization.SolverMechanisms import mechanism_report_path, write_solver_mechanisms_html
+from visualization.SolveTrace import SolveTrace, TraceEvent
+from visualization.UpgradeReport import upgrade_saved_report
 
 
 def start_record(name="b", variable="z1_0"):
@@ -21,6 +25,71 @@ def append(path, record):
 
 
 class IncrementalTreeTests(unittest.TestCase):
+    def test_completed_legacy_report_can_be_upgraded_without_losing_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            page = root / 'tree_mechanisms.html'
+            report = {'available': True, 'totals': {'drift_checks': 2},
+                      'events': [{'kind': 'numerical', 'sequence': index} for index in range(2)]}
+            write_solver_mechanisms_html(report, page, status='RUNNING', title='Archived report', panels=['numerical'])
+            (root / 'result.json').write_text(json.dumps({'solver': {'status': 'UNKNOWN', 'reason': 'TIMEOUT'}}), encoding='utf-8')
+            upgrade_saved_report(page)
+            html = page.read_text(encoding='utf-8')
+            preview = json.loads(re.search(r'const INITIAL_DATA = (.*);', html).group(1))
+            self.assertEqual(preview['title'], 'Archived report')
+            self.assertEqual(preview['panels'], ['numerical'])
+            self.assertEqual(preview['report']['totals']['drift_checks'], 2)
+            snapshot = snapshot_path(page).read_text(encoding='utf-8')
+            self.assertIn('data.status="UNKNOWN"', snapshot)
+            self.assertIn('"sequence": 1', snapshot)
+            upgrade_saved_report(page)
+            self.assertEqual(snapshot_path(page).read_text(encoding='utf-8'), snapshot)
+
+    def test_upgrader_refuses_run_without_completed_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page = Path(directory) / 'tree_mechanisms.html'
+            write_solver_mechanisms_html({}, page, status='RUNNING')
+            previous = page.read_bytes()
+            with self.assertRaises(FileNotFoundError):
+                upgrade_saved_report(page)
+            self.assertEqual(page.read_bytes(), previous)
+
+    def test_large_tree_bootstraps_without_blocking_on_full_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page = Path(directory) / 'tree.html'
+            trace = SolveTrace(events=[
+                TraceEvent('reluplex_branch', 1, 4, 1, 'z1_0', {'phase': '+', 'result': 'UNSAT'}),
+                TraceEvent('reluplex_branch', 2, 3, 2, 'z2_0', {'phase': '+', 'result': 'UNSAT'}),
+            ])
+            with patch('visualization.LiveSnapshot.INLINE_DATA_LIMIT', 1):
+                write_relu_search_tree_html(trace, page, overall_status='UNSAT')
+            html = page.read_text(encoding='utf-8')
+            preview = json.loads(re.search(r'const INITIAL_DATA = (.*);', html).group(1))
+            self.assertTrue(preview['deferredData'])
+            self.assertEqual(preview['status'], 'RUNNING')
+            self.assertFalse(preview['roots'][0]['children'])
+            snapshot = snapshot_path(page).read_text(encoding='utf-8')
+            data = json.loads(snapshot.split('parent.postMessage(', 1)[1].rsplit(',"*");', 1)[0])['data']
+            self.assertEqual(data['status'], 'UNSAT')
+            self.assertEqual(len(data['roots'][0]['children']), 1)
+
+    def test_large_mechanisms_keep_initial_totals_and_all_history_in_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page = Path(directory) / 'mechanisms.html'
+            report = {'available': True, 'totals': {'drift_checks': 120},
+                      'boundHistory': [{'variable': 'z1_0', 'after': [0, index]} for index in range(100)],
+                      'events': [{'kind': 'numerical', 'sequence': index} for index in range(120)]}
+            with patch('visualization.LiveSnapshot.INLINE_DATA_LIMIT', 1):
+                write_solver_mechanisms_html(report, page, status='TIMEOUT')
+            preview = json.loads(re.search(r'const INITIAL_DATA = (.*);', page.read_text(encoding='utf-8')).group(1))
+            self.assertEqual(preview['report']['totals']['drift_checks'], 120)
+            self.assertNotIn('boundHistory', preview['report'])
+            snapshot = snapshot_path(page).read_text(encoding='utf-8')
+            data = json.loads(snapshot.split('parent.postMessage(', 1)[1].rsplit(',"*");', 1)[0])['data']
+            self.assertEqual(data['status'], 'TIMEOUT')
+            self.assertEqual(len(data['report']['boundHistory']), 100)
+            self.assertEqual(len(data['report']['events']), 120)
+
     def test_only_new_lines_are_decoded_and_open_branch_is_updated_in_place(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "branches.jsonl"

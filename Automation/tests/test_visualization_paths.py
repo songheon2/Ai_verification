@@ -598,6 +598,105 @@ class RealtimeSearchTreeTests(unittest.TestCase):
 
 
 class TheoryFlowLabelTests(unittest.TestCase):
+    def test_simplex_call_counts_are_centered_unless_bar_is_too_small(self):
+        import matplotlib.pyplot as plt
+        from visualization.SolverProgress import draw_dpll_theory_panel
+        figure, axes = draw_dpll_theory_panel([
+            {'event': 'round_end', 'round': 1, 'simplex_calls': 100, 'duration_seconds': 1, 'result': 'THEORY_CONFLICT'},
+            {'event': 'round_end', 'round': 2, 'simplex_calls': 1, 'duration_seconds': 0.01, 'result': 'BOOLEAN_UNSAT'},
+        ])
+        try:
+            labels = axes.flat[1].texts
+            self.assertEqual([label.get_text() for label in labels], ['100', '1'])
+            self.assertEqual(labels[0].xy, (1, 50))
+            self.assertEqual(labels[0].get_verticalalignment(), 'center')
+            self.assertEqual(labels[1].xy, (2, 1))
+            self.assertEqual(labels[1].get_verticalalignment(), 'bottom')
+        finally:
+            plt.close(figure)
+
+    def test_bound_variable_note_does_not_extend_right_of_graph(self):
+        import matplotlib.pyplot as plt
+        from visualization.SolverProgress import draw_simplex_panel
+        figure, axes = draw_simplex_panel([])
+        try:
+            figure.canvas.draw()
+            axis = axes.flat[3]
+            note = next(text for text in axis.texts if text.get_text().startswith('h: ReLU'))
+            renderer = figure.canvas.get_renderer()
+            self.assertLessEqual(note.get_window_extent(renderer).x1,
+                                 axis.get_window_extent(renderer).x1 + 1)
+        finally:
+            plt.close(figure)
+
+    def test_simplex_quadrants_keep_useful_plot_area(self):
+        import matplotlib.pyplot as plt
+        from visualization.SolverProgress import draw_simplex_panel
+        figure, axes = draw_simplex_panel([])
+        try:
+            self.assertEqual(tuple(figure.get_size_inches()), (10.5, 7.2))
+            self.assertAlmostEqual(axes.flat[0].get_position().x0,
+                                   1 - axes.flat[3].get_position().x1)
+            for axis in axes.flat:
+                self.assertGreater(axis.get_position().width, 0.29)
+                self.assertGreater(axis.get_position().height, 0.32)
+        finally:
+            plt.close(figure)
+
+    def test_round_labels_stay_centered_even_in_short_bars(self):
+        import matplotlib.pyplot as plt
+        from visualization.SolverProgress import draw_dpll_theory_panel
+        events = [{'event': 'round_end', 'round': 1, 'result': 'CONFLICT',
+                   'duration_seconds': 1.23456},
+                  {'event': 'round_end', 'round': 2, 'result': 'BOOLEAN_UNSAT',
+                   'duration_seconds': 0.001}]
+        for finished in (False, True):
+            with self.subTest(finished=finished):
+                figure, axes = draw_dpll_theory_panel(events + ([
+                    {'event': 'solver_end', 'status': 'UNSAT', 'rounds': 2}
+                ] if finished else []))
+                try:
+                    ticks = [label.get_text() for label in axes.flat[0].get_xticklabels()]
+                    self.assertEqual(ticks, ['1', '2'])
+                    label = axes.flat[0].get_xlabel()
+                    self.assertEqual(label, 'DPLL round')
+                    annotations = axes.flat[0].texts
+                    figure.canvas.draw()
+                    self.assertEqual([text.get_text() for text in annotations],
+                                     ['CONFLICT\n1.235 s', 'BOOLEAN_UNSAT\n0.001 s'])
+                    for text, x, duration in zip(annotations, [1, 2], [1.23456, 0.001]):
+                        self.assertEqual(text.xy, (x, duration / 2))
+                        self.assertEqual(text.get_verticalalignment(), 'center')
+                        self.assertEqual(text.get_position(), (0, 0))
+                        renderer = figure.canvas.get_renderer()
+                        content = text.get_window_extent(renderer)
+                        box = text.get_bbox_patch().get_window_extent(renderer)
+                        margins = [content.x0-box.x0, box.x1-content.x1,
+                                   content.y0-box.y0, box.y1-content.y1]
+                        self.assertLess(max(margins)-min(margins), 1.0)
+                finally:
+                    plt.close(figure)
+
+    def test_base_panels_match_and_only_dpll_can_grow_horizontally(self):
+        import matplotlib.pyplot as plt
+        from visualization.SolverProgress import draw_dpll_theory_panel, draw_simplex_panel
+        events = [{'event': 'round_end', 'round': 1, 'result': 'THEORY_CONFLICT',
+                   'duration_seconds': 1}]
+        base, _ = draw_dpll_theory_panel(events)
+        simplex, _ = draw_simplex_panel(events)
+        expanded, _ = draw_dpll_theory_panel(events + [
+            {'event': 'round_end', 'round': 2, 'result': 'BOOLEAN_UNSAT', 'duration_seconds': 1}])
+        try:
+            self.assertEqual(tuple(base.get_size_inches()), (10.5, 7.2))
+            self.assertAlmostEqual(base.subplotpars.left, 0.09)
+            self.assertAlmostEqual(1-base.subplotpars.right, 0.09)
+            self.assertEqual(tuple(simplex.get_size_inches()), (10.5, 7.2))
+            self.assertGreater(expanded.get_figwidth(), base.get_figwidth())
+            self.assertEqual(expanded.get_figheight(), base.get_figheight())
+        finally:
+            for figure in (base, simplex, expanded):
+                plt.close(figure)
+
     def test_many_rounds_stay_above_network_footer(self):
         import matplotlib.pyplot as plt
         from visualization.SolverProgress import draw_dpll_theory_panel
@@ -608,6 +707,7 @@ class TheoryFlowLabelTests(unittest.TestCase):
                            {'event':'round_end','round':index,'result':'THEORY_CONFLICT','duration_seconds':1}])
         figure, axes = draw_dpll_theory_panel(events)
         try:
+            self.assertEqual(tuple(figure.get_size_inches()), (15, 7.2))
             figure.canvas.draw()
             renderer = figure.canvas.get_renderer()
             flow = axes.flat[3]
@@ -615,6 +715,8 @@ class TheoryFlowLabelTests(unittest.TestCase):
             box = text.get_window_extent(renderer)
             network = next(label for label in figure.texts if label.get_text().startswith('Network:'))
             footer_box = network.get_window_extent(renderer)
+            totals_box = axes.flat[0].xaxis.label.get_window_extent(renderer)
+            self.assertGreater(totals_box.y0, axes.flat[2].title.get_window_extent(renderer).y1)
             self.assertIn('R16 |',text.get_text())
             self.assertGreaterEqual(box.y0, flow.get_window_extent(renderer).y0)
             self.assertGreater(box.y0, footer_box.y1 + 10)

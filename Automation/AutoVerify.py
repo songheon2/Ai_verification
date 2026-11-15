@@ -171,6 +171,7 @@ from DPLL import (
     TrueProp,
 )
 from DPLL_T import dpll_t_detailed
+from Reluplex import FEATURES, feature_options
 from GenericNNEncoding import NNModel, encode_nn
 from Automation.ModelInspector import (
     ModelInfo,
@@ -570,6 +571,7 @@ def run_verification(
     simplex_max_iter_override: Optional[int] = None,
     max_recursion_override: Optional[int] = None,
     profile_stages: bool = False,
+    reluplex_options: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     model, info = load_model_for_verification(model_path)
     _validate_contract(spec, info)
@@ -686,6 +688,7 @@ def run_verification(
                 simplex_max_iter=simplex_max_iter,
                 max_recursion=max_recursion,
                 profile_stages=profile_stages,
+                reluplex_options=dict(reluplex_options) if reluplex_options else None,
             )
             result["solver"] = {
                 **solver_result.to_dict(),
@@ -693,6 +696,7 @@ def run_verification(
                 "timeout_seconds": timeout_seconds,
                 "simplex_max_iter": simplex_max_iter,
                 "max_recursion": max_recursion,
+                "reluplex_options": dict(reluplex_options or {}),
             }
             if solver_result.status == SolverStatus.SAT:
                 counterexample = _counterexample(
@@ -851,6 +855,7 @@ def run_vnnlib_verification(
     split_heatmap_threshold: float = 1,
     split_heatmap_cap: int = 20,
     profile_stages: bool = False,
+    reluplex_options: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """VNNLIB이 정의한 unsafe 영역과 신경망의 교집합을 직접 탐색한다.
 
@@ -1220,6 +1225,7 @@ def run_vnnlib_verification(
             realtime_window_seconds=realtime_window_seconds,
             model_layer_sizes=info.layer_sizes,
             progress=progress,
+            reluplex_options=dict(reluplex_options) if reluplex_options else None,
         )
     finally:
         if progress is not None:
@@ -1232,6 +1238,7 @@ def run_vnnlib_verification(
         "timeout_seconds": timeout_seconds,
         "simplex_max_iter": simplex_max_iter,
         "max_recursion": max_recursion,
+        "reluplex_options": dict(reluplex_options or {}),
     }
     if progress_visualizer is not None:
         progress_visualizer.flush()
@@ -1686,6 +1693,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="override solver.max_recursion from the spec (기본 50). 은닉 ReLU가 이 값보다 "
              "많으면 탐색이 끝까지 못 내려가 UNKNOWN이 된다 - recursion_limit_hits 참고",
     )
+    verify_parser.add_argument(
+        "--features", default="default",
+        help="Reluplex 구현 기법 켜기/끄기 (기능별 비교 실험용). 쉼표로 구분: "
+        + ", ".join(FEATURES)
+        + " (1 경계 유도, 2 백점프, 3 부동소수 안전장치, 4 과소근사). "
+        "default=bound,numeric(현재 기본값), all, none",
+    )
+    verify_parser.add_argument(
+        "--under-approx-eps", type=float, default=0.1,
+        help="--features에 underapprox가 있을 때 과소근사의 eps (기본 0.1)",
+    )
     verify_parser.add_argument("--json-output", help="write detailed results as JSON")
 
     vnnlib_parser = subparsers.add_parser(
@@ -1715,6 +1733,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reluplex ReLU 분기 재귀 깊이 상한 (기본 50). 한 경로에서 split은 매번 다른 "
              "뉴런을 고정하므로 은닉 ReLU 개수보다 크게 잡을 필요는 없다. 은닉 ReLU가 이 "
              "값보다 많으면 UNKNOWN이 된다 - 결과의 recursion_limit_hits가 0이 아니면 올릴 것",
+    )
+    vnnlib_parser.add_argument(
+        "--features", default="default",
+        help="Reluplex 구현 기법 켜기/끄기 (기능별 비교 실험용). 쉼표로 구분: "
+        + ", ".join(FEATURES)
+        + " (1 경계 유도, 2 백점프, 3 부동소수 안전장치, 4 과소근사). "
+        "default=bound,numeric(현재 기본값), all, none",
+    )
+    vnnlib_parser.add_argument(
+        "--under-approx-eps", type=float, default=0.1,
+        help="--features에 underapprox가 있을 때 과소근사의 eps (기본 0.1)",
     )
     vnnlib_parser.add_argument("--json-output")
     vnnlib_parser.add_argument(
@@ -1846,6 +1875,7 @@ def main() -> int:
                 split_heatmap_threshold=args.split_heatmap_threshold,
                 split_heatmap_cap=args.split_heatmap_cap,
                 profile_stages=args.profile_stages,
+                reluplex_options=feature_options(args.features, args.under_approx_eps),
             )
             _print_vnnlib_verification(result)
             if result.get("result_path"):
@@ -1868,6 +1898,7 @@ def main() -> int:
             simplex_max_iter_override=args.simplex_max_iter,
             max_recursion_override=args.max_recursion,
             profile_stages=args.profile_stages,
+            reluplex_options=feature_options(args.features, args.under_approx_eps),
         )
         _print_verification(result)
         if args.json_output:

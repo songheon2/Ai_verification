@@ -27,7 +27,8 @@ class MechanismBrowserTests(unittest.TestCase):
                          "outcome": "restored", "lineage_pivots": 1000,
                          "depth": 1, "nodeId": 2, "round_index": 1}
                 report = {"available": True, "totals": {"drift_checks": count, "restores": count},
-                          "settings": [{"backjump": True, "drift_threshold": 1e-6}], "eventCount": count,
+                          "settings": [{"backjump": True, "drift_threshold": 1e-6,
+                                        "underapprox_enabled": count > 0}], "eventCount": count,
                           "boundRounds": [{"round_index": 1, "ranges": [
                               {"variable": "z1_0", "state": "unstable", "before": [None,None], "after": [-2,3]},
                               {"variable": "z1_1", "state": "active", "before": [0,5], "after": [1,2]},
@@ -120,6 +121,7 @@ class MechanismBrowserTests(unittest.TestCase):
     await fetch('/stage?value=1');
     frame.contentWindow.postMessage({type:'relu-search-tree-refresh'},'*');
     await wait(()=>doc.querySelector('#numericalValue').textContent.includes('오차 검사 3'));
+    assert(doc.querySelector('#underapproxValue').textContent.includes('솔버 과소근사 활성'),'remote underapprox option is reflected after refresh');
     assert(frame.contentDocument===doc && filter.value==='numerical','document and filter survive refresh');
     assert(doc.querySelector('#events').textContent.includes('타블로 복원'),'actual restoration displayed');
     filter.value='bounds';filter.dispatchEvent(new frame.contentWindow.Event('change'));

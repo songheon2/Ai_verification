@@ -622,6 +622,7 @@ def simplex(
     mechanism_callback=None,
     numerical_callback=None,
     bound_change_callback=None,
+    numeric_safeguards: bool = True,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     Simplex 알고리즘 (Algorithm 3 스타일).
@@ -691,6 +692,12 @@ def simplex(
     LP를 끝까지 풀어야 드러날 모순을 피벗된 다른 row에서 일찍 볼 수 있다.
     0이면 하지 않는다. 호출을 시작할 때의 row로는 노드의 경계 유도가 이미 같은
     일을 했으므로 첫 피벗 전에는 하지 않는다.
+
+    부동소수 안전장치 끄기 (numeric_safeguards=False, 비교 실험용)
+    --------------------------------------------------------------
+    논문 4절의 부동소수 안전장치(아주 작은 수로 나누는 피벗 피하기, 누적 오차
+    검사·복원)를 끈다: 진입변수를 계수 크기와 무관하게 이름순 첫 후보로 고르고,
+    누적 오차를 재지 않는다. 판정이 틀릴 수 있으므로 기능별 효과를 비교할 때만 쓴다.
 
     UNSAT의 원인 (tableau.deps가 있을 때)
     -------------------------------------
@@ -775,6 +782,9 @@ def simplex(
 
     restores = 0
     tableau.conflict = None
+    # numeric_safeguards=False(비교 실험용)면 누적 오차 검사·복원을 하지 않는다
+    check_at_exit = DRIFT_CHECK_AT_EXIT if numeric_safeguards else float("inf")
+    check_every = DRIFT_CHECK_EVERY if numeric_safeguards else float("inf")
     # 복원하면 이 호출에서 틀어진 row로 좁혔을 수도 있는 경계를 되돌린다
     # (원인 마스크도 같이)
     bounds_at_start = (
@@ -893,7 +903,7 @@ def simplex(
             # row로 구한 할당은 원래 문제의 해가 아닐 수 있고, 자식 노드가 이
             # row로 경계 유도를 한다. 복원하면 기저가 바뀌므로 위반 검사부터
             # 다시 한다.
-            if tableau.pivots_since_check >= DRIFT_CHECK_AT_EXIT:
+            if tableau.pivots_since_check >= check_at_exit:
                 restored = _drift_needs_restore()
                 if restored is None:
                     return _numerical_failure()
@@ -954,6 +964,12 @@ def simplex(
                 pivot_xi = pivot_rng.choice(
                     sorted(xi for xi, a in candidates if abs(a) >= floor)
                 )
+        elif not numeric_safeguards:
+            # 안전장치를 끈 비교 실험용: 계수 크기를 보지 않고 이름순 첫 후보 (Bland)
+            pivot_xi = min(
+                (xi for xi, a in violated_row.coeffs.items() if _eligible(xi, a)),
+                default=None,
+            )
         else:
             best = None
             for xi, a in violated_row.coeffs.items():
@@ -972,7 +988,7 @@ def simplex(
             # 오차로 틀어졌다면 반례가 있는 영역을 잘라내는 잘못된 UNSAT이
             # 되므로, 검사 없이 쌓인 피벗이 많으면 선언하기 전에 원래 등식
             # 대비 오차를 확인한다.
-            if tableau.pivots_since_check >= DRIFT_CHECK_AT_EXIT:
+            if tableau.pivots_since_check >= check_at_exit:
                 restored = _drift_needs_restore()
                 if restored is None:
                     return _numerical_failure()
@@ -1072,7 +1088,7 @@ def simplex(
                 # 비기저변수를 경계 안에서 어떻게 움직여도 이 row를 만족시킬 수
                 # 없다 → UNSAT. 피벗 불가 UNSAT과 똑같이 row 계수에 기대는
                 # 판정이므로 같은 오차 검사를 거친다.
-                if tableau.pivots_since_check >= DRIFT_CHECK_AT_EXIT:
+                if tableau.pivots_since_check >= check_at_exit:
                     restored = _drift_needs_restore()
                     if restored is None:
                         return _numerical_failure()
@@ -1114,7 +1130,7 @@ def simplex(
             mechanism_counts["full_tightened"] += n_tightened
             if conflict_found:
                 # 피벗마다 강화의 모순과 똑같이 row 계수에 기대는 판정이다
-                if tableau.pivots_since_check >= DRIFT_CHECK_AT_EXIT:
+                if tableau.pivots_since_check >= check_at_exit:
                     restored = _drift_needs_restore()
                     if restored is None:
                         return _numerical_failure()
@@ -1130,7 +1146,7 @@ def simplex(
 
         # 긴 호출은 끝날 때까지 기다리지 않고 중간에도 오차를 본다. 틀어진
         # row로 피벗을 계속하면 엉뚱한 방향으로 헤매며 반복만 늘어난다.
-        if tableau.pivots_since_check >= DRIFT_CHECK_EVERY:
+        if tableau.pivots_since_check >= check_every:
             if _drift_needs_restore() is None:
                 return _numerical_failure()
 

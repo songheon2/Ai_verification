@@ -376,7 +376,8 @@
     text('#boundsValue',$('#boundScope').value==='stable'?`STABLE 확정 ${displayBoundHistory(report).length}건`:ranges.length?`뉴런 ${ranges.length}개 · 활성 ${states.active} · 비활성 ${states.inactive} · 불안정 ${states.unstable}`:'탐색 전 경계 기록 없음');
     text('#backjumpValue',(report.settings || []).length?`${report.settings.some(item=>item.backjump)?'백점프 활성':'백점프 비활성'} · 충돌 ${totals.conflict || 0}건 · 백점프 ${totals.backjump || 0}회`:'설정 기록 대기');
     text('#numericalValue',report.available?`오차 검사 ${totals.drift_checks || 0}회 · 복원 ${totals.restores || 0}회${totals.restore_failures?' · 복원 실패 '+totals.restore_failures+'회':''}`:'측정 기록 대기');
-    text('#underapproxValue','솔버 미적용 · 구간 미리보기');
+    const underapproxEnabled=(report.settings || []).some(item=>item.underapprox_enabled);
+    text('#underapproxValue',underapproxEnabled?'솔버 과소근사 활성 · 아래 그림은 구간 미리보기':'솔버 미적용 · 구간 미리보기');
     boundChart(report,ranges);conflictChart(report,totals);numericalChart(report);underChart(ranges);
     fitCards();
     renderRecords(report);

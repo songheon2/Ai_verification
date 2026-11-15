@@ -92,6 +92,7 @@ def _dpll_t_run(
     split_logger=None,
     progress=None,
     round_state: Optional[Dict[str, int]] = None,
+    reluplex_options: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, float]], SolverStatus, str, int]:
     """
     DPLL(T) main loop.
@@ -228,6 +229,7 @@ def _dpll_t_run(
                     str(item["atom_id"]) for item in selected_theory_atoms
                 ],
             },
+            **(reluplex_options or {}),
         )
         if th_sat:
             if progress is not None:
@@ -279,8 +281,12 @@ def dpll_t_detailed(
     realtime_window_seconds: float = 300.0,
     model_layer_sizes: Optional[Iterable[int]] = None,
     progress=None,
+    reluplex_options: Optional[Dict[str, Any]] = None,
 ) -> SolverResult:
     """Run DPLL(T), distinguishing SAT, UNSAT, and UNKNOWN.
+
+    reluplex_options는 이론 호출마다 reluplex()에 그대로 넘길 인자다
+    (예: Reluplex.feature_options("bound,backjump")로 만든 기능 켜기/끄기).
 
     trace를 넘기면(SolveTrace()) BCP/Simplex/Reluplex 구간 타이밍과 ReLU split
     이벤트가 그 안에 기록된다 (visualization/SolveTrace.py 참고). 안 넘기면
@@ -378,6 +384,7 @@ def dpll_t_detailed(
                 split_logger=split_logger,
                 progress=progress,
                 round_state=round_state,
+                reluplex_options=reluplex_options,
             )
         except SolverLimitReached as exc:
             if progress is not None:

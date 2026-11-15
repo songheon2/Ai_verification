@@ -27,6 +27,51 @@ import time
 
 _NEURON_VAR_RE = re.compile(r"^[zh](\d+)_(\d+)(?:_.*)?$")
 
+# 논문 4절의 구현 기법 4가지를 켜고 끄는 이름 (기능별 비교 실험용)
+FEATURES = ("bound", "backjump", "numeric", "underapprox")
+DEFAULT_FEATURES = ("bound", "numeric")
+
+
+def feature_options(features: Any = "default", under_approx_eps: float = 0.1) -> Dict[str, Any]:
+    """기능 이름 목록을 reluplex() 인자로 바꾼다.
+
+    bound       — 1. 더 엄밀한 경계 유도: 루트와 노드마다 경계 유도, 피벗마다 진입
+                  변수 강화, 1000피벗마다 tableau 전체 강화
+    backjump    — 2. 충돌 분석과 백점프
+    numeric     — 3. 부동소수 안전장치: 작은 계수로 피벗하지 않기, 누적 오차 검사·복원
+    underapprox — 4. 과소근사 (eps = under_approx_eps)
+
+    "default"는 지금 기본값(bound, numeric), "all"은 넷 다, "none"은 모두 끈다.
+    쉼표로 구분한 문자열이나 이름 목록을 받는다.
+    """
+    if isinstance(features, str):
+        key = features.strip().lower()
+        if key == "default":
+            names = set(DEFAULT_FEATURES)
+        elif key == "all":
+            names = set(FEATURES)
+        elif key in ("none", ""):
+            names = set()
+        else:
+            names = {name.strip() for name in key.split(",") if name.strip()}
+    else:
+        names = set(features)
+    unknown = names - set(FEATURES)
+    if unknown:
+        raise ValueError(
+            f"알 수 없는 기능: {', '.join(sorted(unknown))} (가능: {', '.join(FEATURES)})"
+        )
+    bound = "bound" in names
+    return {
+        "derive_bound": bound,
+        "derive_in_search": bound,
+        "pivot_tighten": bound,
+        "full_tighten_every": 1000 if bound else 0,
+        "backjump": "backjump" in names,
+        "numeric_safeguards": "numeric" in names,
+        "under_approx": under_approx_eps if "underapprox" in names else 0.0,
+    }
+
 
 def _parse_neuron_var(name: str) -> Optional[Tuple[int, int]]:
     match = _NEURON_VAR_RE.match(name)
@@ -221,6 +266,7 @@ def reluplex(
     check_backjump: bool = False,
     under_approx: float = 0.0,
     under_approx_share: float = 0.3,
+    numeric_safeguards: bool = True,
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     derive_in_search: 분기로 좁아진 경계로 노드마다 경계 유도를 다시 돌린다
@@ -264,6 +310,9 @@ def reluplex(
         처음부터 다시 푼다.
     under_approx_share: 과소근사 단계에 쓸 시간 비율 (남은 시간 기준).
         deadline이 없으면 과소근사 단계는 끝날 때까지 돈다.
+    numeric_safeguards: 부동소수 안전장치 (논문 4절). False면 비교 실험용으로
+        끈다 — simplex와 PivotForRelu가 계수 크기를 보지 않고 이름순 첫 후보로
+        피벗하고, 누적 오차 검사·복원을 하지 않는다. 판정이 틀릴 수 있다.
     """
     if search_derive_rows not in ("original", "tableau", "both"):
         raise ValueError(f"알 수 없는 search_derive_rows: {search_derive_rows}")
@@ -424,7 +473,13 @@ def reluplex(
                 row = next(r for r in tableau.rows if r.basic_var == var)
                 if not row.coeffs:
                     continue
-                column = min(row.coeffs, key=lambda v: (-abs(row.coeffs[v]), v))
+                if numeric_safeguards:
+                    column = min(row.coeffs, key=lambda v: (-abs(row.coeffs[v]), v))
+                else:   # 안전장치 끔: 계수 크기와 무관하게 이름순 첫 0 아닌 열
+                    column = min(
+                        (v for v, c in row.coeffs.items() if c != 0.0),
+                        default=next(iter(row.coeffs)),
+                    )
                 if row.coeffs[column] == 0.0:
                     continue
                 _pivot(tableau, column, var)
@@ -633,6 +688,7 @@ def reluplex(
                     stats=stats,
                     tighten_bounds=pivot_tighten,
                     full_tighten_every=full_tighten_every,
+                    numeric_safeguards=numeric_safeguards,
                 )
 
             if not sat:
@@ -730,6 +786,7 @@ def reluplex(
                             stats=stats,
                             tighten_bounds=pivot_tighten,
                             full_tighten_every=full_tighten_every,
+                            numeric_safeguards=numeric_safeguards,
                         )
                 except SolverLimitReached as exc:
                     if exc.reason == "TIMEOUT":

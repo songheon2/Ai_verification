@@ -29,7 +29,7 @@ from Automation.PropertyBuilder import (
     infer_expected_from_outputs,
 )
 from BoundDerivation import BoundDeps, derive_bounds
-from Reluplex import reluplex
+from Reluplex import FEATURES, feature_options, reluplex
 from Simplex import DRIFT_CHECK_AT_EXIT, build_tableau, simplex
 from Automation.SolverStatus import SolverLimitReached, SolverResult, SolverStatus
 from Automation.VnnlibParser import (
@@ -1009,6 +1009,55 @@ class UnderApproximationTests(unittest.TestCase):
                     self.assertEqual(stats.get("CLOSED_MEASURE"), 1.0)
                     exact_unsat += 1
         self.assertGreater(exact_unsat, 0)
+
+
+class FeatureSwitchTests(unittest.TestCase):
+    """논문 구현 기법 4가지를 켜고 끄는 스위치 (기능별 비교 실험용)."""
+
+    def test_feature_names_map_to_reluplex_arguments(self):
+        none = feature_options("none")
+        self.assertFalse(none["derive_bound"] or none["derive_in_search"] or none["pivot_tighten"])
+        self.assertEqual(none["full_tighten_every"], 0)
+        self.assertFalse(none["backjump"] or none["numeric_safeguards"])
+        self.assertEqual(none["under_approx"], 0.0)
+        everything = feature_options("all", under_approx_eps=0.2)
+        self.assertTrue(everything["derive_bound"] and everything["backjump"])
+        self.assertTrue(everything["numeric_safeguards"])
+        self.assertEqual(everything["under_approx"], 0.2)
+        self.assertEqual(feature_options("bound, numeric"), feature_options("default"))
+        self.assertEqual(feature_options(FEATURES), everything | {"under_approx": 0.1})
+        with self.assertRaises(ValueError):
+            feature_options("bound,typo")
+
+    def test_default_features_match_reluplex_defaults(self):
+        import inspect
+
+        defaults = {
+            name: param.default
+            for name, param in inspect.signature(reluplex).parameters.items()
+        }
+        for name, value in feature_options("default").items():
+            self.assertEqual(defaults[name], value, name)
+
+    def test_every_single_feature_setting_keeps_verdicts(self):
+        settings = ["none", "bound", "backjump", "numeric", "underapprox", "all"]
+        for seed in range(20):
+            rows, bounds, relus, forward, theta = _random_relu_problem(seed)
+            _model, expected = reluplex(rows, dict(bounds), relus, max_recursion=100)
+            for setting in settings:
+                with self.subTest(seed=seed, features=setting):
+                    stats = {}
+                    model, sat = reluplex(
+                        rows, dict(bounds), relus, max_recursion=100, stats=stats,
+                        **feature_options(setting),
+                    )
+                    self.assertEqual(sat, expected)
+                    if sat:
+                        self.assertGreaterEqual(
+                            forward([model["x0"], model["x1"]]), theta - 1e-6
+                        )
+                    else:
+                        self.assertEqual(stats.get("CLOSED_MEASURE"), 1.0)
 
 
 if __name__ == "__main__":

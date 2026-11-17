@@ -106,6 +106,10 @@ class SimplexTableau:
              None이면 추적하지 않는다. 피벗마다 좁힌 경계에도 원인을 붙인다.
     - conflict : 마지막 simplex 호출이 UNSAT이었을 때 그 원인 분기 마스크.
              모르면 None (추적을 안 했거나 UNSAT이 아니었다).
+    - imported_rows : 이 tableau 계보가 외부 엔진(GLPK glp_eval_tab_row)에서 표 row를
+             가져온 적이 있다. 그런 row에는 반올림 잡음 계수가 남을 수 있어 경계 유도가
+             row 오차(LpEngines._row_error)를 붙여 쓴다. 우리 피벗만 거친 row는
+             native·카츠와 같이 오차 없이 쓴다. 한 번 켜지면 자식도 물려받는다.
     """
     rows: List[Row]
     bounds: Dict[str, Bound]
@@ -114,6 +118,7 @@ class SimplexTableau:
     pivots_since_check: int = 0
     deps: Optional[Any] = None
     conflict: Optional[int] = None
+    imported_rows: bool = False
 
     def __deepcopy__(self, memo: Dict[int, Any]) -> "SimplexTableau":
         # origin_rows는 한 번 만들어지면 바뀌지 않으므로 목록만 새로 만들고
@@ -126,6 +131,7 @@ class SimplexTableau:
             origin_rows=list(self.origin_rows),
             pivots_since_check=self.pivots_since_check,
             deps=None if self.deps is None else self.deps.copy(),
+            imported_rows=self.imported_rows,
         )
 
     # 기저변수 집합 (빠른 조회)
@@ -392,7 +398,7 @@ def _restore_tableau(tableau: SimplexTableau) -> bool:
 
 
 def _tighten_from_row(
-    tableau: SimplexTableau, row: Row, tol: float = DEFAULT_TOL
+    tableau: SimplexTableau, row: Row, tol: float = DEFAULT_TOL, err: float = 0.0
 ) -> Optional[bool]:
     """row의 우변(비기저변수들의 경계)으로 기저변수의 경계를 좁힌다.
 
@@ -401,6 +407,9 @@ def _tighten_from_row(
 
     tableau.deps가 있으면 좁힌 경계에 그 계산에 쓰인 경계들의 원인 마스크를
     붙이고, 모순이면 원인을 tableau.conflict에 남긴다.
+
+    err: row 자체의 오차 상한(GLPK에서 가져온 근사 row, LpEngines._row_error).
+        그만큼 더 넓힌다. 자체 simplex의 row는 0.
 
     반환: True=좁아짐, False=변화 없음, None=모순(이 row는 만족될 수 없다)
     """
@@ -421,8 +430,8 @@ def _tighten_from_row(
     if lo_inf and hi_inf:
         return False
     # 여러 항을 더하며 생긴 반올림으로 경계가 실제보다 좁아지지 않도록 바깥쪽으로 조금 넓힌다
-    implied_lo = -inf if lo_inf else lo - 1e-12 * max(1.0, abs(lo))
-    implied_hi = inf if hi_inf else hi + 1e-12 * max(1.0, abs(hi))
+    implied_lo = -inf if lo_inf else lo - 1e-12 * max(1.0, abs(lo)) - err
+    implied_hi = inf if hi_inf else hi + 1e-12 * max(1.0, abs(hi)) + err
 
     cur = tableau.bounds[row.basic_var]
     new_lo = max(cur.lower, implied_lo)

@@ -3,6 +3,7 @@
 이 모듈은 `reluplex(row_defs, bounds, relus)`를 제공하며,
 사진의 Algorithm 4(간단화된 Reluplex)의 재귀적 구현을 따릅니다.
 """
+from contextlib import contextmanager
 from math import isfinite
 from typing import Any, Dict, List, Tuple, Optional
 from Simplex import (
@@ -260,6 +261,8 @@ def reluplex(
     derive_bound: bool = True,
     derive_in_search: bool = True,
     search_derive_rows: str = "both",
+    search_derive_passes: int = 20,
+    derive_incremental: bool = True,
     pivot_tighten: bool = True,
     full_tighten_every: int = 1000,
     backjump: bool = False,
@@ -267,6 +270,10 @@ def reluplex(
     under_approx: float = 0.0,
     under_approx_share: float = 0.3,
     numeric_safeguards: bool = True,
+    lp_engine: str = "native",
+    lp_mode: Optional[str] = None,
+    glpk_extract: str = "full",
+    glpk_row_error: str = "auto",
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
     derive_in_search: 분기로 좁아진 경계로 노드마다 경계 유도를 다시 돌린다
@@ -278,6 +285,13 @@ def reluplex(
         "tableau"  — 부모가 피벗해 둔 현재 tableau row. 같은 제약의 다른
                      선형결합이라 원래 row에서는 안 나오는 경계가 나온다.
         "both"     — 둘 다.
+    search_derive_passes: 노드 경계 유도를 최대 몇 바퀴 돌리나(BoundDerivation의
+        max_passes). 20이면 사실상 고정점까지. 줄이면 노드마다 싸지지만 늦은
+        바퀴에서 나오는 모순·확정을 놓친다 (4_5/φ3 노드 67개: 4바퀴면 시간 0.54배,
+        확정 ReLU 98%, 경계 유도로 찾는 모순 20개 중 12개).
+    derive_incremental: 경계 유도의 둘째 바퀴부터 경계가 바뀐 변수가 든 row만
+        다시 본다(BoundDerivation incremental). 결과는 같고 시간만 준다 — 기본으로 켬
+        (45문제 실험: 노드 수 40문제 모두 같고 시간 0.82배).
     pivot_tighten: Simplex가 피벗할 때마다 진입 변수의 경계를 그 row로 좁힌다
         (논문 5절). LP가 끝나면 좁아진 경계를 노드 경계에 합치고, 그 결과
         새로 확정된 ReLU를 강제한 뒤 LP를 다시 푼다.
@@ -313,9 +327,39 @@ def reluplex(
     numeric_safeguards: 부동소수 안전장치 (논문 4절). False면 비교 실험용으로
         끈다 — simplex와 PivotForRelu가 계수 크기를 보지 않고 이름순 첫 후보로
         피벗하고, 누적 오차 검사·복원을 하지 않는다. 판정이 틀릴 수 있다.
+    lp_engine: 노드 LP("경계 위반 고치기")를 누가 푸는가. "native"는 자체 simplex.
+        "glpk" / "z3"는 lp_mode에 따라 두 가지로 쓴다(LpEngines.py).
+    lp_mode: 엔진을 어떻게 끼우는가 (lp_engine이 native가 아닐 때).
+        "core"   — 카츠 Reluplex의 구조. Reluplex가 자기 tableau를 들고 native
+                   경로를 그대로 돌고, Simplex.simplex 자리만 엔진이 맡는다. 그래서
+                   ①②③④가 모두 돌고, 엔진 안에서 하던 일(피벗마다 경계 강화, UNSAT의
+                   원인, 오차 복원)은 엔진마다 대응 기법으로 한다(LpEngines.GlpkCore,
+                   Z3Core). glpk·z3의 기본값.
+        "oracle" — 엔진을 계산기처럼: 정의식과 경계만 넘기고 "해가 있나"만 받는다.
+                   tableau를 쓰는 기법은 빠지고 repair는 "고칠 값으로 잠깐 고정하고
+                   다시 풀기"로 한다. lp_engine="simplex"(자체 simplex를 같은 방식으로
+                   쓰는 통제군)는 이 방식뿐이다.
+    glpk_extract: lp_engine="glpk", lp_mode="core"일 때 다 푼 LP를 tableau로 가져오는
+        방법(LpEngines.GlpkCore). "full"은 기저 row 전부를 GLPK에서 새로 계산해 오고,
+        "basis"는 카츠 Reluplex처럼 기저 목록만 받아 우리 tableau를 그만큼 피벗한다.
+    glpk_row_error: 노드 경계 유도에서 tableau row에 GLPK 잡음 대비 오차 상한을 붙이는
+        때(LpEngines.GlpkCore row_error). "auto"는 표 row를 GLPK에서 가져온 tableau만
+        ("full"은 늘, "basis"는 우리 피벗만 거쳤으면 안 붙임), "always"는 늘.
     """
     if search_derive_rows not in ("original", "tableau", "both"):
         raise ValueError(f"알 수 없는 search_derive_rows: {search_derive_rows}")
+    if lp_engine != "native":
+        from LpEngines import CORES, ENGINES, make_core, make_engine
+        if lp_engine not in ENGINES:
+            raise ValueError(
+                f"알 수 없는 lp_engine: {lp_engine} (가능: native, {', '.join(ENGINES)})"
+            )
+        if lp_mode is None:
+            lp_mode = "core" if lp_engine in CORES else "oracle"
+        if lp_mode not in ("core", "oracle"):
+            raise ValueError(f"알 수 없는 lp_mode: {lp_mode} (가능: core, oracle)")
+        if lp_mode == "core" and lp_engine not in CORES:
+            raise ValueError(f"lp_mode='core'는 {', '.join(CORES)}만 된다 (native가 곧 simplex의 core다)")
 
     original_relu_count = len(relus)
     if stats is not None:
@@ -374,6 +418,35 @@ def reluplex(
         if stats is not None:
             stats[key] = stats.get(key, 0) + amount
 
+    @contextmanager
+    def _lp_timer(repair: bool = False):
+        """LP 풀이 한 번의 횟수와 시간 (엔진 비교에서 'LP가 시간의 몇 할인가')."""
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            _bump("LP_CALLS")
+            _bump("LP_SECONDS", time.perf_counter() - started)
+            if repair:
+                _bump("LP_REPAIR_CALLS")
+
+    # lp_engine이 native가 아니면 아래 경계 유도가 끝난 뒤 만든다.
+    # engine: oracle 방식의 엔진, core: core 방식에서 Simplex.simplex 자리를 맡는 엔진
+    engine = None
+    core = None
+
+    def _simplex(*args, **kwargs):
+        return (core.simplex if core is not None else simplex)(*args, **kwargs)
+
+    def _engine_solve(
+        rows_now: List[Tuple[str, Dict[str, float]]],
+        bounds_now: Dict[str, Tuple[float, float]],
+        repair: bool = False,
+    ) -> Optional[Dict[str, float]]:
+        with _lp_timer(repair):
+            # repair는 값을 잠깐 고정하고 푼다: 그때 좁힌 경계는 노드 전체에서 성립하지 않는다
+            return engine.solve(rows_now, bounds_now, deadline)
+
     record_stable = trace is not None or hasattr(split_logger, "stable")
 
     def _record_stable(fixed, before, after, depth: int, source: str) -> None:
@@ -430,6 +503,10 @@ def reluplex(
                 )
             last_conflict[0] = mask
             _bump("CONFLICT_LEAVES")
+            if not mask and depth > 0:
+                # 분기 없이도 모순 = 문제 전체가 UNSAT이라는 뜻. 루트에서는 못 보고
+                # 깊은 곳에서만 보이면 수치 오차로 생긴 가짜 모순일 수 있어 따로 센다.
+                _bump("CONFLICT_EMPTY")
             _bump("CONFLICT_BITS", bin(mask).count("1"))
             _bump("CONFLICT_DEPTH", depth)
         return None, False
@@ -578,6 +655,7 @@ def reluplex(
     ) -> Tuple[Optional[Dict[str, float]], bool]:
         """active: 이 노드에서 아직 켜짐/꺼짐이 정해지지 않은 ReLU.
 
+
         분기했거나 경계 유도로 확정된 ReLU는 선형 제약(row/bound)으로 강제되어
         있으므로 위반 검사·repair·분기 대상에서 빠진다. 최종 SAT 검산만은
         _validated_sat이 전체 ReLU로 다시 한다.
@@ -628,9 +706,15 @@ def reluplex(
             if search_derive_rows != "tableau" or warm is None:
                 derive_rows.extend(current_row_defs)
             if search_derive_rows != "original" and warm is not None:
-                derive_rows.extend((row.basic_var, row.coeffs) for row in warm.rows)
+                if core is not None and core.needs_row_error(warm):
+                    # GLPK에서 가져온 표 row: row마다 오차 상한을 붙여 넘긴다
+                    _bump("SEARCH_ROW_ERROR_CALLS")
+                    derive_rows.extend(core.rows_with_error(warm, bounds_now))
+                else:
+                    derive_rows.extend((row.basic_var, row.coeffs) for row in warm.rows)
             tightened, fixed_here, infeasible = derive_bounds(
-                derive_rows, bounds_now, active, deps=deps_now
+                derive_rows, bounds_now, active, deps=deps_now,
+                max_passes=search_derive_passes, incremental=derive_incremental,
             )
             _bump("SEARCH_DERIVE_CALLS")
             _bump("SEARCH_DERIVE_SECONDS", time.perf_counter() - started)
@@ -662,145 +746,212 @@ def reluplex(
                 _bump("UA_FIXED", len(ua_fixed))
                 ua_fixed_total[0] += len(ua_fixed)
 
-        if warm is not None:
-            # 부모의 basis를 물려받고, 좁아진 bound만 반영해 이어서 푼다.
-            # bounds_now 기준으로 한 번 맞춰주므로 부모와 어긋날 여지가 없다.
-            tableau = warm
-            _sync_bounds(tableau, bounds_now, deps_now)
-        else:
-            tableau = build_tableau(current_row_defs, bounds_now)
-            if deps_now is not None:
-                tableau.deps = deps_now.copy()
-        while True:
+        if engine is not None:
+            # ── LP를 바깥 엔진에 맡긴다 (lp_engine, LpEngines.py) ──
+            # 엔진은 이 노드의 정의식과 경계만 받아 "만족하는 점이 있는가"를 답한다.
+            # tableau를 들여다보는 기법(피벗마다 경계 강화, tableau row로 경계 유도,
+            # 부모 tableau 물려받기)은 쓰지 않고, 이어 풀기는 엔진이 알아서 한다.
             with span(trace, "simplex", depth=depth):
-                sol, sat = simplex(
-                    tableau,
-                    max_iter=simplex_max_iter,
-                    debug=debug,
-                    deadline=deadline,
-                    report_unknown=report_unknown,
-                    progress=progress,
-                    progress_context={
-                        **base_progress_context,
-                        "depth": depth,
-                        "origin": "reluplex",
-                    },
-                    stats=stats,
-                    tighten_bounds=pivot_tighten,
-                    full_tighten_every=full_tighten_every,
-                    numeric_safeguards=numeric_safeguards,
-                )
+                assign = _engine_solve(current_row_defs, bounds_now)
+            if assign is None:
+                return _unsat(depth, "LP", None)
 
-            if not sat:
-                return _unsat(depth, "LP", tableau.conflict)
-            if not pivot_tighten or not active:
-                break
+            violations = _check_relu_violations(assign, active)
+            if not violations:
+                return _validated_sat(assign, current_row_defs, bounds_now)
 
-            # 피벗하며 좁힌 경계를 노드 경계에 합친다. 자식은 bounds_now를
-            # 물려받으므로 여기서 합쳐야 다음 분기 선택과 자식 노드에 쓰인다.
-            # 원인 마스크도 tableau에서 같이 가져온다.
-            stable_before = {x: bounds_now[x] for x, _ in active} if record_stable else None
-            merged = False
-            for var, b in tableau.bounds.items():
-                lo, hi = bounds_now.get(var, (float('-inf'), float('inf')))
-                if b.lower > lo or b.upper < hi:
-                    bounds_now[var] = (max(lo, b.lower), min(hi, b.upper))
-                    if deps_now is not None:
-                        if b.lower > lo:
-                            deps_now.set_lo(var, tableau.deps.lo.get(var, 0))
-                        if b.upper < hi:
-                            deps_now.set_hi(var, tableau.deps.hi.get(var, 0))
-                    merged = True
-            if not merged:
-                break
-            # 좁아진 경계로 부호가 정해진 ReLU가 생겼는지 ReLU 규칙만으로 본다.
-            # 정해졌는데 강제하지 않으면 그 ReLU는 위반 중이어도 분기 후보가
-            # 아니게 되어(_splittable=False) 탐색이 결론 없이 끝난다. 그래서
-            # 강제한 뒤 이 노드의 LP를 다시 푼다.
-            tightened, fixed_here, infeasible = derive_bounds(
-                [], bounds_now, active, max_passes=1, deps=deps_now
-            )
-            if infeasible:
-                return _unsat(
-                    depth, "DERIVE",
-                    deps_now.conflict if deps_now is not None else None,
-                )
-            _record_stable(fixed_here, stable_before, tightened, depth, "pivot")
-            bounds_now = tightened
-            if not fixed_here:
-                break
-            current_row_defs, active = _enforce_fixed(
-                fixed_here, depth, current_row_defs, bounds_now, tableau, active,
-                deps_now,
-            )
-            _sync_bounds(tableau, bounds_now, deps_now)
-            _bump("PIVOT_TIGHTEN_FIXED", len(fixed_here))
-
-        assign = sol
-        violations = _check_relu_violations(assign, active)
-        if not violations:
-            return _validated_sat(assign, current_row_defs, bounds_now)
-
-        # ── ReLU 위반 수정 (논문 3절 Update_b / Update_f / PivotForRelu) ──
-        # 노드의 tableau를 제자리에서 고친다. 한 쌍을 고치면 새 경계 위반이 생길
-        # 수 있으므로 simplex가 그 상태에서 이어서 경계를 맞춘다. 고칠 쌍은 위반
-        # 중인 쌍 가운데 이름순 첫 번째로 고정해서, 고쳐도 계속 다시 위반되는
-        # 쌍에 횟수가 쌓이게 한다. 이 노드에서 고친 횟수가 branch_tau에 닿은
-        # 쌍은 분기한다 (논문 5절: 5회). local_repair_max_iter는 노드당 수정
-        # 횟수의 상한이다.
-        #
-        # 예전 구현은 (1) tableau를 통째로 복사해 두 방향 모두 simplex를 끝까지
-        # 풀고 할당만 가져왔다 — tableau는 원본 그대로라 다음 수정은 다시 처음
-        # 상태에서 시작했다. (2) 횟수를 탐색 전체에서 누적하고 초기화하지 않아,
-        # 탐색 초반에는 노드마다 repair를 20번까지 하고 포화된 뒤에는 1번만 했다.
-        # ACAS Xu 20개(116초)에서 repair가 시간의 29~52%를 썼다.
-        repair_count: Dict[Tuple[str, str], int] = {}
-        repair_unknown_reason = None
-        for _ in range(local_repair_max_iter):
-            check_deadline(deadline)
-            pair = min(violations, key=lambda p: p[0])
-            if repair_count.get(pair, 0) >= branch_tau:
-                break
-            repair_count[pair] = repair_count.get(pair, 0) + 1
-            with span(trace, "reluplex_repair", depth=depth, branch_x=pair[0]):
-                if _apply_relu_fix(tableau, *pair) is None:
-                    # 어느 쪽으로도 범위 안에서 고칠 수 없다 → 분기로만 풀린다
+            # ── ReLU 위반 수정 (Update_f / Update_b 흉내) ──
+            # 자체 simplex는 고친 값에서 출발해 이어서 풀지만, 바깥 엔진은 출발점을
+            # 받지 않는다. 그래서 고칠 변수를 목표값으로 잠깐 고정(경계 [t, t])하고
+            # 다시 푼다 — 고정은 이번 풀이에만 쓰고 노드 경계에는 남기지 않는다.
+            # 고정한 문제가 불가능하면 다른 쪽을 시도하고, 둘 다 안 되면 이 쌍은
+            # 분기로만 풀린다(자체 simplex에서 목표값이 범위 밖일 때와 같은 처리).
+            # 고칠 쌍 고르기, 횟수 세기, branch_tau는 자체 simplex 경로와 같다.
+            repair_count: Dict[Tuple[str, str], int] = {}
+            repair_unknown_reason = None
+            for _ in range(local_repair_max_iter):
+                check_deadline(deadline)
+                pair = min(violations, key=lambda p: p[0])
+                if repair_count.get(pair, 0) >= branch_tau:
+                    break
+                repair_count[pair] = repair_count.get(pair, 0) + 1
+                x_var, y_var = pair
+                options = [
+                    ("update_f", y_var, relu(assign[x_var])),
+                    ("update_b", x_var, assign[y_var]),
+                ]
+                rng.shuffle(options)
+                fixed_assign = None
+                with span(trace, "reluplex_repair", depth=depth, branch_x=x_var):
+                    for _rule, var, target in options:
+                        lo, hi = bounds_now.get(var, (float('-inf'), float('inf')))
+                        if (target < lo - _scaled_tol(lo)
+                                or target > hi + _scaled_tol(hi)):
+                            continue
+                        target = min(max(target, lo), hi)
+                        pinned = dict(bounds_now)
+                        pinned[var] = (target, target)
+                        try:
+                            fixed_assign = _engine_solve(current_row_defs, pinned, repair=True)
+                        except SolverLimitReached as exc:
+                            if exc.reason == "TIMEOUT":
+                                raise
+                            repair_unknown_reason = exc.reason
+                            break
+                        if fixed_assign is not None:
+                            break
+                if repair_unknown_reason is not None:
+                    break
+                if fixed_assign is None:
                     repair_count[pair] = branch_tau
                     _bump("REPAIR_UNFIXABLE")
                     break
                 _bump("REPAIR_STEPS")
-                try:
-                    with span(trace, "simplex", depth=depth):
-                        sol2, sat2 = simplex(
-                            tableau,
-                            max_iter=simplex_max_iter,
-                            debug=debug,
-                            deadline=deadline,
-                            report_unknown=report_unknown,
-                            progress=progress,
-                            progress_context={
-                                **base_progress_context,
-                                "depth": depth,
-                                "origin": "relu_repair",
-                            },
-                            stats=stats,
-                            tighten_bounds=pivot_tighten,
-                            full_tighten_every=full_tighten_every,
-                            numeric_safeguards=numeric_safeguards,
-                        )
-                except SolverLimitReached as exc:
-                    if exc.reason == "TIMEOUT":
-                        raise
-                    repair_unknown_reason = exc.reason
+                assign = fixed_assign
+                violations = _check_relu_violations(assign, active)
+                if not violations:
+                    return _validated_sat(assign, current_row_defs, bounds_now)
+            tableau = None
+        else:
+            if warm is not None:
+                # 부모의 basis를 물려받고, 좁아진 bound만 반영해 이어서 푼다.
+                # bounds_now 기준으로 한 번 맞춰주므로 부모와 어긋날 여지가 없다.
+                tableau = warm
+                _sync_bounds(tableau, bounds_now, deps_now)
+            else:
+                tableau = build_tableau(current_row_defs, bounds_now)
+                if deps_now is not None:
+                    tableau.deps = deps_now.copy()
+            while True:
+                with _lp_timer(), span(trace, "simplex", depth=depth):
+                    sol, sat = _simplex(
+                        tableau,
+                        max_iter=simplex_max_iter,
+                        debug=debug,
+                        deadline=deadline,
+                        report_unknown=report_unknown,
+                        progress=progress,
+                        progress_context={
+                            **base_progress_context,
+                            "depth": depth,
+                            "origin": "reluplex",
+                        },
+                        stats=stats,
+                        tighten_bounds=pivot_tighten,
+                        full_tighten_every=full_tighten_every,
+                        numeric_safeguards=numeric_safeguards,
+                    )
+
+                if not sat:
+                    return _unsat(depth, "LP", tableau.conflict)
+                if not pivot_tighten or not active:
                     break
-            if not sat2:
-                # 수정은 할당만 바꾸고 제약은 그대로이므로, 여기서 UNSAT이면 이
-                # 노드의 LP 자체가 불가능하다는 뜻이다(피벗 강화로 좁힌 경계 포함).
-                return _unsat(depth, "LP", tableau.conflict)
-            assign = sol2
+
+                # 피벗하며 좁힌 경계를 노드 경계에 합친다. 자식은 bounds_now를
+                # 물려받으므로 여기서 합쳐야 다음 분기 선택과 자식 노드에 쓰인다.
+                # 원인 마스크도 tableau에서 같이 가져온다.
+                stable_before = {x: bounds_now[x] for x, _ in active} if record_stable else None
+                merged = False
+                for var, b in tableau.bounds.items():
+                    lo, hi = bounds_now.get(var, (float('-inf'), float('inf')))
+                    if b.lower > lo or b.upper < hi:
+                        bounds_now[var] = (max(lo, b.lower), min(hi, b.upper))
+                        if deps_now is not None:
+                            if b.lower > lo:
+                                deps_now.set_lo(var, tableau.deps.lo.get(var, 0))
+                            if b.upper < hi:
+                                deps_now.set_hi(var, tableau.deps.hi.get(var, 0))
+                        merged = True
+                if not merged:
+                    break
+                # 좁아진 경계로 부호가 정해진 ReLU가 생겼는지 ReLU 규칙만으로 본다.
+                # 정해졌는데 강제하지 않으면 그 ReLU는 위반 중이어도 분기 후보가
+                # 아니게 되어(_splittable=False) 탐색이 결론 없이 끝난다. 그래서
+                # 강제한 뒤 이 노드의 LP를 다시 푼다.
+                tightened, fixed_here, infeasible = derive_bounds(
+                    [], bounds_now, active, max_passes=1, deps=deps_now
+                )
+                if infeasible:
+                    return _unsat(
+                        depth, "DERIVE",
+                        deps_now.conflict if deps_now is not None else None,
+                    )
+                _record_stable(fixed_here, stable_before, tightened, depth, "pivot")
+                bounds_now = tightened
+                if not fixed_here:
+                    break
+                current_row_defs, active = _enforce_fixed(
+                    fixed_here, depth, current_row_defs, bounds_now, tableau, active,
+                    deps_now,
+                )
+                _sync_bounds(tableau, bounds_now, deps_now)
+                _bump("PIVOT_TIGHTEN_FIXED", len(fixed_here))
+
+            assign = sol
             violations = _check_relu_violations(assign, active)
             if not violations:
                 return _validated_sat(assign, current_row_defs, bounds_now)
+
+            # ── ReLU 위반 수정 (논문 3절 Update_b / Update_f / PivotForRelu) ──
+            # 노드의 tableau를 제자리에서 고친다. 한 쌍을 고치면 새 경계 위반이 생길
+            # 수 있으므로 simplex가 그 상태에서 이어서 경계를 맞춘다. 고칠 쌍은 위반
+            # 중인 쌍 가운데 이름순 첫 번째로 고정해서, 고쳐도 계속 다시 위반되는
+            # 쌍에 횟수가 쌓이게 한다. 이 노드에서 고친 횟수가 branch_tau에 닿은
+            # 쌍은 분기한다 (논문 5절: 5회). local_repair_max_iter는 노드당 수정
+            # 횟수의 상한이다.
+            #
+            # 예전 구현은 (1) tableau를 통째로 복사해 두 방향 모두 simplex를 끝까지
+            # 풀고 할당만 가져왔다 — tableau는 원본 그대로라 다음 수정은 다시 처음
+            # 상태에서 시작했다. (2) 횟수를 탐색 전체에서 누적하고 초기화하지 않아,
+            # 탐색 초반에는 노드마다 repair를 20번까지 하고 포화된 뒤에는 1번만 했다.
+            # ACAS Xu 20개(116초)에서 repair가 시간의 29~52%를 썼다.
+            repair_count: Dict[Tuple[str, str], int] = {}
+            repair_unknown_reason = None
+            for _ in range(local_repair_max_iter):
+                check_deadline(deadline)
+                pair = min(violations, key=lambda p: p[0])
+                if repair_count.get(pair, 0) >= branch_tau:
+                    break
+                repair_count[pair] = repair_count.get(pair, 0) + 1
+                with span(trace, "reluplex_repair", depth=depth, branch_x=pair[0]):
+                    if _apply_relu_fix(tableau, *pair) is None:
+                        # 어느 쪽으로도 범위 안에서 고칠 수 없다 → 분기로만 풀린다
+                        repair_count[pair] = branch_tau
+                        _bump("REPAIR_UNFIXABLE")
+                        break
+                    _bump("REPAIR_STEPS")
+                    try:
+                        with _lp_timer(repair=True), span(trace, "simplex", depth=depth):
+                            sol2, sat2 = _simplex(
+                                tableau,
+                                max_iter=simplex_max_iter,
+                                debug=debug,
+                                deadline=deadline,
+                                report_unknown=report_unknown,
+                                progress=progress,
+                                progress_context={
+                                    **base_progress_context,
+                                    "depth": depth,
+                                    "origin": "relu_repair",
+                                },
+                                stats=stats,
+                                tighten_bounds=pivot_tighten,
+                                full_tighten_every=full_tighten_every,
+                                numeric_safeguards=numeric_safeguards,
+                            )
+                    except SolverLimitReached as exc:
+                        if exc.reason == "TIMEOUT":
+                            raise
+                        repair_unknown_reason = exc.reason
+                        break
+                if not sat2:
+                    # 수정은 할당만 바꾸고 제약은 그대로이므로, 여기서 UNSAT이면 이
+                    # 노드의 LP 자체가 불가능하다는 뜻이다(피벗 강화로 좁힌 경계 포함).
+                    return _unsat(depth, "LP", tableau.conflict)
+                assign = sol2
+                violations = _check_relu_violations(assign, active)
+                if not violations:
+                    return _validated_sat(assign, current_row_defs, bounds_now)
 
         # ── 분기 변수(branch_x) 선택 ──
         # 원래 Reluplex 규칙은 "repair로 여러 번 고쳐봤는데 계속 말썽인 ReLU를
@@ -888,7 +1039,7 @@ def reluplex(
                     # global_split_count 증가 및 '+' 기록: 첫 Reluplex 재귀 호출 직전.
                     split_id = split_logger.begin(branch_x, layer, index)
                 warm1 = None
-                if warm_start:
+                if warm_start and engine is None:
                     new_rows1 = []
                     if relu_y is not None:
                         new_rows1.append(
@@ -1053,7 +1204,10 @@ def reluplex(
                                 )
                                 inactive_branch_log_id = None
                         else:
-                            warm2 = _child_tableau(tableau, []) if warm_start else None
+                            warm2 = (
+                                _child_tableau(tableau, [])
+                                if warm_start and engine is None else None
+                            )
                             try:
                                 r2, sat2 = _rec(
                                     bounds2, depth + 1, row_defs2, warm2, child_active,
@@ -1177,7 +1331,8 @@ def reluplex(
     active_row_defs = row_defs
     active_bounds = dict(bounds)
     if derive_bound and relus:
-        tightened, fixed, infeasible = derive_bounds(row_defs, bounds, relus)
+        tightened, fixed, infeasible = derive_bounds(row_defs, bounds, relus,
+                                                     incremental=derive_incremental)
         if stats is not None:
             stats['DERIVE_FIXED_RELUS'] = len(fixed)
             stats['DERIVE_REMAINING_RELUS'] = original_relu_count - len(fixed)
@@ -1204,18 +1359,51 @@ def reluplex(
     # 시간을 다 쓰면 그 결과는 버리고 원래 문제를 처음부터 푼다. 단, 한 번도
     # 강제로 고정하지 않고 끝났다면 그 탐색이 곧 원래 탐색이므로 결과를 쓴다
     # (sat_relu처럼 0 근처 경계가 없는 문제에서 같은 탐색을 두 번 하지 않는다).
-    if under_approx > 0.0 and relus:
-        model, sat, exact = _under_approx_phase(active_bounds, active_row_defs)
-        if sat or exact:
-            if exact:
-                _bump("UA_EXACT")
-            return model, sat
-        if stats is not None:
-            stats['CLOSED_MEASURE'] = 0.0
-        if seed is not None:
-            rng.seed(seed)      # 원래 탐색은 과소근사를 안 켰을 때와 같은 경로로
+    if lp_engine != "native" and lp_mode == "core":
+        # 카츠 구조: native 경로 그대로, Simplex.simplex 자리만 엔진이 맡는다
+        core = make_core(lp_engine, full_tighten_every=full_tighten_every,
+                         glpk_extract=glpk_extract, glpk_row_error=glpk_row_error)
+    elif lp_engine != "native":
+        # 엔진은 이 호출 동안 LP 하나를 계속 들고 경계만 바꿔 이어서 푼다.
+        # 자체 simplex 엔진(통제군)에는 native 경로와 같은 simplex 설정을 넘기되
+        # tableau 결합 기법(피벗마다 경계 강화)은 끈다.
+        engine = make_engine(lp_engine, {
+            "max_iter": simplex_max_iter,
+            "debug": debug,
+            "report_unknown": report_unknown,
+            "stats": stats,
+            "numeric_safeguards": numeric_safeguards,
+        })
+    try:
+        if under_approx > 0.0 and relus:
+            model, sat, exact = _under_approx_phase(active_bounds, active_row_defs)
+            if sat or exact:
+                if exact:
+                    _bump("UA_EXACT")
+                return model, sat
+            if stats is not None:
+                stats['CLOSED_MEASURE'] = 0.0
+            if seed is not None:
+                rng.seed(seed)      # 원래 탐색은 과소근사를 안 켰을 때와 같은 경로로
 
-    return _rec(active_bounds, 0, active_row_defs)
+        return _rec(active_bounds, 0, active_row_defs)
+    finally:
+        used = engine if engine is not None else core
+        if used is not None and stats is not None:
+            stats["LP_ENGINE"] = f"{used.name}-{lp_mode}"
+            stats["LP_ENGINE_FAILURES"] = (
+                stats.get("LP_ENGINE_FAILURES", 0) + getattr(used, "failures", 0)
+            )
+            if hasattr(used, "check_seconds"):
+                stats["Z3_CHECK_SECONDS"] = (
+                    stats.get("Z3_CHECK_SECONDS", 0.0) + used.check_seconds
+                )
+            if hasattr(used, "pivots"):
+                stats["GLPK_PIVOTS"] = stats.get("GLPK_PIVOTS", 0) + used.pivots
+            if hasattr(used, "conflicts_found"):
+                stats["ENGINE_CONFLICTS_FOUND"] = (
+                    stats.get("ENGINE_CONFLICTS_FOUND", 0) + used.conflicts_found
+                )
 
 
 # ─────────────────────────────────────────────

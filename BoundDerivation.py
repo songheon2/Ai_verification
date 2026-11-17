@@ -162,12 +162,18 @@ def derive_bounds(
     max_passes: int = 20,
     tol: float = 1e-9,
     deps: Optional[BoundDeps] = None,
+    incremental: bool = True,
 ) -> Tuple[Bounds, Dict[Tuple[str, str], str], bool]:
     """구간 전파를 고정점까지 돌린다.
 
     deps: 주면 경계마다 원인 분기 마스크를 제자리에서 갱신한다(BoundDeps).
         모순이면 deps.conflict, 확정한 ReLU의 근거는 deps.fixed에 남는다.
         원인 계산은 경계가 실제로 바뀔 때만 하므로 대부분의 row에서는 비용이 없다.
+    incremental: 두 번째 바퀴부터는 마지막으로 본 뒤 경계가 바뀐 변수가 든 row와
+        ReLU만 다시 본다. 한 row(ReLU)가 좁히는 결과는 그 변수들의 경계로만 정해지므로,
+        그 경계가 그대로인 row를 다시 봐도 아무것도 바뀌지 않는다 — 건너뛰어도 바퀴마다
+        일어나는 경계 변화, 모순, 원인 마스크가 전부 같다. ACAS Xu 노드에서 둘째
+        바퀴에 다시 볼 row가 70%, 다섯째 바퀴에 23%로 줄었다. 기본으로 켠다(False는 비교·검증용).
 
     Returns:
         (좁혀진 bounds, {(x, y): 'active'|'inactive'}, infeasible)
@@ -177,12 +183,34 @@ def derive_bounds(
     b: Bounds = {v: tuple(x) for v, x in bounds.items()}  # type: ignore[misc]
     relu_list = list(relus)
     fixed: Dict[Tuple[str, str], str] = {}
+    # incremental: prev = 앞 바퀴에서 바뀐 변수, cur = 이번 바퀴에서 지금까지 바뀐 변수
+    # (_tighten이 True를 돌려준 변수). 첫 바퀴는 모두 본다(prev=None).
+    prev: Optional[set] = None
+    cur: set = set()
+
+    def _crossed(lo: float, hi: float) -> bool:
+        # _tighten과 같은 모순 판정. 한 점으로 고정된 변수는 두 row로 유도한 값이 반올림
+        # 만큼 어긋나 l > u(tol 이내)로 남곤 한다 — 모순은 아니고 _tighten도 그대로 둔다.
+        return lo - hi > tol * max(1.0, abs(lo), abs(hi))
 
     for _ in range(max_passes):
         changed = False
 
         # ── 선형 제약 전파 ──
-        for name, coeffs in row_defs:
+        # row는 (head, 계수) 또는 (head, 계수, 오차 상한). 오차 상한 err는 근사 row
+        # (GLPK에서 가져온 표 row, LpEngines._row_error)가 경계 안에서 틀릴 수 있는
+        # 최대치다. 정방향은 err만큼, 역방향은 그 변수 계수로 나누므로 err/|c|만큼
+        # 넓힌다 — 반올림 잡음 계수로 나눠 오차를 키우는 일이 생기지 않는다.
+        for row in row_defs:
+            name, coeffs = row[0], row[1]
+            err = row[2] if len(row) > 2 else 0.0
+            if err == INF:
+                continue
+            if prev is not None and (
+                name not in prev and name not in cur
+                and coeffs.keys().isdisjoint(prev) and coeffs.keys().isdisjoint(cur)
+            ):
+                continue        # 마지막으로 본 뒤 이 row의 변수 경계가 그대로다
             terms = [(v, c) for v, c in coeffs.items() if c != 0.0 and v in b]
             if not terms or name not in b:
                 continue
@@ -208,16 +236,18 @@ def derive_bounds(
                 else:
                     hi_fin += t_hi
 
-            s_lo = -INF if lo_inf else lo_fin
-            s_hi = INF if hi_inf else hi_fin
+            s_lo = -INF if lo_inf else lo_fin - err
+            s_hi = INF if hi_inf else hi_fin + err
             cur_lo, cur_hi = b[name]
             # 아래 역방향과 같은 이유로, 좁힐 게 없으면 _tighten을 건너뛴다
-            if s_lo > cur_lo or s_hi < cur_hi or cur_lo > cur_hi:
+            if s_lo > cur_lo or s_hi < cur_hi or (cur_lo > cur_hi and _crossed(cur_lo, cur_hi)):
                 d_lo, d_hi = _row_deps(terms, deps) if deps is not None else (0, 0)
                 r = _tighten(b, name, s_lo, s_hi, tol, deps, d_lo, d_hi)
                 if r is None:
                     return b, fixed, True
-                changed |= r
+                if r:
+                    changed = True
+                    cur.add(name)
 
             # 역방향: name과 "나머지 항"으로 각 v를 좁힌다
             n_lo, n_hi = b[name]
@@ -237,8 +267,8 @@ def derive_bounds(
                     rest_hi = INF if hi_inf else hi_fin - t_hi
 
                 # c*v = name - rest
-                cv_lo = -INF if (n_lo == -INF or rest_hi == INF) else n_lo - rest_hi
-                cv_hi = INF if (n_hi == INF or rest_lo == -INF) else n_hi - rest_lo
+                cv_lo = -INF if (n_lo == -INF or rest_hi == INF) else n_lo - rest_hi - err
+                cv_hi = INF if (n_hi == INF or rest_lo == -INF) else n_hi - rest_lo + err
                 if c > 0:
                     v_lo = -INF if cv_lo == -INF else cv_lo / c
                     v_hi = INF if cv_hi == INF else cv_hi / c
@@ -250,7 +280,10 @@ def derive_bounds(
                 # 유도를 돌리면 호출의 대부분이 이 경우라서 함수 호출 자체를
                 # 건너뛴다 (결과는 같고 비용만 준다).
                 cur_lo, cur_hi = b[v]
-                if v_lo <= cur_lo and v_hi >= cur_hi and cur_lo <= cur_hi:
+                # (l > u여도 tol 안이면 _tighten은 모순도 변화도 없다 — 건너뛴다. 이걸
+                # 막아 두면 고정된 변수가 든 긴 row마다 마스크를 헛계산한다: GLPK row
+                # 오차를 빼자 4_5/φ3 노드에서 이런 호출이 10만 번 넘게 나왔다)
+                if v_lo <= cur_lo and v_hi >= cur_hi and (cur_lo <= cur_hi or not _crossed(cur_lo, cur_hi)):
                     continue
                 d_lo = d_hi = 0
                 if deps is not None:
@@ -265,7 +298,9 @@ def derive_bounds(
                 r = _tighten(b, v, v_lo, v_hi, tol, deps, d_lo, d_hi)
                 if r is None:
                     return b, fixed, True
-                changed |= r
+                if r:
+                    changed = True
+                    cur.add(v)
 
         # ── ReLU 의미 전파 ──
         # 원인 마스크: relu의 정의에서 바로 나오는 관계(y >= 0, y >= x, x <= y,
@@ -274,6 +309,9 @@ def derive_bounds(
         for x, y in relu_list:
             if x not in b or y not in b:
                 continue
+            if prev is not None and x not in prev and x not in cur and y not in prev and y not in cur:
+                continue
+            bx0, by0 = b[x], b[y]           # 바뀌면 새 tuple이 들어간다 (cur 기록용)
             x_lo, x_hi = b[x]
             dxl = dxh = 0
             if deps is not None:
@@ -334,9 +372,17 @@ def derive_bounds(
                 if r is None:
                     return b, fixed, True
                 changed |= r
+            if b[x] is not bx0:
+                cur.add(x)
+            if b[y] is not by0:
+                cur.add(y)
 
         if not changed:
             break
+        if incremental:
+            prev, cur = cur, set()
+        else:
+            cur.clear()
 
     return b, fixed, False
 

@@ -172,6 +172,7 @@ from DPLL import (
 )
 from DPLL_T import dpll_t_detailed
 from Reluplex import FEATURES, feature_options
+from LpEngines import ENGINES as LP_ENGINES
 from GenericNNEncoding import NNModel, encode_nn
 from Automation.ModelInspector import (
     ModelInfo,
@@ -1623,6 +1624,15 @@ def _write_json_result(result: Mapping[str, Any], output_path: str) -> None:
         handle.write("\n")
 
 
+def _reluplex_options(args: argparse.Namespace) -> Dict[str, Any]:
+    """CLI의 --features / --under-approx-eps / --lp-engine / --lp-mode를 reluplex() 인자로."""
+    options = feature_options(args.features, args.under_approx_eps)
+    options["lp_engine"] = args.lp_engine
+    if args.lp_mode:
+        options["lp_mode"] = args.lp_mode
+    return options
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Inspect and verify supported FC+ReLU ONNX/custom models"
@@ -1681,6 +1691,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--under-approx-eps", type=float, default=0.1,
         help="--features에 underapprox가 있을 때 과소근사의 eps (기본 0.1)",
     )
+    verify_parser.add_argument(
+        "--lp-engine", default="native", choices=("native",) + LP_ENGINES,
+        help="노드 LP를 푸는 엔진 (엔진 비교 실험용). native=지금 방식(자체 simplex의 "
+        "tableau를 Reluplex가 직접 다룸), simplex=자체 simplex를 엔진처럼(통제군), "
+        "glpk, z3",
+    )
+    verify_parser.add_argument(
+        "--lp-mode", choices=("core", "oracle"), default=None,
+        help="--lp-engine이 glpk/z3일 때 엔진을 끼우는 방식. core(기본)=카츠 Reluplex 구조: "
+        "자기 tableau를 들고 simplex 자리만 엔진에 맡겨 기법 ①②③④가 모두 돈다. "
+        "oracle=정의식과 경계만 넘기고 해가 있나만 받는다",
+    )
     verify_parser.add_argument("--json-output", help="write detailed results as JSON")
 
     vnnlib_parser = subparsers.add_parser(
@@ -1721,6 +1743,18 @@ def build_parser() -> argparse.ArgumentParser:
     vnnlib_parser.add_argument(
         "--under-approx-eps", type=float, default=0.1,
         help="--features에 underapprox가 있을 때 과소근사의 eps (기본 0.1)",
+    )
+    vnnlib_parser.add_argument(
+        "--lp-engine", default="native", choices=("native",) + LP_ENGINES,
+        help="노드 LP를 푸는 엔진 (엔진 비교 실험용). native=지금 방식(자체 simplex의 "
+        "tableau를 Reluplex가 직접 다룸), simplex=자체 simplex를 엔진처럼(통제군), "
+        "glpk, z3",
+    )
+    vnnlib_parser.add_argument(
+        "--lp-mode", choices=("core", "oracle"), default=None,
+        help="--lp-engine이 glpk/z3일 때 엔진을 끼우는 방식. core(기본)=카츠 Reluplex 구조: "
+        "자기 tableau를 들고 simplex 자리만 엔진에 맡겨 기법 ①②③④가 모두 돈다. "
+        "oracle=정의식과 경계만 넘기고 해가 있나만 받는다",
     )
     vnnlib_parser.add_argument("--json-output")
     vnnlib_parser.add_argument(
@@ -1851,7 +1885,7 @@ def main() -> int:
                 split_heatmap_threshold=args.split_heatmap_threshold,
                 split_heatmap_cap=args.split_heatmap_cap,
                 profile_stages=args.profile_stages,
-                reluplex_options=feature_options(args.features, args.under_approx_eps),
+                reluplex_options=_reluplex_options(args),
             )
             _print_vnnlib_verification(result)
             if result.get("result_path"):
@@ -1874,7 +1908,7 @@ def main() -> int:
             simplex_max_iter_override=args.simplex_max_iter,
             max_recursion_override=args.max_recursion,
             profile_stages=args.profile_stages,
-            reluplex_options=feature_options(args.features, args.under_approx_eps),
+            reluplex_options=_reluplex_options(args),
         )
         _print_verification(result)
         if args.json_output:

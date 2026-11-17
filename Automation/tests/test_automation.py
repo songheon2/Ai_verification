@@ -1060,5 +1060,316 @@ class FeatureSwitchTests(unittest.TestCase):
                         self.assertEqual(stats.get("CLOSED_MEASURE"), 1.0)
 
 
+def _importable(module: str) -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec(module) is not None
+
+
+class LpEngineTests(unittest.TestCase):
+    """노드 LP를 바깥 엔진(자체 simplex 통제군 / GLPK / Z3)에 맡기는 경로."""
+
+    def _engines(self):
+        from LpEngines import ENGINES
+
+        available = {"simplex": True, "glpk": _importable("swiglpk"), "z3": _importable("z3")}
+        return [name for name in ENGINES if available[name]]
+
+    def test_engine_merges_equalities_and_frees_absent_rows(self):
+        from LpEngines import make_engine
+
+        inf = float("inf")
+        # x + y = 2 를 >= 두 개로 (DPLL_T가 등식을 넣는 방식)
+        rows = [("s1", {"x": 1.0, "y": 1.0}), ("s2", {"x": -1.0, "y": -1.0})]
+        for name in self._engines():
+            with self.subTest(engine=name):
+                engine = make_engine(name, {"max_iter": 1000})
+                bounds = {"s1": (2.0, inf), "s2": (-2.0, inf), "x": (0.0, 1.0), "y": (0.0, 0.5)}
+                self.assertIsNone(engine.solve(rows, bounds))       # x + y <= 1.5
+                bounds["y"] = (0.0, 1.0)
+                sol = engine.solve(rows, bounds)
+                self.assertIsNotNone(sol)
+                self.assertAlmostEqual(sol["x"] + sol["y"], 2.0, places=9)
+                self.assertAlmostEqual(sol["s1"], 2.0, places=9)
+                self.assertAlmostEqual(sol["s2"], -2.0, places=9)
+                # 이번 호출에 없는 row(s1, s2)는 제약이 아니다
+                sol = engine.solve([("s3", {"x": 1.0})], {"s3": (0.0, 0.25),
+                                                          "x": (0.0, 1.0), "y": (0.0, 0.0)})
+                self.assertIsNotNone(sol)
+                self.assertLessEqual(sol["x"], 0.25 + 1e-9)
+                self.assertEqual(sol["y"], 0.0)
+                with self.assertRaises(ValueError):
+                    engine.solve([("s1", {"x": 2.0})], bounds)       # 같은 head, 다른 식
+
+    def test_engines_keep_verdicts(self):
+        for seed in range(20):
+            rows, bounds, relus, forward, theta = _random_relu_problem(seed)
+            _model, expected = reluplex(rows, dict(bounds), relus, max_recursion=100)
+            for name in self._engines():
+                modes = ("oracle",) if name == "simplex" else ("core", "oracle")
+                for mode, setting in [(m, s) for m in modes for s in ("default", "none", "all")]:
+                    with self.subTest(seed=seed, engine=name, mode=mode, features=setting):
+                        stats = {}
+                        model, sat = reluplex(
+                            rows, dict(bounds), relus, max_recursion=100, stats=stats,
+                            lp_engine=name, lp_mode=mode, **feature_options(setting),
+                        )
+                        self.assertEqual(sat, expected)
+                        if sat:
+                            self.assertGreaterEqual(
+                                forward([model["x0"], model["x1"]]), theta - 1e-6
+                            )
+                        else:
+                            self.assertEqual(stats.get("CLOSED_MEASURE"), 1.0)
+                        if stats.get("LP_CALLS"):
+                            self.assertEqual(stats.get("LP_ENGINE"), f"{name}-{mode}")
+
+    @unittest.skipUnless(_importable("swiglpk"), "swiglpk 없음")
+    def test_glpk_core_imports_a_consistent_tableau(self):
+        """GLPK가 푼 기저의 표를 가져온 tableau가 원래 등식·경계를 만족하는가."""
+        from LpEngines import GlpkCore
+        from Simplex import build_tableau
+
+        for seed in range(10):
+            rows, bounds, _relus, _forward, _theta = _random_relu_problem(seed)
+            for tighten in (False, True):
+                with self.subTest(seed=seed, tighten=tighten):
+                    tableau = build_tableau(rows, dict(bounds))
+                    sol, sat = GlpkCore().simplex(tableau, tighten_bounds=tighten,
+                                                  full_tighten_every=3)
+                    if not sat:
+                        continue
+                    self.assertEqual(len(tableau.rows), len(rows))
+                    for row in tableau.rows:      # 반올림 잡음 계수가 남지 않았다
+                        mags = [abs(c) for c in row.coeffs.values()]
+                        if mags:
+                            self.assertGreater(min(mags), 1e-12 * max(mags))
+                    for row in tableau.rows:      # 표 row가 값에서 성립
+                        expected = sum(c * sol[v] for v, c in row.coeffs.items())
+                        self.assertAlmostEqual(sol[row.basic_var], expected, places=7)
+                    for head, terms in rows:      # 원래 등식도 성립
+                        expected = sum(c * sol[v] for v, c in terms.items())
+                        self.assertAlmostEqual(sol[head], expected, places=7)
+                    for var, b in tableau.bounds.items():
+                        self.assertGreaterEqual(sol[var], b.lower - 1e-7)
+                        self.assertLessEqual(sol[var], b.upper + 1e-7)
+
+    @unittest.skipUnless(_importable("swiglpk"), "swiglpk 없음")
+    def test_glpk_basis_extract_pivots_to_glpk_basis(self):
+        """extract="basis"(카츠 방식): 우리 tableau를 GLPK 기저로 피벗한 결과가 맞는 tableau다."""
+        import copy
+        from LpEngines import GlpkCore, _pivot_touched
+        from Simplex import _pivot, build_tableau
+
+        for seed in range(10):
+            rows, bounds, _relus, _forward, _theta = _random_relu_problem(seed)
+            # 피벗 계산은 Simplex._pivot과 같다(잡음 계수 정리만 더한다)
+            tab = build_tableau(rows, dict(bounds))
+            for k, row in enumerate(tab.rows):
+                if row.coeffs:
+                    xi = max(row.coeffs, key=lambda v: abs(row.coeffs[v]))
+                    ref = copy.deepcopy(tab)
+                    _pivot(ref, xi, row.basic_var)
+                    _pivot_touched(tab.rows, k, xi)
+                    for mine, theirs in zip(tab.rows, ref.rows):
+                        self.assertEqual(mine.basic_var, theirs.basic_var)
+                        for v in set(mine.coeffs) | set(theirs.coeffs):
+                            self.assertAlmostEqual(mine.coeffs.get(v, 0.0),
+                                                   theirs.coeffs.get(v, 0.0), places=12)
+                    break
+            for tighten in (False, True):
+                with self.subTest(seed=seed, tighten=tighten):
+                    tableau = build_tableau(rows, dict(bounds))
+                    stats = {}
+                    core = GlpkCore(extract="basis")
+                    sol, sat = core.simplex(tableau, tighten_bounds=tighten,
+                                            full_tighten_every=3, stats=stats)
+                    if not sat:
+                        continue
+                    if not stats.get("GLPK_ADOPT_FALLBACK") and not stats.get("GLPK_ADOPT_SKIPPED"):
+                        m = core.glp.glp_get_num_rows(core.lp)
+                        glpk_basis = {core._name(core.glp.glp_get_bhead(core.lp, i), m)
+                                      for i in range(1, m + 1)}
+                        self.assertEqual(set(tableau.basic_vars), glpk_basis)
+                    basic = set(tableau.basic_vars)
+                    for row in tableau.rows:
+                        self.assertFalse(basic & set(row.coeffs))
+                        expected = sum(c * sol[v] for v, c in row.coeffs.items())
+                        self.assertAlmostEqual(sol[row.basic_var], expected, places=7)
+                    for head, terms in rows:
+                        expected = sum(c * sol[v] for v, c in terms.items())
+                        self.assertAlmostEqual(sol[head], expected, places=7)
+                    for var, b in tableau.bounds.items():
+                        self.assertGreaterEqual(sol[var], b.lower - 1e-7)
+                        self.assertLessEqual(sol[var], b.upper + 1e-7)
+
+    def test_incremental_derive_is_identical(self):
+        """incremental 경계 유도는 경계·확정 ReLU·모순·원인 마스크가 원래와 똑같다."""
+        import random
+        from BoundDerivation import BoundDeps
+
+        for seed in range(30):
+            rows, bounds, relus, _forward, _theta = _random_relu_problem(seed)
+            rng = random.Random(seed)
+            # 분기로 좁아진 노드처럼: 경계 몇 개를 좁히고 원인 비트를 붙인다
+            node = dict(bounds)
+            lo_m, hi_m = {}, {}
+            for x, _y in rng.sample(list(relus), k=min(2, len(relus))):
+                lo, hi = node.get(x, (-float("inf"), float("inf")))
+                bit = 1 << rng.randint(1, 5)
+                if rng.random() < 0.5:
+                    node[x] = (max(lo, 0.0), hi); lo_m[x] = bit
+                else:
+                    node[x] = (lo, min(hi, 0.0)); hi_m[x] = bit
+            for passes in (20, 2):
+                with self.subTest(seed=seed, passes=passes):
+                    out = []
+                    for inc in (False, True):
+                        deps = BoundDeps(lo_m, hi_m)
+                        b, fixed, inf = derive_bounds(rows, dict(node), relus, deps=deps,
+                                                      max_passes=passes, incremental=inc)
+                        out.append((b, list(fixed.items()), inf, deps.lo, deps.hi,
+                                    deps.conflict, deps.fixed))
+                    self.assertEqual(out[0], out[1])
+
+    def test_derive_options_keep_verdicts(self):
+        for seed in range(20):
+            rows, bounds, relus, forward, theta = _random_relu_problem(seed)
+            _model, expected = reluplex(rows, dict(bounds), relus, max_recursion=100)
+            for passes in (20, 1):
+                with self.subTest(seed=seed, passes=passes):
+                    model, sat = reluplex(
+                        rows, dict(bounds), relus, max_recursion=100,
+                        **feature_options("bound,backjump,numeric"), check_backjump=True,
+                        derive_incremental=True, search_derive_passes=passes,
+                    )
+                    self.assertEqual(sat, expected)
+                    if sat:
+                        self.assertGreaterEqual(forward([model["x0"], model["x1"]]), theta - 1e-6)
+
+    @unittest.skipUnless(_importable("swiglpk"), "swiglpk 없음")
+    def test_glpk_basis_extract_keeps_verdicts(self):
+        for seed in range(20):
+            rows, bounds, relus, forward, theta = _random_relu_problem(seed)
+            _model, expected = reluplex(rows, dict(bounds), relus, max_recursion=100)
+            with self.subTest(seed=seed):
+                stats = {}
+                model, sat = reluplex(
+                    rows, dict(bounds), relus, max_recursion=100, stats=stats,
+                    lp_engine="glpk", glpk_extract="basis",
+                    **feature_options("bound,backjump,numeric"), check_backjump=True,
+                )
+                self.assertEqual(sat, expected)
+                if sat:
+                    self.assertGreaterEqual(forward([model["x0"], model["x1"]]), theta - 1e-6)
+
+    @unittest.skipUnless(_importable("swiglpk"), "swiglpk 없음")
+    def test_glpk_row_error_only_for_imported_rows(self):
+        """row 오차는 GLPK에서 표 row를 가져온 tableau에만 붙인다(row_error="auto").
+        "basis"는 우리 피벗만 거치므로 안 붙이고, "full"과 "always"는 붙인다.
+        한 번 가져온 tableau의 자식도 붙인다. 어느 쪽이든 판정은 같다."""
+        import copy
+        from LpEngines import GlpkCore
+        from Simplex import build_tableau
+
+        rows, bounds, relus, forward, theta = _random_relu_problem(0)
+        for extract, row_error, want in (("basis", "auto", False), ("full", "auto", True),
+                                         ("basis", "always", True)):
+            with self.subTest(extract=extract, row_error=row_error):
+                tableau = build_tableau(rows, dict(bounds))
+                core = GlpkCore(extract=extract, row_error=row_error)
+                self.assertFalse(core.needs_row_error(tableau) and row_error == "auto")
+                stats = {}
+                _sol, sat = core.simplex(tableau, stats=stats)
+                self.assertTrue(sat)
+                if stats.get("GLPK_ADOPT_FALLBACK"):
+                    continue
+                self.assertEqual(core.needs_row_error(tableau), want)
+                self.assertEqual(core.needs_row_error(copy.deepcopy(tableau)), want)
+        for seed in range(20):
+            rows, bounds, relus, forward, theta = _random_relu_problem(seed)
+            verdicts = set()
+            for row_error in ("auto", "always"):
+                stats = {}
+                model, sat = reluplex(
+                    rows, dict(bounds), relus, max_recursion=100, stats=stats,
+                    lp_engine="glpk", glpk_extract="basis", glpk_row_error=row_error,
+                    **feature_options("bound,backjump,numeric"), check_backjump=True,
+                )
+                verdicts.add(sat)
+                if sat:
+                    self.assertGreaterEqual(forward([model["x0"], model["x1"]]), theta - 1e-6)
+            self.assertEqual(len(verdicts), 1, seed)
+
+    def test_inexact_row_error_blocks_noise_division(self):
+        """③: GLPK 표 row에 남은 반올림 잡음 계수로 나눠 가짜 모순을 만들지 않는다.
+
+        1_9/φ3(SAT)에서 실제로 나온 row: s203 = -1.000000000000002*s202 - 1.72e-12*s94.
+        원래는 s203 = -s202라 s94의 계수는 0이어야 한다. 셋 다 한 점으로 고정된 경계에서
+        s94를 이 row로 풀면 2.6e-16 / 1.72e-12로 나눠 가짜 모순이 났다. row 오차 상한을
+        붙이면 그만큼 넓혀서 모순이 나지 않고, 진짜 모순은 그대로 잡는다."""
+        from LpEngines import _bound_mag, _row_error
+
+        defs = {"s202": {"x1": 1.0}, "s203": {"x1": -1.0}, "s94": {"x2": 1.0}}
+        a, b = 0.12810300290584564, -0.013009699992835522
+        bounds = {"x1": (a, a), "x2": (b, b), "s202": (a, a), "s203": (-a, -a), "s94": (b, b)}
+        tab = {"s202": -1.000000000000002, "s94": -1.72e-12}
+        _b, _f, infeasible = derive_bounds([("s203", tab)], dict(bounds), [])
+        self.assertTrue(infeasible)          # 오차를 모르면 가짜 모순
+        err = _row_error(defs, "s203", tab, _bound_mag(bounds))
+        self.assertGreater(err, 0.0)
+        self.assertLess(err, 1e-12)
+        _b, _f, infeasible = derive_bounds([("s203", tab, err)], dict(bounds), [])
+        self.assertFalse(infeasible)
+        # 진짜 모순(s203이 s202와 부호가 같다)은 오차를 붙여도 잡는다
+        wrong = dict(bounds, s203=(a, a))
+        _b, _f, infeasible = derive_bounds([("s203", tab, err)], wrong, [])
+        self.assertTrue(infeasible)
+
+    def test_core_conflicts_never_skip_a_sat_branch(self):
+        """②: 코어 엔진이 남긴 UNSAT 원인으로 백점프해도 SAT 가지를 건너뛰지 않는다
+        (check_backjump는 건너뛸 가지를 실제로 풀어 SAT이면 AssertionError)."""
+        from LpEngines import CORES
+
+        available = {"glpk": _importable("swiglpk"), "z3": _importable("z3")}
+        for seed in range(20):
+            rows, bounds, relus, _forward, _theta = _random_relu_problem(seed)
+            _model, expected = reluplex(rows, dict(bounds), relus, max_recursion=100)
+            for name in CORES:
+                if not available[name]:
+                    continue
+                with self.subTest(seed=seed, engine=name):
+                    stats = {}
+                    _m, sat = reluplex(
+                        rows, dict(bounds), relus, max_recursion=100, stats=stats,
+                        lp_engine=name, **feature_options("bound,backjump,numeric"),
+                        check_backjump=True,
+                    )
+                    self.assertEqual(sat, expected)
+
+    def test_unknown_engine_is_rejected(self):
+        rows, bounds, relus, _forward, _theta = _random_relu_problem(0)
+        with self.assertRaises(ValueError):
+            reluplex(rows, dict(bounds), relus, lp_engine="cplex")
+        with self.assertRaises(ValueError):
+            reluplex(rows, dict(bounds), relus, lp_engine="simplex", lp_mode="core")
+        with self.assertRaises(ValueError):
+            reluplex(rows, dict(bounds), relus, lp_engine="glpk", lp_mode="typo")
+
+    def test_cli_passes_lp_engine(self):
+        from Automation.AutoVerify import _reluplex_options, build_parser
+
+        args = build_parser().parse_args(
+            ["verify-vnnlib", "--model", "m.onnx", "--vnnlib", "p.vnnlib", "--lp-engine", "glpk"]
+        )
+        options = _reluplex_options(args)
+        self.assertEqual(options["lp_engine"], "glpk")
+        self.assertEqual(
+            {k: v for k, v in options.items() if k != "lp_engine"}, feature_options("default")
+        )
+        args = build_parser().parse_args(["verify-vnnlib", "--model", "m.onnx", "--vnnlib", "p.vnnlib"])
+        self.assertEqual(_reluplex_options(args)["lp_engine"], "native")
+
+
 if __name__ == "__main__":
     unittest.main()

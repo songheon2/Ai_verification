@@ -19,6 +19,8 @@ from time import sleep, time_ns
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from visualization.RenderLock import serialized_render
+from visualization.ReluNeuronHover import HOVER_SCRIPT, write_relu_hover_map
+from visualization.AtomicFile import write_atomic_text
 from visualization.ReluSearchTree import branch_log_path
 from visualization.RenderProcess import (
     REALTIME_RENDER_INTERVAL_SECONDS,
@@ -219,9 +221,7 @@ class SplitEventLogger:
             rounds = metadata.setdefault("round_starts", [])
             rounds.append({"round": round_index, "time_ns": time_ns()})
             destination = split_metadata_path(self.path)
-            temporary = destination.with_suffix(".tmp")
-            temporary.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
-            os.replace(temporary, destination)
+            write_atomic_text(destination, json.dumps(metadata, ensure_ascii=False))
         self.request_update()
 
     def end(self, split_id: str, variable: str, layer: Optional[int], index: Optional[int]) -> None:
@@ -281,6 +281,12 @@ class SplitEventLogger:
             "event": "relu_stable", "depth": depth, "source": source,
             "records": records,
             "round_index": self._round_index if round_index is None else round_index,
+        })
+
+    def mechanism(self, *, depth: int, kind: str, **metadata) -> None:
+        self._append_branch({
+            "event": "relu_mechanism", "depth": depth, "kind": kind,
+            "round_index": self._round_index, **metadata,
         })
 
     def _append_branch(self, values: Dict) -> None:
@@ -548,8 +554,12 @@ def draw_realtime_split_dashboard(
 
     if events is None:
         events = read_split_events(path)
-    if full_history and round_starts is None:
-        round_starts = read_split_metadata(path).get("round_starts", [])
+    if round_starts is None:
+        hover_round_starts = read_split_metadata(path).get("round_starts", [])
+        if full_history:
+            round_starts = hover_round_starts
+    else:
+        hover_round_starts = round_starts
     active_counts, total_counts, unknown_active = split_neuron_counts(events)
     fig = plt.figure(figsize=(10.5, 7.2))
     grid = fig.add_gridspec(2, 1, height_ratios=(1.0, 1.65), hspace=0.42)
@@ -679,6 +689,7 @@ def draw_realtime_split_dashboard(
         top=0.92,
         bottom=0.12 if model_layer_sizes else 0.09,
     )
+    fig._relu_hover_geometry = (neuron_ax, observed, marker_sizes if observed else [], events, hover_round_starts)
     return fig, {"history": history_ax, "neurons": neuron_ax}
 
 
@@ -756,8 +767,10 @@ class RealtimeSplitVisualizer:
     <img id="split-view" alt="Realtime ReLU split visualization">
   </main>
   <script>
+    {HOVER_SCRIPT}
     const imageName = {image_name};
     const image = document.getElementById("split-view");
+    image.onload = () => attachReluNeuronHover(image,imageName);
     function refresh() {{
       image.src = imageName + "?t=" + Date.now();
     }}
@@ -801,6 +814,7 @@ class RealtimeSplitVisualizer:
             # 실시간 화면은 정적 보고서보다 새 프레임 도착 속도가 중요하다.
             # 낮은 DPI와 고정 canvas를 사용해 tight-bbox 재계산 비용도 피한다.
             fig.savefig(temporary_output, dpi=100)
+            write_relu_hover_map(fig, self.output_path)
             os.replace(temporary_output, self.output_path)
         finally:
             plt.close(fig)

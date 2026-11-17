@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Tuple, Optional
 from Simplex import (
     Bound,
     DEFAULT_TOL,
+    DRIFT_TOL, DRIFT_CHECK_EVERY, DRIFT_CHECK_AT_EXIT,
     Row,
     SimplexTableau,
     _compute_basic,
@@ -276,6 +277,8 @@ def reluplex(
     glpk_row_error: str = "auto",
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
+    local_repair_max_iter: 탐색 노드별 전체 수정 시도 횟수 상한.
+        성공 여부와 관계없이 시도마다 1회 소비한다. branch_tau는 뉴런별 시도 상한.
     derive_in_search: 분기로 좁아진 경계로 노드마다 경계 유도를 다시 돌린다
         (논문 5절: "ReLU의 약 10%를 분기하면 경계 유도로 나머지가 전부
         제거되는 경우가 잦았다"). 모순이 나오면 LP를 풀지 않고 그 가지를
@@ -436,7 +439,12 @@ def reluplex(
     core = None
 
     def _simplex(*args, **kwargs):
-        return (core.simplex if core is not None else simplex)(*args, **kwargs)
+        if core is None:
+            return simplex(*args, **kwargs)
+        # 엔진 코어(LpEngines)는 시각화 기록 콜백을 받지 않는다
+        for key in ("mechanism_callback", "numerical_callback", "bound_change_callback"):
+            kwargs.pop(key, None)
+        return core.simplex(*args, **kwargs)
 
     def _engine_solve(
         rows_now: List[Tuple[str, Dict[str, float]]],
@@ -446,6 +454,77 @@ def reluplex(
         with _lp_timer(repair):
             # repair는 값을 잠깐 고정하고 푼다: 그때 좁힌 경계는 노드 전체에서 성립하지 않는다
             return engine.solve(rows_now, bounds_now, deadline)
+
+    record_mechanisms = trace is not None or hasattr(split_logger, "mechanism")
+
+    def _record_mechanism(kind: str, depth: int, **metadata) -> None:
+        if not record_mechanisms:
+            return
+        metadata.update(kind=kind, round_index=base_progress_context.get("round_index"))
+        with span(trace, "reluplex_mechanism", depth=depth, **metadata):
+            pass
+        if hasattr(split_logger, "mechanism"):
+            split_logger.mechanism(depth=depth, **metadata)
+
+    _record_mechanism("settings", 0, backjump=backjump,
+                      derive_in_search=derive_in_search, pivot_tighten=pivot_tighten,
+                      full_tighten_every=full_tighten_every, derive_bound=derive_bound,
+                      drift_threshold=DRIFT_TOL, drift_check_every=DRIFT_CHECK_EVERY,
+                      drift_check_at_exit=DRIFT_CHECK_AT_EXIT,
+                      numeric_safeguards=numeric_safeguards,
+                      underapprox_enabled=under_approx > 0.0, underapprox_epsilon=under_approx)
+
+    def _lp_events(depth: int, **metadata) -> None:
+        if any(metadata.get(key, 0) for key in
+               ("cycles", "pivot_tightened", "full_tighten", "bound_conflicts")):
+            _record_mechanism("simplex", depth, **metadata)
+
+    bound_variables = {}
+    if record_mechanisms:
+        for x, y in relus:
+            key = (relu_metadata or {}).get((x, y)) or _parse_neuron_var(x)
+            for var, role in ((x, "z"), (y, "h")):
+                bound_variables[var] = {"variable": var, "neuron": x, "role": role,
+                                        "layer": key[0] if key else None, "index": key[1] if key else None}
+
+    def _bound_recorder(depth, source):
+        pending = []
+
+        def flush():
+            if pending:
+                _record_mechanism("bound_updates", depth, source=source, changes=list(pending))
+                pending.clear()
+
+        def changed(variable, before, after, *, source=source):
+            if variable not in bound_variables or before == after:
+                return
+            pending.append({**bound_variables[variable], "source": source,
+                            "before": [value if isfinite(value) else None for value in before],
+                            "after": [value if isfinite(value) else None for value in after],
+                            "observed_at": time.monotonic()})
+            # Batch log writes while retaining every actual change in order.
+            if len(pending) >= 64:
+                flush()
+
+        return changed, flush
+
+    def _derive_observed(*args, observation_depth, observation_source, **kwargs):
+        if not record_mechanisms:
+            return derive_bounds(*args, **kwargs)
+        changed, flush = _bound_recorder(observation_depth, observation_source)
+        try:
+            return derive_bounds(*args, on_change=changed, **kwargs)
+        finally:
+            flush()
+
+    def _simplex_observed(*args, observation_depth, **kwargs):
+        if not record_mechanisms:
+            return _simplex(*args, **kwargs)
+        changed, flush = _bound_recorder(observation_depth, "lp-pivot")
+        try:
+            return _simplex(*args, bound_change_callback=changed, **kwargs)
+        finally:
+            flush()
 
     record_stable = trace is not None or hasattr(split_logger, "stable")
 
@@ -491,6 +570,9 @@ def reluplex(
         합이라, 둘의 비가 "모순이 경로의 몇 할에 기대는가"이다.
         """
         _closed(depth, kind)
+        _record_mechanism("conflict", depth, source=kind,
+                          cause_depths=([i for i in range(1, depth + 1)
+                                         if mask & (1 << i)] if mask is not None else None))
         last_unsat_origin[0] = "found"
         if not track_deps:
             last_conflict[0] = None
@@ -521,7 +603,7 @@ def reluplex(
             return assign, True
         return _limit("RELUPLEX_MODEL_INVALID")
 
-    def _apply_relu_fix(tableau: SimplexTableau, x: str, y: str) -> Optional[str]:
+    def _apply_relu_fix(tableau: SimplexTableau, x: str, y: str, depth: int) -> Optional[str]:
         """위반된 ReLU 쌍 하나를 tableau에서 제자리로 고친다.
 
         논문 3절의 Update_f(y := relu(x))와 Update_b(x := y) 중 하나를 적용한다.
@@ -534,6 +616,7 @@ def reluplex(
         수정으로 생긴 경계 위반은 호출자가 simplex로 이어서 고친다.
         """
         basic = {row.basic_var for row in tableau.rows}
+        before = [tableau.assign[x], tableau.assign[y]] if record_mechanisms else None
         options = [
             ("update_f", y, relu(tableau.assign[x])),
             ("update_b", x, tableau.assign[y]),
@@ -563,7 +646,12 @@ def reluplex(
                 tableau.pivots_since_check += 1
                 _bump("REPAIR_PIVOTS")
             _update_assign(tableau, var, target)
+            _record_mechanism("repair", depth, variable=x, output=y, rule=rule,
+                              pivoted=var in basic, before=before,
+                              after=[tableau.assign[x], tableau.assign[y]])
             return rule
+        _record_mechanism("repair", depth, variable=x, output=y, rule="unfixable",
+                          pivoted=False, before=before, after=before)
         return None
 
     def _enforce_fixed(
@@ -712,12 +800,18 @@ def reluplex(
                     derive_rows.extend(core.rows_with_error(warm, bounds_now))
                 else:
                     derive_rows.extend((row.basic_var, row.coeffs) for row in warm.rows)
-            tightened, fixed_here, infeasible = derive_bounds(
+            tightened, fixed_here, infeasible = _derive_observed(
                 derive_rows, bounds_now, active, deps=deps_now,
                 max_passes=search_derive_passes, incremental=derive_incremental,
+                observation_depth=depth, observation_source="search",
             )
             _bump("SEARCH_DERIVE_CALLS")
             _bump("SEARCH_DERIVE_SECONDS", time.perf_counter() - started)
+            if record_mechanisms:
+                changed = sum(bounds_now[v] != bound for v, bound in tightened.items())
+                _record_mechanism("bounds", depth, source="search", changed=changed,
+                                  fixed=len(fixed_here), conflict=infeasible,
+                                  seconds=time.perf_counter() - started)
             if infeasible:
                 # 전파만으로 l > u 모순 — 이 가지는 LP를 풀 필요도 없이 UNSAT
                 return _unsat(
@@ -824,8 +918,9 @@ def reluplex(
                     tableau.deps = deps_now.copy()
             while True:
                 with _lp_timer(), span(trace, "simplex", depth=depth):
-                    sol, sat = _simplex(
+                    sol, sat = _simplex_observed(
                         tableau,
+                        observation_depth=depth,
                         max_iter=simplex_max_iter,
                         debug=debug,
                         deadline=deadline,
@@ -839,6 +934,10 @@ def reluplex(
                         stats=stats,
                         tighten_bounds=pivot_tighten,
                         full_tighten_every=full_tighten_every,
+                        mechanism_callback=(lambda **values: _lp_events(depth, **values))
+                        if record_mechanisms else None,
+                        numerical_callback=(lambda **values: _record_mechanism("numerical", depth, **values))
+                        if record_mechanisms else None,
                         numeric_safeguards=numeric_safeguards,
                     )
 
@@ -868,8 +967,9 @@ def reluplex(
                 # 정해졌는데 강제하지 않으면 그 ReLU는 위반 중이어도 분기 후보가
                 # 아니게 되어(_splittable=False) 탐색이 결론 없이 끝난다. 그래서
                 # 강제한 뒤 이 노드의 LP를 다시 푼다.
-                tightened, fixed_here, infeasible = derive_bounds(
-                    [], bounds_now, active, max_passes=1, deps=deps_now
+                tightened, fixed_here, infeasible = _derive_observed(
+                    [], bounds_now, active, max_passes=1, deps=deps_now,
+                    observation_depth=depth, observation_source="pivot",
                 )
                 if infeasible:
                     return _unsat(
@@ -877,6 +977,8 @@ def reluplex(
                         deps_now.conflict if deps_now is not None else None,
                     )
                 _record_stable(fixed_here, stable_before, tightened, depth, "pivot")
+                _record_mechanism("bounds", depth, source="pivot", changed=0,
+                                  fixed=len(fixed_here), conflict=False)
                 bounds_now = tightened
                 if not fixed_here:
                     break
@@ -893,12 +995,8 @@ def reluplex(
                 return _validated_sat(assign, current_row_defs, bounds_now)
 
             # ── ReLU 위반 수정 (논문 3절 Update_b / Update_f / PivotForRelu) ──
-            # 노드의 tableau를 제자리에서 고친다. 한 쌍을 고치면 새 경계 위반이 생길
-            # 수 있으므로 simplex가 그 상태에서 이어서 경계를 맞춘다. 고칠 쌍은 위반
-            # 중인 쌍 가운데 이름순 첫 번째로 고정해서, 고쳐도 계속 다시 위반되는
-            # 쌍에 횟수가 쌓이게 한다. 이 노드에서 고친 횟수가 branch_tau에 닿은
-            # 쌍은 분기한다 (논문 5절: 5회). local_repair_max_iter는 노드당 수정
-            # 횟수의 상한이다.
+            # 노드의 tableau를 제자리에서 고치고 Simplex로 경계를 다시 맞춘다.
+            # 성공 여부와 무관하게 시도마다 전체 및 뉴런별 수정 횟수를 늘린다.
             #
             # 예전 구현은 (1) tableau를 통째로 복사해 두 방향 모두 simplex를 끝까지
             # 풀고 할당만 가져왔다 — tableau는 원본 그대로라 다음 수정은 다시 처음
@@ -913,17 +1011,20 @@ def reluplex(
                 if repair_count.get(pair, 0) >= branch_tau:
                     break
                 repair_count[pair] = repair_count.get(pair, 0) + 1
-                with span(trace, "reluplex_repair", depth=depth, branch_x=pair[0]):
-                    if _apply_relu_fix(tableau, *pair) is None:
+                with span(trace, "reluplex_repair", depth=depth, branch_x=pair[0]) as repair_event:
+                    if _apply_relu_fix(tableau, *pair, depth) is None:
                         # 어느 쪽으로도 범위 안에서 고칠 수 없다 → 분기로만 풀린다
                         repair_count[pair] = branch_tau
                         _bump("REPAIR_UNFIXABLE")
+                        if repair_event is not None:
+                            repair_event.meta.update(result="UNFIXABLE")
                         break
                     _bump("REPAIR_STEPS")
                     try:
                         with _lp_timer(repair=True), span(trace, "simplex", depth=depth):
-                            sol2, sat2 = _simplex(
+                            sol2, sat2 = _simplex_observed(
                                 tableau,
+                                observation_depth=depth,
                                 max_iter=simplex_max_iter,
                                 debug=debug,
                                 deadline=deadline,
@@ -937,12 +1038,18 @@ def reluplex(
                                 stats=stats,
                                 tighten_bounds=pivot_tighten,
                                 full_tighten_every=full_tighten_every,
+                                mechanism_callback=(lambda **values: _lp_events(depth, **values))
+                                if record_mechanisms else None,
+                                numerical_callback=(lambda **values: _record_mechanism("numerical", depth, **values))
+                                if record_mechanisms else None,
                                 numeric_safeguards=numeric_safeguards,
                             )
                     except SolverLimitReached as exc:
                         if exc.reason == "TIMEOUT":
                             raise
                         repair_unknown_reason = exc.reason
+                        if repair_event is not None:
+                            repair_event.meta.update(result="UNKNOWN", reason=exc.reason)
                         break
                 if not sat2:
                     # 수정은 할당만 바꾸고 제약은 그대로이므로, 여기서 UNSAT이면 이
@@ -962,8 +1069,8 @@ def reluplex(
         #   (b) 반대로 지금 위반 중인데 repair에 한 번도 안 뽑힌 ReLU는 후보에서
         #       빠진다. 그래서 쪼갤 게 남아있는데도 branch_x=None으로 포기하는
         #       경우가 생긴다.
-        # 후보를 "지금 위반 중이면서 아직 고정되지 않은 ReLU"로 좁힌다. 순위는
-        # repair_count 내림차순(원 규칙)을 유지하되, 동점은 이름순으로 끊어
+        # 후보는 "지금 위반 중이면서 아직 고정되지 않은 ReLU"다.
+        # 수정 시도 횟수 내림차순, 동점은 이름순으로 선택한다.
         # 실행을 결정적으로 만든다 — 예전에는 repair_count가 금세 포화돼서
         # sorted()가 사실상 삽입 순서(=뉴런 번호순)를 돌려주고 있었다.
         def _splittable(px: str) -> bool:
@@ -1168,6 +1275,12 @@ def reluplex(
                             r2, sat2 = None, False
                             c2 = c1
                             _bump("BACKJUMPS")
+                            _record_mechanism(
+                                "backjump", depth + 1, variable=branch_x,
+                                from_depth=depth + 1, target_depth=max(0, c1.bit_length() - 1),
+                                cause_depths=[i for i in range(1, depth + 1) if c1 & (1 << i)],
+                                skipped_measure=2.0 ** -(depth + 1),
+                            )
                             _bump("BACKJUMP_SKIPPED_MEASURE", 2.0 ** -(depth + 1))
                             _bump("CLOSED_MEASURE", 2.0 ** -(depth + 1))
                             if inactive_branch_event is not None:
@@ -1331,8 +1444,22 @@ def reluplex(
     active_row_defs = row_defs
     active_bounds = dict(bounds)
     if derive_bound and relus:
-        tightened, fixed, infeasible = derive_bounds(row_defs, bounds, relus,
-                                                     incremental=derive_incremental)
+        tightened, fixed, infeasible = _derive_observed(row_defs, bounds, relus,
+                                                       incremental=derive_incremental,
+                                                       observation_depth=0, observation_source="initial")
+        if record_mechanisms:
+            ranges = []
+            for x, y in relus:
+                key = (relu_metadata or {}).get((x, y)) or _parse_neuron_var(x)
+                lo, hi = tightened[x]
+                ranges.append({"variable": x, "output": y, "layer": key[0] if key else None,
+                               "index": key[1] if key else None,
+                               "before": [v if isfinite(v) else None for v in bounds[x]],
+                               "after": [v if isfinite(v) else None for v in (lo, hi)],
+                               "state": "active" if lo >= 0 else "inactive" if hi <= 0 else "unstable"})
+            _record_mechanism("bounds", 0, source="initial",
+                              changed=sum(bounds[v] != value for v, value in tightened.items()),
+                              fixed=len(fixed), conflict=infeasible, ranges=ranges)
         if stats is not None:
             stats['DERIVE_FIXED_RELUS'] = len(fixed)
             stats['DERIVE_REMAINING_RELUS'] = original_relu_count - len(fixed)

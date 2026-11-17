@@ -163,6 +163,7 @@ def derive_bounds(
     tol: float = 1e-9,
     deps: Optional[BoundDeps] = None,
     incremental: bool = True,
+    on_change=None,
 ) -> Tuple[Bounds, Dict[Tuple[str, str], str], bool]:
     """구간 전파를 고정점까지 돌린다.
 
@@ -174,6 +175,8 @@ def derive_bounds(
         그 경계가 그대로인 row를 다시 봐도 아무것도 바뀌지 않는다 — 건너뛰어도 바퀴마다
         일어나는 경계 변화, 모순, 원인 마스크가 전부 같다. ACAS Xu 노드에서 둘째
         바퀴에 다시 볼 row가 70%, 다섯째 바퀴에 23%로 줄었다. 기본으로 켠다(False는 비교·검증용).
+    on_change: 주면 경계가 실제로 바뀔 때마다 on_change(변수, 이전 경계, 새 경계)를 부른다
+        (시각화 기록용, 결과에는 영향이 없다).
 
     Returns:
         (좁혀진 bounds, {(x, y): 'active'|'inactive'}, infeasible)
@@ -183,6 +186,15 @@ def derive_bounds(
     b: Bounds = {v: tuple(x) for v, x in bounds.items()}  # type: ignore[misc]
     relu_list = list(relus)
     fixed: Dict[Tuple[str, str], str] = {}
+    apply_bound = _tighten
+    if on_change is not None:
+        def apply_bound(current, variable, *args):
+            before = current[variable]
+            result = _tighten(current, variable, *args)
+            if result:
+                on_change(variable, before, current[variable])
+            return result
+
     # incremental: prev = 앞 바퀴에서 바뀐 변수, cur = 이번 바퀴에서 지금까지 바뀐 변수
     # (_tighten이 True를 돌려준 변수). 첫 바퀴는 모두 본다(prev=None).
     prev: Optional[set] = None
@@ -242,7 +254,7 @@ def derive_bounds(
             # 아래 역방향과 같은 이유로, 좁힐 게 없으면 _tighten을 건너뛴다
             if s_lo > cur_lo or s_hi < cur_hi or (cur_lo > cur_hi and _crossed(cur_lo, cur_hi)):
                 d_lo, d_hi = _row_deps(terms, deps) if deps is not None else (0, 0)
-                r = _tighten(b, name, s_lo, s_hi, tol, deps, d_lo, d_hi)
+                r = apply_bound(b, name, s_lo, s_hi, tol, deps, d_lo, d_hi)
                 if r is None:
                     return b, fixed, True
                 if r:
@@ -295,7 +307,7 @@ def derive_bounds(
                     cv_lo = deps.lo.get(name, 0) | r_hi
                     cv_hi = deps.hi.get(name, 0) | r_lo
                     d_lo, d_hi = (cv_lo, cv_hi) if c > 0 else (cv_hi, cv_lo)
-                r = _tighten(b, v, v_lo, v_hi, tol, deps, d_lo, d_hi)
+                r = apply_bound(b, v, v_lo, v_hi, tol, deps, d_lo, d_hi)
                 if r is None:
                     return b, fixed, True
                 if r:
@@ -317,14 +329,14 @@ def derive_bounds(
             if deps is not None:
                 dxl, dxh = deps.lo.get(x, 0), deps.hi.get(x, 0)
             # y >= 0 이고 y >= x  (relu의 정의)
-            r = _tighten(b, y, max(0.0, x_lo if x_lo != -INF else 0.0), INF, tol,
+            r = apply_bound(b, y, max(0.0, x_lo if x_lo != -INF else 0.0), INF, tol,
                          deps, dxl if x_lo > 0.0 else 0, 0)
             if r is None:
                 return b, fixed, True
             changed |= r
             # y <= max(0, u(x))
             if x_hi != INF:
-                r = _tighten(b, y, -INF, max(0.0, x_hi), tol, deps, 0, dxh)
+                r = apply_bound(b, y, -INF, max(0.0, x_hi), tol, deps, 0, dxh)
                 if r is None:
                     return b, fixed, True
                 changed |= r
@@ -337,11 +349,11 @@ def derive_bounds(
                 fixed[(x, y)] = "active"        # 항상 켜짐 → y = x
                 if deps is not None:
                     deps.fixed[(x, y)] = dxl
-                r = _tighten(b, y, x_lo, x_hi, tol, deps, dxl, dxh)
+                r = apply_bound(b, y, x_lo, x_hi, tol, deps, dxl, dxh)
                 if r is None:
                     return b, fixed, True
                 changed |= r
-                r = _tighten(b, x, y_lo, y_hi, tol, deps, dyl, dyh)
+                r = apply_bound(b, x, y_lo, y_hi, tol, deps, dyl, dyh)
                 if r is None:
                     return b, fixed, True
                 changed |= r
@@ -349,7 +361,7 @@ def derive_bounds(
                 fixed[(x, y)] = "inactive"      # 항상 꺼짐 → y = 0
                 if deps is not None:
                     deps.fixed[(x, y)] = dxh
-                r = _tighten(b, y, 0.0, 0.0, tol, deps, 0, dxh)
+                r = apply_bound(b, y, 0.0, 0.0, tol, deps, 0, dxh)
                 if r is None:
                     return b, fixed, True
                 changed |= r
@@ -359,7 +371,7 @@ def derive_bounds(
                 fixed[(x, y)] = "inactive"
                 if deps is not None:
                     deps.fixed[(x, y)] = dyh
-                r = _tighten(b, x, -INF, 0.0, tol, deps, 0, dyh)
+                r = apply_bound(b, x, -INF, 0.0, tol, deps, 0, dyh)
                 if r is None:
                     return b, fixed, True
                 changed |= r
@@ -368,7 +380,7 @@ def derive_bounds(
                 fixed[(x, y)] = "active"
                 if deps is not None:
                     deps.fixed[(x, y)] = dyl
-                r = _tighten(b, x, y_lo, y_hi, tol, deps, dyl, dyh)
+                r = apply_bound(b, x, y_lo, y_hi, tol, deps, dyl, dyh)
                 if r is None:
                     return b, fixed, True
                 changed |= r

@@ -27,14 +27,38 @@
       auto.checked = true; refreshPages(); auto.checked = false;
       await waitFor(() => snapshots > before, 'snapshot applied');
     };
+    const beforeAutoEnable = snapshots;
+    const initialFrameSrc = frame.src;
+    auto.checked = true;
+    auto.dispatchEvent(new Event('change'));
+    auto.checked = false;
+    await waitFor(() => snapshots > beforeAutoEnable, 'checkbox immediately requests snapshot without polling');
+    assert(frame.contentDocument === doc && frame.src === initialFrameSrc, 'auto refresh preserves the visible document');
+    assert(getComputedStyle(frame).backgroundColor === 'rgb(255, 255, 255)' && getComputedStyle(frame).colorScheme === 'light', 'initial iframe cannot flash a dark background');
+    const panel = panels[0];
+    await waitFor(() => !panel.pending, 'initial image preload');
+    const previousImage = document.getElementById(panel.id), previousUri = panel.uri;
+    panel.uri = '/missing-image';
+    refreshPanel(panel);
+    assert(document.getElementById(panel.id) === previousImage, 'old image remains visible during loading');
+    await waitFor(() => !panel.pending, 'failed image preload');
+    assert(document.getElementById(panel.id) === previousImage, 'failed update preserves the previous image');
+    panel.uri = previousUri;
     const click = async id => {
       const target = details(id);
       const wasOpen = target.open;
       target.querySelector(':scope > summary').click();
+      assert(wasOpen ? !target.querySelector(':scope > .children') : !!target.querySelector(':scope > .children'), 'tree click applies synchronously without a snapshot');
       await waitFor(() => wasOpen ? !target.querySelector(':scope > .children') : !!target.querySelector(':scope > .children'), 'toggle ' + id);
     };
 
     assert(summaries().length === 1, 'initial render contains only root');
+    const lowerPanel=doc.querySelector('#timelinePanel');
+    const wasPanelOpen=lowerPanel.open;
+    lowerPanel.querySelector(':scope > summary').click();
+    assert(lowerPanel.open!==wasPanelOpen,'lower panel toggles synchronously');
+    lowerPanel.querySelector(':scope > summary').click();
+    assert(lowerPanel.open===wasPanelOpen,'lower panel restores synchronously');
     const statusOptions = [...doc.querySelector('#statusFilter').options];
     assert(!statusOptions.some(option => ['SAT', 'UNSAT', 'TIMEOUT', 'UNKNOWN'].includes(option.value)) && statusOptions.some(option => option.value === 'FINAL'), 'terminal outcomes share one final-result filter');
     assert(win.getComputedStyle(doc.body).backgroundColor === 'rgb(255, 255, 255)' && win.getComputedStyle(doc.body).color === 'rgb(31, 41, 55)', 'tree report uses white background and dark text');
@@ -76,7 +100,17 @@
     assert(scrollY > 0 && timelineScroll > 0, 'fixture has scrollable content');
     assert(treeScrollTop > 0 && treeViewport.clientHeight <= win.innerHeight * .6 + 1, 'large tree scrolls inside a bounded viewport');
     await fetch('/stage?value=1');
-    await refresh();
+    const beforeScrollingSnapshots=snapshots;
+    const oldBadge=details(2).querySelector('.badge').textContent;
+    const signalWheel=()=>treeViewport.dispatchEvent(new win.WheelEvent('wheel',{bubbles:true,deltaY:30}));
+    signalWheel();
+    const scrolling=win.setInterval(signalWheel,40);
+    const queuedRefresh=refresh();
+    await new Promise(resolve=>setTimeout(resolve,100));
+    assert(snapshots===beforeScrollingSnapshots && details(2).querySelector('.badge').textContent===oldBadge,'automatic snapshot work waits while the user scrolls');
+    assert(win.getComputedStyle(treeViewport).overscrollBehaviorY==='auto','tree edge allows continued page scrolling');
+    win.clearInterval(scrolling);
+    await queuedRefresh;
     await waitFor(() => details(2)?.querySelector('.badge').textContent === 'CLOSED (UNSAT)', 'live state update');
     assert(frame.contentDocument === doc, 'visible document is not reloaded');
     assert(details(1) === rootElement && details(2) === childElement, 'visible node DOM identities survive update');
@@ -310,7 +344,12 @@
     assert(trackingButton().getAttribute('aria-pressed') === 'true' && trackingDetails(108).classList.contains('recent-target'), 'reload restores tracking and latest path');
     assert(!trackingDoc.querySelector('#timelinePanel').open && !trackingDoc.querySelector('#stablePanel').open, 'reload restores both collapsed panels');
     const restoredViewport = trackingDoc.querySelector('#treeViewport');
-    trackingDoc.querySelector('#tree').style.paddingBottom = '160px';
+    // This case specifically covers a fully visible target. Larger fonts can
+    // otherwise require legitimate horizontal scrolling to reveal its verdict.
+    restoredViewport.style.minWidth = '900px';
+    // Keep the next two rows visible even when larger text makes the header
+    // taller and therefore reduces the tree viewport's available height.
+    trackingDoc.querySelector('#tree').style.paddingBottom = `${Math.min(160, restoredViewport.clientHeight)}px`;
     restoredViewport.scrollTop = restoredViewport.scrollHeight;
     const visibleScrollTop = restoredViewport.scrollTop, visibleScrollLeft = restoredViewport.scrollLeft;
     let visibleScrollCalls = 0;
@@ -345,7 +384,7 @@
         resultDoc.querySelector('#' + id).dispatchEvent(new resultWin.Event('input'));
       };
       const ancestorButton = resultDoc.querySelector('#findAncestors');
-      assert(resultDoc.querySelector('#neuronFilter').nextElementSibling === ancestorButton, 'ancestor finder is next to neuron input');
+      assert(resultDoc.querySelector('#neuronFilter').closest('.neuron-combo').nextElementSibling === ancestorButton, 'ancestor finder is next to neuron input');
       setAncestorInput('layerFilter', '2'); setAncestorInput('neuronFilter', '1');
       ancestorButton.click();
       assert(resultDoc.querySelectorAll('#tree details').length === 3 && resultDetails(1).open && resultDetails(2) && resultDetails(3) && !resultDetails(4), 'ancestor finder includes both phases and their shared root for ' + status);
@@ -353,7 +392,7 @@
       assert(!resultDetails(3).open && resultDetails(3).classList.contains('leaf') && filter.value === 'ALL', 'search ends at target nodes and clears conflicting verdict selection');
       assert(resultDoc.querySelectorAll('#timeline .row').length === 3 && resultDoc.querySelector('#overall').textContent === status, 'ancestor paths also appear in the timeline without changing the overall verdict');
       const subtreeButton = resultDoc.querySelector('#findSubtrees');
-      assert(ancestorButton.nextElementSibling === subtreeButton && subtreeButton.closest('.ancestor-search') === resultDoc.querySelector('#layerFilter').parentElement, 'subtree finder shares the coordinate group next to ancestor finder');
+      assert(ancestorButton.nextElementSibling === subtreeButton && subtreeButton.closest('.ancestor-search') === resultDoc.querySelector('#layerFilter').closest('.ancestor-search'), 'subtree finder shares the coordinate group next to ancestor finder');
       subtreeButton.click();
       assert(subtreeButton.getAttribute('aria-pressed') === 'true' && ancestorButton.getAttribute('aria-pressed') === 'false', 'subtree and ancestor search modes are exclusive');
       assert(resultDoc.querySelectorAll('#tree details').length === 3 && resultDetails(2) && resultDetails(3).open && resultDetails(4) && !resultDetails(1), 'subtree finder displays both matched roots and descendants without ancestors for ' + status);

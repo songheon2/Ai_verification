@@ -45,6 +45,8 @@ def _replace_figure(fig, output_path: str, dpi: int) -> None:
     )
     try:
         fig.savefig(temporary, dpi=dpi)
+        from visualization.ReluNeuronHover import write_relu_hover_map
+        write_relu_hover_map(fig, output)
         os.replace(temporary, output)
     finally:
         plt.close(fig)

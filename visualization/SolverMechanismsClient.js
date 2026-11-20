@@ -75,9 +75,45 @@
   const searchSteps = Object.assign(Object.create(null), saved.searchSteps && typeof saved.searchSteps==='object' ? saved.searchSteps : {});
   const text = (selector, value) => { const element=$(selector);if(element.textContent!==String(value))element.textContent=value; };
   const reportCaches=new WeakMap();
+  let boundFileState={first:null,loaded:0,records:[],pending:false,failed:null};
+  let boundFilesDirty=false;
   function reportCache(report){
     if(!reportCaches.has(report))reportCaches.set(report,{});
     return reportCaches.get(report);
+  }
+  function prepareBoundFiles(report){
+    const files=report.boundHistoryFiles;
+    if(!Array.isArray(files) || !enabled.has('bounds'))return;
+    const first=files[0] ?? null;
+    if(boundFileState.first!==first)boundFileState={first,loaded:0,records:[],pending:false,failed:null};
+    const state=boundFileState;
+    report.boundHistory=state.records;
+    const file=files[state.loaded];
+    if(!file||state.pending||state.failed===file||inputBusy||$('#boundScope').value!=='all')return;
+    if(!/^[^/:\\]+_bound_history\/[a-f0-9]{32}-[1-9]\d*\.js$/.test(file))return;
+    const script=document.createElement('script');
+    state.pending=true;
+    script.onload=()=>{
+      script.remove();state.pending=false;
+      if(state!==boundFileState)return;
+      if(!Array.isArray(script.mechanismBounds)){state.failed=file;render();return;}
+      state.records.push(...script.mechanismBounds);
+      state.loaded++;
+      const current=data.report;
+      if(!current?.boundHistoryFiles || current.boundHistoryFiles[0]!==state.first)return;
+      reportCaches.delete(current);
+      if(inputBusy){boundFilesDirty=true;return;}
+      prepareBoundFiles(current);
+      if(!state.pending)render();
+    };
+    script.onerror=()=>{
+      script.remove();state.pending=false;state.failed=file;
+      if(state!==boundFileState)return;
+      if(inputBusy)boundFilesDirty=true;
+      else render();
+    };
+    script.src=new URL(file.split('/').map(encodeURIComponent).join('/'),location.href).href;
+    document.head.append(script);
   }
   const finite = value => typeof value === 'number' && Number.isFinite(value);
   const number = value => finite(value) ? Number(value.toPrecision(6)).toString() : '?';
@@ -148,7 +184,9 @@
   function boundRounds(report) {
     const cache=reportCache(report);if(cache.rounds)return cache.rounds;
     const rounds=[...(report.boundRounds || [])], known=new Set(rounds.map(item=>item.round_index));
-    for(const item of [...(report.boundHistory || []),...(report.eventsByKind?.bounds || [])])if(!known.has(item.round_index)){known.add(item.round_index);rounds.push({round_index:item.round_index,ranges:[]});}
+    for(const items of [report.boundHistory || [],report.eventsByKind?.bounds || []]){
+      for(const item of items)if(!known.has(item.round_index)){known.add(item.round_index);rounds.push({round_index:item.round_index,ranges:[]});}
+    }
     return cache.rounds=rounds;
   }
   function displayBoundHistory(report) {
@@ -444,6 +482,8 @@
   }
   let conflictReport=null,numericReport=null,numericMetric=null,underRanges=null,underNeuron=null,underEpsilon=null;
   function render() {
+    boundFilesDirty=false;
+    prepareBoundFiles(data.report || {});
     document.body.setAttribute('aria-busy',String(Boolean(data.deferredData)));
     const report=data.report || {}, totals=report.totals || {}, ranges=selectedRanges(report);
     const states={active:0,inactive:0,unstable:0};ranges.forEach(item=>{if(item.state in states)states[item.state]++;});
@@ -454,6 +494,9 @@
     const underapproxEnabled=(report.settings || []).some(item=>item.underapprox_enabled);
     text('#underapproxValue',underapproxEnabled?'솔버 과소근사 활성 · 아래 그림은 구간 미리보기':'솔버 미적용 · 구간 미리보기');
     boundChart(report,ranges);
+    if($('#boundScope').value==='all' && boundFileState.loaded<(report.boundHistoryFiles?.length || 0)){
+      text('#boundPending',boundFileState.failed?'경계 변경 기록을 불러오지 못했습니다':'경계 변경 불러오는 중');
+    }
     if(conflictReport!==report){conflictChart(report,totals);conflictReport=report;}
     const metric=$('#numericalMetric').value;
     if(numericReport!==report||numericMetric!==metric){numericalChart(report);numericReport=report;numericMetric=metric;}
@@ -487,6 +530,7 @@
       inputBusy=event.data.active===true;
       if(!inputBusy){
         if(queuedData){const latest=queuedData;queuedData=null;applySnapshot(latest);}
+        if(boundFilesDirty)render();
         if(resumeRecords){const append=resumeRecords;resumeRecords=null;setTimeout(append,0);}
         scheduleBoundPlayback();
         if(queuedRefresh){queuedRefresh=false;const force=finalQueued;finalQueued=false;refresh(force);}
@@ -529,6 +573,7 @@
   $('#boundNeuronSearch').oninput=()=>{pauseBounds();boundFollow=false;render();save();};
   $('#boundScope').onchange=()=>{
     if(boundTimer!==null){clearTimeout(boundTimer);boundTimer=null;}
+    boundFileState.failed=null;
     boundIndex=-1;render();save();
   };
   $('#boundSearchStep').oninput=()=>seekSearchBound(Number($('#boundSearchStep').value)-1);

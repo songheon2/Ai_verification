@@ -1085,6 +1085,7 @@ def run_vnnlib_verification(
                 title=f"Realtime ReLU Search Tree: {network_label}",
                 mechanism_panels=selected_mechanisms,
                 model_layer_sizes=info.layer_sizes,
+                tree_enabled=realtime_relu_enabled,
             )
 
         if realtime_solver_enabled:
@@ -1282,6 +1283,7 @@ def run_vnnlib_verification(
                 relu_search_tree_output if realtime_capture_enabled else None
             ),
             realtime_tree_title=f"ReLU Search Tree: {network_label}",
+            realtime_tree_enabled=realtime_relu_enabled,
             mechanism_panels=selected_mechanisms,
             realtime_open_view=False,
             realtime_playback_ms=realtime_playback_ms,
@@ -1392,7 +1394,9 @@ def run_vnnlib_verification(
             plt.close(fig)
             result["relu_feedback_output"] = relu_feedback_output
 
-        if feedback_capture_enabled and relu_search_tree_output is not None:
+        if feedback_capture_enabled and relu_search_tree_output is not None and (
+            feedback_relu_enabled or not realtime_capture_enabled
+        ):
             write_relu_search_tree_html(
                 trace,
                 relu_search_tree_output,
@@ -1400,8 +1404,9 @@ def run_vnnlib_verification(
                 overall_reason=solver_result.reason,
                 title=f"ReLU Search Tree: {network_label}",
                 theory_stats=solver_result.theory_stats,
-                mechanism_panels=selected_mechanisms,
+                mechanism_panels=[] if realtime_capture_enabled else selected_mechanisms,
                 model_layer_sizes=info.layer_sizes,
+                tree_enabled=feedback_relu_enabled,
             )
             if feedback_relu_enabled:
                 result["relu_search_tree_output"] = relu_search_tree_output

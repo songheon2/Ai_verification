@@ -16,6 +16,36 @@ from visualization.LiveSnapshot import snapshot_path
 
 class MechanismBrowserTests(unittest.TestCase):
     @unittest.skipUnless(chromium_path(), "Chromium is not installed")
+    def test_completed_file_report_loads_all_bound_chunks_on_demand(self):
+        from visualization.ReluSearchTree import LiveBoundHistory
+        from visualization.SolveTrace import SolveTrace
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "tree with space.html"
+            history, trace = LiveBoundHistory(output), SolveTrace()
+            for index in range(3):
+                trace.enter("reluplex_mechanism", kind="bound_updates", depth=0, round_index=1, changes=[{
+                    "variable": "z1_0", "before": [-2, 4 - index], "after": [-2, 3 - index],
+                }])
+                history.publish(trace)
+            write_solver_mechanisms_html({"available": True, "boundHistoryFiles": history.files},
+                                         output, status="SAT", panels=["bounds"])
+            harness = r'''<script>
+const check=()=>document.getElementById('boundStep').max==='3';
+const selector=document.getElementById('boundScope');
+selector.value='all'; selector.dispatchEvent(new Event('change'));
+const result=document.createElement('pre'); result.id='chunk-test'; document.body.append(result);
+const poll=setInterval(()=>{if(check()){result.textContent='PASS';clearInterval(poll);}},20);
+</script>'''
+            output.write_text(output.read_text(encoding="utf-8").replace("</body>", harness + "</body>"), encoding="utf-8")
+            process = subprocess.run([
+                chromium_path(), "--headless", "--no-sandbox", "--disable-gpu",
+                "--no-first-run", f"--user-data-dir={Path(directory) / 'profile'}", "--virtual-time-budget=5000",
+                "--dump-dom", output.as_uri(),
+            ], capture_output=True, timeout=25)
+            self.assertIn('<pre id="chunk-test">PASS</pre>', process.stdout.decode("utf-8", errors="replace")[-2200:])
+
+    @unittest.skipUnless(chromium_path(), "Chromium is not installed")
     def test_independent_report_refreshes_and_keeps_selected_filter(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -188,13 +188,13 @@ def picker_markup(*, standalone=False):
           ''' + analysis_usage_markup("llm-batch") + r'''
         </details>
         <p class="llm-state" data-followup-source hidden></p>
-        <label class="llm-question-field">질문<textarea maxlength="2000" placeholder="비워두면 전체 실행의 공통 패턴과 성능 차이를 분석합니다."></textarea></label>
+        <label class="llm-question-field">질문<textarea maxlength="2000" placeholder="예: 이 검증기의 구조와 검증 흐름을 설명해 주세요."></textarea></label>
         <div class="llm-action-row">
-          <label class="llm-consent"><input type="checkbox">실행 요약과 이번 세션의 질문·답변을 Google에 전송하는 데 동의합니다</label>
-          <button class="llm-button llm-primary" type="button" data-analyze disabled>전체 실행 분석</button>
+          <label class="llm-consent"><input type="checkbox">질문·답변과 분석에 필요한 자료를 Google에 전송하는 데 동의합니다</label>
+          <button class="llm-button llm-primary" type="button" data-analyze disabled>질문하기</button>
         </div>
       </fieldset>
-      <div class="llm-state" data-analysis-status aria-live="polite">연속 검증을 실행하면 기록이 쌓이는 대로 분석할 수 있습니다.</div>
+      <div class="llm-state" data-analysis-status aria-live="polite"></div>
     </div>
     <div id="verify-saved-panel" role="tabpanel" aria-labelledby="verify-saved-tab" hidden>
       <div class="llm-saved-row">
@@ -215,7 +215,7 @@ def picker_markup(*, standalone=False):
         <span class="llm-result-tag" data-analysis-tag aria-live="polite">대기</span>
         <button class="llm-button llm-copy" type="button" data-copy disabled>원문 복사</button>
       </div>
-      <article class="llm-result" data-report data-empty="true" aria-label="통합 분석 보고서">전체 실행 분석을 눌러 결과를 비교하세요.</article>
+      <article class="llm-result" data-report data-empty="true" aria-label="통합 분석 보고서">답변이 여기에 표시됩니다.</article>
     </div>
   </section>
   SHUTDOWN_BUTTON
@@ -282,6 +282,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
   const analyzeButton = analysis.querySelector('[data-analyze]');
   const analysisQuestion = analysis.querySelector('textarea');
   const defaultQuestionPlaceholder = analysisQuestion.placeholder;
+  const runQuestionPlaceholder = '비워두면 전체 실행의 공통 패턴과 성능 차이를 분석합니다.';
   const consent = analysis.querySelector('input');
   const analysisStatus = analysis.querySelector('[data-analysis-status]');
   const analysisTag = analysis.querySelector('[data-analysis-tag]');
@@ -305,6 +306,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
   const endpoint = new URL('api/', location.href);
   let csrf = null, loading = false, running = false, revision = 0;
   let batchId = null, batchComplete = false, analysisRunning = false, analysisAvailable = false;
+  let overviewMode = true;
   let analysisReady = false, analysisSubmitting = false, analysisRevision = 0;
   let batchPollTimer = null, pollingBatch = null;
   let reportSource = '';
@@ -341,9 +343,11 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     stopButton.disabled = !activeRunId || !running || stopping || stopPending;
     batchModel.disabled = !analysisAvailable || analysisRunning;
     batchEffort.disabled = batchModel.disabled || !batchModel.value;
-    analyzeButton.disabled = !analysisAvailable || !analysisReady || analysisRunning || analysisSubmitting || followupPending
+    analyzeButton.disabled = !analysisAvailable || (!overviewMode && !analysisReady) || (overviewMode && running)
+      || analysisRunning || analysisSubmitting || followupPending
       || !consent.checked || !batchModel.value;
-    analyzeButton.textContent = !followupSource.hidden ? '이어서 질문하기' : batchComplete ? '전체 실행 분석' : '현재까지 분석';
+    analyzeButton.textContent = !followupSource.hidden ? '이어서 질문하기' : overviewMode ? '질문하기'
+      : batchComplete ? '전체 실행 분석' : '현재까지 분석';
     viewSaved.disabled = savedLoading || !savedSelect.value;
     if (followupButton) followupButton.disabled = !csrf || !savedSelect.value || running || analysisRunning || followupPending;
     copyButton.disabled = !reportSource || activeAnalysisTab === 0 && analysisRunning;
@@ -368,7 +372,8 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     if (activeAnalysisTab === 1) {
       renderAnalysis(savedAnalysis || {status:'idle'}, '저장된 LLM 답변을 선택하세요.');
     } else {
-      renderAnalysis(currentAnalysis, analysisReady ? '분석 버튼을 눌러 기록을 비교하세요.'
+      renderAnalysis(currentAnalysis, overviewMode ? '답변이 여기에 표시됩니다.'
+        : analysisReady ? '분석 버튼을 눌러 기록을 비교하세요.'
         : '분석 결과가 여기에 표시됩니다.');
     }
   }
@@ -592,8 +597,14 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
       if (hasPreferred) batchModel.value = preferred;
       setAnalysisEffortOptions(batchEffort, batchLevels[batchModel.value]);
       modelLoaded = true;
-    } catch {
+      if (analysisStatus.dataset.modelError) {
+        analysisStatus.textContent = '';
+        delete analysisStatus.dataset.modelError;
+      }
+    } catch (error) {
       options(batchModel, [], '모델 조회 실패 · 클릭하여 재시도');
+      analysisStatus.dataset.modelError = 'true';
+      analysisStatus.textContent = '모델 목록을 불러오지 못했습니다. 모델 목록을 다시 열어 주세요. ' + error.message;
     } finally {
       modelLoading = false;
       enabled();
@@ -767,6 +778,8 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
       if (shutdownButton) shutdownButton.disabled = false;
       analysisAvailable = Boolean(data.batch_analysis_available);
       analysis.hidden = false;
+      if (analysisAvailable) loadModels();
+      else analysisStatus.textContent = 'Gemini API 키를 설정한 뒤 검증기를 다시 실행해 주세요.';
       renderAnalysisTab();
       maxRuns = data.max_batch_runs || maxRuns;
       setCatalog('group', data.groups, data.preferences?.group);
@@ -848,10 +861,12 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     try {
       const state = await api('verify-batch?id=' + encodeURIComponent(id));
       if (batchId !== id || launcherClosed) return;
+      overviewMode = Boolean(state.overview);
       runList.hidden = !state.runs.length;
       followupSource.hidden = !state.followup_source;
       followupSource.textContent = state.followup_source ? '이어서 질문 · ' + state.followup_source.title : '';
-      analysisQuestion.placeholder = state.followup_source ? '이전 답변에서 이어서 궁금한 점을 입력하세요.' : defaultQuestionPlaceholder;
+      analysisQuestion.placeholder = state.followup_source ? '이전 답변에서 이어서 궁금한 점을 입력하세요.'
+        : overviewMode ? defaultQuestionPlaceholder : runQuestionPlaceholder;
       const signature = JSON.stringify([id, state.status, state.runs.map(run =>
         [run.number, run.status, run.phase, run.verdict, run.error, run.dashboard_ready])]);
       if (signature !== runListSignature) {
@@ -878,10 +893,10 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
       analysisReady = state.analysis_ready;
       status.textContent = stopping ? '검증을 중단하고 있습니다.' : running
         ? '대기열 순서대로 검증 중입니다.'
-        : !state.runs.length && state.followup_source ? ''
+        : !state.runs.length && (overviewMode || state.followup_source) ? ''
         : (state.status === 'cancelled' ? '연속 검증 중단' : '연속 검증 종료')
           + ' · ' + state.runs.length + '건' + (state.save_error ? ' · ' + state.save_error : '');
-      if (analysisReady) loadModels();
+      if (analysisReady && !overviewMode) loadModels();
       if (updatingAnalysis && !analysisSubmitting && revisionAtRequest === analysisRevision) {
         analysisRunning = state.analysis.status === 'running';
         currentAnalysis = state.analysis;
@@ -889,7 +904,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
           analysisQuestion.value = state.analysis.question;
         }
         analysisStatus.textContent = !analysisAvailable ? 'Gemini API 키를 설정하고 이 화면을 다시 열어 주세요.'
-          : analysisRunning ? '요청 시점까지의 기록을 분석하고 있습니다.'
+          : analysisRunning ? (overviewMode ? '' : '요청 시점까지의 기록을 분석하고 있습니다.')
           : state.analysis.error || [
             state.analysis.model, state.analysis.partial && state.analysis.snapshot_at
               ? '부분 기록 · ' + savedDate({saved_at:state.analysis.snapshot_at}) : '',
@@ -919,11 +934,12 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     currentAnalysis = {status:'running'};
     enabled();
     renderAnalysisTab();
-    analysisStatus.textContent = '요청 시점까지의 기록을 분석하고 있습니다.';
+    analysisStatus.textContent = overviewMode ? '' : '요청 시점까지의 기록을 분석하고 있습니다.';
     const model = batchModel.value;
     try {
-      await api('verify-batch-analysis', {id:batchId, consent:consent.checked,
+      const job = await api('verify-batch-analysis', {id:batchId, consent:consent.checked,
         question:analysisQuestion.value, model, thinking_level:batchEffort.value});
+      batchId = job.id;
     } catch (error) {
       currentAnalysis = {status:'error'};
       if (activeAnalysisTab === 0) renderAnalysisTab();
@@ -981,6 +997,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
         const job = await api('verify-batch', {runs:draft.map(entry => entry.choice)});
         batchId = job.id;
         activeRunId = batchId;
+        overviewMode = false;
         batchComplete = false;
         analysisReady = false;
         currentAnalysis = {status:'idle'};

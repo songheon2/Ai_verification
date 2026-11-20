@@ -82,6 +82,7 @@ class SolveTrace:
     """한 번의 DPLL(T) 실행 동안 쌓인 TraceEvent 목록."""
 
     events: List[TraceEvent] = field(default_factory=list)
+    _branch_completions: int = field(default=0, init=False, repr=False, compare=False)
 
     def enter(
         self,
@@ -99,6 +100,12 @@ class SolveTrace:
     def exit(self, event: TraceEvent) -> None:
         """enter()가 반환한 이벤트에 종료 시각을 채운다."""
         event.t_end = monotonic()
+        if event.component == "reluplex_branch":
+            self.record_branch_completion(event)
+
+    def record_branch_completion(self, event: TraceEvent) -> None:
+        self._branch_completions += 1
+        event.meta["completion_order"] = self._branch_completions
 
     def open_events(self) -> List[TraceEvent]:
         """아직 t_end가 채워지지 않은(진행 중이거나, 타임아웃/예외로 중간에 끊긴) 이벤트들."""

@@ -13,6 +13,7 @@ from pathlib import Path
 import threading
 from time import monotonic
 from typing import Any, Dict, Iterable, List, Optional
+from uuid import uuid4
 
 from visualization.NetworkLayout import parse_neuron_var
 from visualization.AtomicFile import write_atomic_text
@@ -47,6 +48,8 @@ class SearchNode:
     repairs: int
     simplex_calls: int
     prunes_space: bool
+    branch_id: Optional[str] = None
+    completion_order: Optional[int] = None
     parent_id: Optional[int] = None
     sat_role: Optional[str] = None
     sat_source_id: Optional[int] = None
@@ -62,6 +65,8 @@ class SearchNode:
         return {
             "id": self.id,
             "order": self.order,
+            "branchId": self.branch_id,
+            "completionSequence": self.completion_order,
             "splitNumber": self.split_number,
             "roundIndex": self.round_index,
             "depth": self.depth,
@@ -109,17 +114,14 @@ def build_relu_search_tree(
     overall_status: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Convert nested ``reluplex_branch`` spans to JSON-friendly tree nodes."""
-    branches = sorted(
-        (event for event in trace.events if event.component == "reluplex_branch"),
-        key=lambda event: event.t_start,
-    )
-    split_spans = sorted(
-        (event for event in trace.events if event.component == "reluplex_split"),
-        key=lambda event: event.t_start,
-    )
+    branches = [event for event in trace.events if event.component == "reluplex_branch"]
+    split_spans = [event for event in trace.events if event.component == "reluplex_split"]
     split_numbers = {id(event): number for number, event in enumerate(split_spans, 1)}
+    split_keys = {event.meta["split_key"]: split_numbers[id(event)]
+                  for event in split_spans if event.meta.get("split_key") is not None}
     roots: List[SearchNode] = []
     stack: List[tuple[TraceEvent, SearchNode]] = []
+    branch_nodes: Dict[str, SearchNode] = {}
     event_nodes: List[tuple[TraceEvent, SearchNode, str]] = []
     # Mechanism observations add events. Index only work-span timestamps once
     # rather than rescanning the expanded trace twice for every tree node.
@@ -134,9 +136,10 @@ def build_relu_search_tree(
         return bisect_right(starts, end) - bisect_left(starts, event.t_start)
 
     for order, event in enumerate(branches, 1):
+        has_parent_id = "parent_branch_id" in event.meta
         while stack and (
             (event.depth or 0) <= (stack[-1][0].depth or 0)
-            or not _inside(event, stack[-1][0])
+            or (not has_parent_id and not _inside(event, stack[-1][0]))
         ):
             stack.pop()
 
@@ -148,6 +151,8 @@ def build_relu_search_tree(
         raw_result = str(event.meta.get("result", "UNKNOWN")).upper()
         result = raw_result
         split_number = event.meta.get("split_number")
+        if split_number is None:
+            split_number = split_keys.get(event.meta.get("split_key"))
         if split_number is None:
             containing_splits = [
                 split for split in split_spans
@@ -181,12 +186,20 @@ def build_relu_search_tree(
             repairs=count_work(event, "reluplex_repair"),
             simplex_calls=count_work(event, "simplex"),
             prunes_space=(raw_result == "UNSAT"),
+            branch_id=event.meta.get("branch_id"),
+            completion_order=event.meta.get("completion_order"),
         )
-        if stack:
-            node.parent_id = stack[-1][1].id
-            stack[-1][1].children.append(node)
+        if has_parent_id:
+            parent = branch_nodes.get(event.meta["parent_branch_id"])
+        else:
+            parent = stack[-1][1] if stack else None
+        if parent is not None:
+            node.parent_id = parent.id
+            parent.children.append(node)
         else:
             roots.append(node)
+        if node.branch_id is not None:
+            branch_nodes[node.branch_id] = node
         event_nodes.append((event, node, raw_result))
         stack.append((event, node))
 
@@ -243,37 +256,57 @@ def build_relu_search_tree(
             if raw_result == final_status and event.t_end is not None
         ]
         if decisive:
-            _event, decisive_node = max(decisive, key=lambda item: item[0].t_end)
+            if all(node.completion_order is not None for _, node in decisive):
+                _event, decisive_node = max(decisive, key=lambda item: item[1].completion_order)
+            else:
+                _event, decisive_node = max(decisive, key=lambda item: item[0].t_end)
             decisive_node.result = final_status
 
     return [root.to_dict() for root in roots]
 
 
-def build_stable_records(trace: SolveTrace) -> List[Dict[str, Any]]:
-    """Keep each fixation scoped to its theory call and containing branch."""
+def _branch_node_lookup(trace: SolveTrace):
+    branches = [event for event in trace.events if event.component == "reluplex_branch"]
+    node_by_branch = {event.meta["branch_id"]: node_id for node_id, event in enumerate(branches, 1)
+                      if event.meta.get("branch_id") is not None}
     by_depth = defaultdict(list)
-    branches = sorted(
-        (event for event in trace.events if event.component == "reluplex_branch"),
-        key=lambda event: event.t_start,
-    )
-    for branch_id, event in enumerate(branches, 1):
-        by_depth[event.depth or 0].append((event.t_start, event, branch_id))
-    starts = {depth: [item[0] for item in items] for depth, items in by_depth.items()}
-    records = []
-    for event in sorted(
-        (event for event in trace.events if event.component == "reluplex_stable"),
-        key=lambda event: event.t_start,
+    if any(
+        event.component in ("reluplex_stable", "reluplex_mechanism") and "branch_id" not in event.meta
+        for event in trace.events
     ):
+        for node_id, event in enumerate(branches, 1):
+            by_depth[event.depth or 0].append((event.t_start, node_id, event))
+        for items in by_depth.values():
+            items.sort(key=lambda item: (item[0], item[1]))
+    starts = {depth: [item[0] for item in items] for depth, items in by_depth.items()}
+
+    def locate(event):
+        if "branch_id" in event.meta:
+            return node_by_branch.get(event.meta["branch_id"])
+        # Compatibility for in-memory traces supplied without branch IDs.
         depth = event.depth or 0
-        branch_id = None
         index = bisect_right(starts.get(depth, []), event.t_start) - 1
         if index >= 0:
-            _, branch, candidate_id = by_depth[depth][index]
+            _, node_id, branch = by_depth[depth][index]
             same_round = (event.meta.get("round_index") is None
                           or branch.meta.get("round_index") is None
                           or event.meta["round_index"] == branch.meta["round_index"])
             if same_round and _inside(event, branch):
-                branch_id = candidate_id
+                return node_id
+        return None
+
+    return locate
+
+
+def build_stable_records(trace: SolveTrace) -> List[Dict[str, Any]]:
+    """Keep each fixation scoped to its theory call and containing branch."""
+    locate = _branch_node_lookup(trace)
+    records = []
+    for event in trace.events:
+        if event.component != "reluplex_stable":
+            continue
+        depth = event.depth or 0
+        node_id = locate(event)
         for record in event.meta.get("records", []):
             variable = str(record.get("variable", "unknown"))
             parsed = parse_neuron_var(variable)
@@ -287,7 +320,7 @@ def build_stable_records(trace: SolveTrace) -> List[Dict[str, Any]]:
                 "result": "STABLE", "state": record.get("state"),
                 "source": event.meta.get("source", "search"),
                 "before": record.get("before"), "after": record.get("after"),
-                "nodeId": branch_id, "branchId": branch_id, "depth": depth,
+                "nodeId": node_id, "branchId": node_id, "depth": depth,
                 "roundIndex": event.meta.get("round_index"),
             })
     return records
@@ -311,6 +344,8 @@ def write_relu_search_tree_html(
     snapshot_only=False,
     snapshot_version=None,
     model_layer_sizes=None,
+    tree_enabled=True,
+    live_bound_history=None,
 ) -> Path:
     """Write an offline report; large histories use an adjacent snapshot file."""
     roots = build_relu_search_tree(trace, overall_status=overall_status)
@@ -322,6 +357,33 @@ def write_relu_search_tree_html(
             collect(node["children"])
 
     collect(roots)
+    stats = theory_stats or {}
+    if mechanism_panels is None or mechanism_panels:
+        mechanisms = build_mechanism_report(
+            trace, serialized_nodes,
+            include_bound_history=(live_bound_history is None
+                                   and (mechanism_panels is None or "bounds" in mechanism_panels)),
+        )
+        if live_bound_history is not None:
+            mechanisms["boundHistoryFiles"] = live_bound_history.publish(trace)
+        # An interrupted LP may not have emitted its final observation yet.
+        if mechanisms["available"] and stats:
+            for field, stat in (("cycles", "SIMPLEX_CYCLES_DETECTED"),
+                                ("pivot_tightened", "PIVOT_TIGHTENED"),
+                                ("full_tighten", "SIMPLEX_FULL_TIGHTEN")):
+                mechanisms["totals"][field] = max(mechanisms["totals"].get(field, 0), stats.get(stat, 0))
+        mechanism_path = mechanism_report_path(output_path)
+        write_solver_mechanisms_html(
+            mechanisms, mechanism_path, status=str(overall_status).upper(),
+            live_snapshots=live_snapshots, snapshot_only=snapshot_only,
+            snapshot_version=snapshot_version,
+            title=f"Reluplex 검증 기법 · {title}", panels=mechanism_panels,
+        )
+        if not tree_enabled:
+            return mechanism_path
+    elif not tree_enabled:
+        return Path(output_path)
+
     stable_records = build_stable_records(trace)
     node_by_id = {node["id"]: node for node in serialized_nodes}
     for record in stable_records:
@@ -339,7 +401,6 @@ def write_relu_search_tree_html(
         for node in serialized_nodes
         if node["result"] == "CLOSED"
     })
-    stats = theory_stats or {}
     total_relus = stats.get("DERIVE_TOTAL_RELUS")
     fixed_relus = stats.get("DERIVE_FIXED_RELUS")
     remaining_relus = stats.get("DERIVE_REMAINING_RELUS")
@@ -388,13 +449,6 @@ def write_relu_search_tree_html(
             }
             for depth, count in sorted(depth_counts.items())
         ]
-    mechanisms = build_mechanism_report(trace, serialized_nodes)
-    # An interrupted LP may not have emitted its final observation yet.
-    if mechanisms["available"] and stats:
-        for field, stat in (("cycles", "SIMPLEX_CYCLES_DETECTED"),
-                            ("pivot_tightened", "PIVOT_TIGHTENED"),
-                            ("full_tighten", "SIMPLEX_FULL_TIGHTEN")):
-            mechanisms["totals"][field] = max(mechanisms["totals"].get(field, 0), stats.get(stat, 0))
     payload = {
         "title": title,
         "modelLayerSizes": list(model_layer_sizes or []),
@@ -422,14 +476,6 @@ def write_relu_search_tree_html(
             else len(serialized_nodes)
         ),
     }
-    # Publish the independent report before a terminal tree snapshot is visible.
-    if mechanism_panels is None or mechanism_panels:
-        write_solver_mechanisms_html(
-            mechanisms, mechanism_report_path(output_path), status=str(overall_status).upper(),
-            live_snapshots=live_snapshots, snapshot_only=snapshot_only,
-            snapshot_version=snapshot_version,
-            title=f"Reluplex 검증 기법 · {title}", panels=mechanism_panels,
-        )
     if live_snapshots:
         payload["snapshotVersion"] = snapshot_version
     data = initial_page_data(
@@ -450,21 +496,28 @@ def branch_log_path(split_log_path: str | Path) -> Path:
     return path.with_name(f"{path.stem}_branches.jsonl")
 
 
-def build_mechanism_report(trace: SolveTrace, nodes: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _bound_change(event, change, change_id, node_id):
+    return {**change, "id": change_id, "round_index": event.meta.get("round_index"),
+            "depth": event.depth or 0, "nodeId": node_id}
+
+
+def build_mechanism_report(trace: SolveTrace, nodes: List[Dict[str, Any]], *,
+                           include_bound_history=True) -> Dict[str, Any]:
     """Locate observations by branch without modifying the tree's nodes."""
-    branches = sorted((event for event in trace.events if event.component == "reluplex_branch"),
-                      key=lambda event: event.t_start)
-    by_depth = defaultdict(list)
+    locate = _branch_node_lookup(trace)
     node_by_id = {node["id"]: node for node in nodes}
-    for event, node in zip(branches, sorted(nodes, key=lambda node: node["order"])):
-        by_depth[event.depth or 0].append((event.t_start, event, node))
-    starts = {depth: [item[0] for item in items] for depth, items in by_depth.items()}
     events = []
     settings = []
     bound_rounds = []
     bound_history = []
     for event in trace.events:
         if event.component not in {"reluplex_mechanism", "reluplex_stable"}:
+            continue
+        if event.meta.get("kind") == "bound_updates":
+            if include_bound_history:
+                node_id = locate(event)
+                for change in event.meta.get("changes", []):
+                    bound_history.append(_bound_change(event, change, len(bound_history) + 1, node_id))
             continue
         record = dict(event.meta)
         if event.component == "reluplex_stable":
@@ -479,30 +532,18 @@ def build_mechanism_report(trace: SolveTrace, nodes: List[Dict[str, Any]]) -> Di
         if record.get("kind") == "settings":
             settings.append(record)
             continue
-        depth = event.depth or 0
-        index = bisect_right(starts.get(depth, []), event.t_start) - 1
-        if index >= 0:
-            _, branch, node = by_depth[depth][index]
-            same_round = (record.get("round_index") is None or node.get("roundIndex") is None
-                          or record["round_index"] == node["roundIndex"])
-            if same_round and _inside(event, branch):
-                record["nodeId"] = node["id"]
-                if record.get("kind") == "backjump":
-                    ancestors = []
-                    parent = node_by_id.get(node.get("parentId"))
-                    while parent is not None:
-                        ancestors.append(parent)
-                        parent = node_by_id.get(parent.get("parentId"))
-                    record["causeNodeIds"] = [parent["id"] for parent in ancestors
-                                              if parent["depth"] in record.get("cause_depths", [])]
-                    record["targetNodeId"] = next((parent["id"] for parent in ancestors
-                                                  if parent["depth"] == record.get("target_depth")), None)
-        if record.get("kind") == "bound_updates":
-            for change in record.get("changes", []):
-                bound_history.append({**change, "id": len(bound_history) + 1,
-                                      "round_index": record.get("round_index"),
-                                      "depth": record["depth"], "nodeId": record["nodeId"]})
-            continue
+        record["nodeId"] = locate(event)
+        node = node_by_id.get(record["nodeId"])
+        if node is not None and record.get("kind") == "backjump":
+            ancestors = []
+            parent = node_by_id.get(node.get("parentId"))
+            while parent is not None:
+                ancestors.append(parent)
+                parent = node_by_id.get(parent.get("parentId"))
+            record["causeNodeIds"] = [parent["id"] for parent in ancestors
+                                      if parent["depth"] in record.get("cause_depths", [])]
+            record["targetNodeId"] = next((parent["id"] for parent in ancestors
+                                          if parent["depth"] == record.get("target_depth")), None)
         if record.get("kind") == "stable":
             for neuron in record.get("records", []):
                 events.append({**neuron, "kind": "stable", "source": record.get("source"),
@@ -599,51 +640,65 @@ class BranchLogReader:
             stream.seek(max(0, self.offset - 64))
             self._anchor = stream.read(min(64, self.offset))
 
+    def _open_branch_id(self, depth, round_index):
+        branch_id = next(reversed(self.open_events), None)
+        if branch_id is not None:
+            branch = self.open_events[branch_id]
+            branch_round = branch.meta.get("round_index")
+            if branch.depth == depth and (round_index is None or branch_round is None or round_index == branch_round):
+                return branch_id
+        return None
+
     def _consume(self, record):
         trace, open_events = self.trace, self.open_events
         kind = record["event"]
-        if kind == "relu_mechanism":
-            stamp = int(record["time_ns"]) / 1_000_000_000
+        if kind not in {"relu_mechanism", "relu_stable", "branch_start", "branch_end"}:
+            return False
+        stamp_ns = record["monotonic_ns"] if "monotonic_ns" in record else record["time_ns"]
+        stamp = int(stamp_ns) / 1_000_000_000
+        if kind in {"relu_mechanism", "relu_stable"}:
+            depth = int(record.get("depth", 0))
+            meta = {key: value for key, value in record.items()
+                    if key not in {"event", "timestamp", "time_ns", "monotonic_ns", "depth"}}
+            if "branch_id" not in meta:
+                # Older JSONL still identifies open branches by ID and append order.
+                meta["branch_id"] = self._open_branch_id(depth, meta.get("round_index"))
             trace.events.append(TraceEvent(
-                component="reluplex_mechanism", t_start=stamp, t_end=stamp,
-                depth=int(record.get("depth", 0)),
-                meta={key: value for key, value in record.items()
-                      if key not in {"event", "timestamp", "time_ns", "depth"}},
+                component="reluplex_mechanism" if kind == "relu_mechanism" else "reluplex_stable",
+                t_start=stamp, t_end=stamp, depth=depth, meta=meta,
             ))
             return True
-        if kind == "relu_stable":
-            stamp = int(record["time_ns"]) / 1_000_000_000
-            trace.events.append(TraceEvent(
-                component="reluplex_stable", t_start=stamp, t_end=stamp,
-                depth=int(record.get("depth", 0)),
-                meta={key: record.get(key) for key in ("source", "records", "round_index")},
-            ))
-            return True
-        if "branch_id" not in record:
+        if not record.get("branch_id"):
             return False
         branch_id = str(record["branch_id"])
         if kind == "branch_start":
+            depth = int(record.get("depth", 0))
+            round_index = record.get("round_index")
+            parent_id = (record["parent_branch_id"] if "parent_branch_id" in record
+                         else self._open_branch_id(depth - 1, round_index))
             event = TraceEvent(
                 component="reluplex_branch",
-                t_start=int(record["time_ns"]) / 1_000_000_000,
-                depth=int(record.get("depth", 0)),
+                t_start=stamp,
+                depth=depth,
                 branch_x=str(record.get("variable", "")),
                 meta={
+                    "branch_id": branch_id,
+                    "parent_branch_id": parent_id,
                     "phase": str(record.get("phase", "?")),
                     "layer": record.get("layer"),
                     "index": record.get("index"),
                     "bound": record.get("bound"),
                     "split_number": record.get("split_number"),
-                    "round_index": record.get("round_index"),
+                    "round_index": round_index,
                     "result": "RUNNING",
                 },
             )
             trace.events.append(event)
             open_events[branch_id] = event
         elif kind == "branch_end" and branch_id in open_events:
-            stamp = int(record["time_ns"]) / 1_000_000_000
             event = open_events.pop(branch_id)
             event.t_end = stamp
+            trace.record_branch_completion(event)
             event.meta["result"] = str(record.get("result", "UNKNOWN"))
             if record.get("reason"):
                 event.meta["reason"] = str(record["reason"])
@@ -652,6 +707,94 @@ class BranchLogReader:
         else:
             return False
         return True
+
+
+class LiveBoundHistory:
+    """Publish each bound change once, ahead of the snapshot that references it."""
+
+    def __init__(self, output_path):
+        self.directory = output_path.with_name(f"{output_path.stem}_bound_history")
+        self.trace = None
+        self.generation = None
+        self.cursor = 0
+        self.count = 0
+        self.files = []
+
+    def publish(self, trace):
+        if self.trace is not trace:
+            self.trace = trace
+            self.generation = uuid4().hex
+            self.cursor = self.count = 0
+            self.files = []
+        if self.cursor == len(trace.events):
+            return self.files
+
+        locate = _branch_node_lookup(trace)
+        pending = []
+        added_files = []
+
+        def write_chunk():
+            name = f"{self.generation}-{len(self.files) + len(added_files) + 1}.js"
+            data = json.dumps(pending, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
+            write_atomic_text(self.directory / name, f"document.currentScript.mechanismBounds={data};")
+            added_files.append(f"{self.directory.name}/{name}")
+            pending.clear()
+
+        count = self.count
+        for event in trace.events[self.cursor:]:
+            if event.component == "reluplex_mechanism" and event.meta.get("kind") == "bound_updates":
+                node_id = locate(event)
+                for change in event.meta.get("changes", []):
+                    count += 1
+                    pending.append(_bound_change(event, change, count, node_id))
+                    if len(pending) == 4096:
+                        write_chunk()
+        if pending:
+            write_chunk()
+        self.files.extend(added_files)
+        self.cursor = len(trace.events)
+        self.count = count
+        return self.files
+
+
+class TreeSnapshotWriter:
+    """Own the incremental log reader and published state in the render process."""
+
+    def __init__(self, log_path, output_path, title, mechanism_panels, model_layer_sizes, tree_enabled):
+        self.reader = BranchLogReader(log_path)
+        self.output_path = Path(output_path)
+        self.title = title
+        self.mechanism_panels = mechanism_panels
+        self.model_layer_sizes = model_layer_sizes
+        self.tree_enabled = tree_enabled
+        self.published_signature = None
+        self.bound_history = (LiveBoundHistory(self.output_path)
+                              if mechanism_panels is None or "bounds" in mechanism_panels else None)
+
+    def write(self, status, reason, stats, version):
+        self.reader.read()
+        signature = (self.reader.revision, status, reason, tuple(
+            stats.get(key) for key in (
+                "DERIVE_TOTAL_RELUS", "DERIVE_FIXED_RELUS", "DERIVE_REMAINING_RELUS",
+                "SIMPLEX_CYCLES_DETECTED", "PIVOT_TIGHTENED", "SIMPLEX_FULL_TIGHTEN",
+            )
+        ))
+        mechanisms_path = mechanism_report_path(self.output_path)
+        has_pages = (
+            (not self.tree_enabled or self.output_path.is_file())
+            and (self.mechanism_panels == () or mechanisms_path.is_file())
+        )
+        if signature == self.published_signature and has_pages:
+            return
+        write_relu_search_tree_html(
+            self.reader.trace, self.output_path, overall_status=status, overall_reason=reason,
+            title=self.title, theory_stats=stats, mechanism_panels=self.mechanism_panels,
+            live_snapshots=True, snapshot_version=version,
+            snapshot_only=self.published_signature is not None and has_pages and status == "RUNNING",
+            model_layer_sizes=self.model_layer_sizes, tree_enabled=self.tree_enabled,
+            live_bound_history=self.bound_history,
+        )
+        self.published_signature = signature
 
 
 class RealtimeSearchTreeVisualizer:
@@ -667,6 +810,8 @@ class RealtimeSearchTreeVisualizer:
         mechanism_panels=None,
         update_interval_seconds: float = 3.0,
         model_layer_sizes=None,
+        tree_enabled=True,
+        render_in_process=False,
     ) -> None:
         self.log_path = Path(log_path)
         self.output_path = Path(output_path)
@@ -679,10 +824,14 @@ class RealtimeSearchTreeVisualizer:
         self._lock = threading.Lock()
         self._pending = False
         self._worker: Optional[threading.Thread] = None
-        self.last_write_error: Optional[OSError] = None
-        self._reader = BranchLogReader(self.log_path)
-        self._published_signature = None
-        self._published = False
+        self.last_write_error: OSError | RuntimeError | None = None
+        self._render_in_process = render_in_process
+        self._config = (
+            str(self.log_path), str(self.output_path), self.title,
+            None if mechanism_panels is None else tuple(mechanism_panels),
+            tuple(self.model_layer_sizes), tree_enabled,
+        )
+        self._local_writer: Optional[TreeSnapshotWriter] = None
         self._snapshot_version = 0
         self._update_interval = max(0.0, float(update_interval_seconds))
         self._last_write_started = float("-inf")
@@ -697,34 +846,22 @@ class RealtimeSearchTreeVisualizer:
                 self._wake.set()
 
     def _write_once(self) -> None:
-        self._reader.read()
         with self._lock:
             status, reason = self.status, self.reason
         stats = dict(self.theory_stats or {})
-        signature = (self._reader.revision, status, reason, tuple(
-            stats.get(key) for key in (
-                "DERIVE_TOTAL_RELUS", "DERIVE_FIXED_RELUS", "DERIVE_REMAINING_RELUS",
-                "SIMPLEX_CYCLES_DETECTED", "PIVOT_TIGHTENED", "SIMPLEX_FULL_TIGHTEN",
-            )
-        ))
-        if signature == self._published_signature and self.output_path.exists():
-            return
-        write_relu_search_tree_html(
-            self._reader.trace,
-            self.output_path,
-            overall_status=status,
-            overall_reason=reason,
-            title=self.title,
-            theory_stats=stats,
-            mechanism_panels=self.mechanism_panels,
-            live_snapshots=True,
-            snapshot_only=self._published and self.output_path.exists() and status == "RUNNING",
-            snapshot_version=self._snapshot_version + 1,
-            model_layer_sizes=self.model_layer_sizes,
-        )
         self._snapshot_version += 1
-        self._published_signature = signature
-        self._published = True
+        if self._render_in_process:
+            from visualization.RenderProcess import submit_tree_render
+            try:
+                submit_tree_render(self._config, status, reason, stats, self._snapshot_version).result()
+                return
+            except (OSError, RuntimeError):
+                if status == "RUNNING":
+                    raise
+                # A child failure must not prevent publication of the final report.
+        if self._local_writer is None:
+            self._local_writer = TreeSnapshotWriter(*self._config)
+        self._local_writer.write(status, reason, stats, self._snapshot_version)
 
     def _run(self) -> None:
         try:
@@ -741,7 +878,7 @@ class RealtimeSearchTreeVisualizer:
                 try:
                     self._write_once()
                     self.last_write_error = None
-                except OSError as exc:
+                except (OSError, RuntimeError) as exc:
                     if self.last_write_error is None:
                         logging.getLogger(__name__).warning(
                             "시각화 파일 갱신 실패; 다음 갱신에서 재시도합니다: %s", exc

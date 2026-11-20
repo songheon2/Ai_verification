@@ -172,6 +172,19 @@ def runtime_reference(settings, context):
             "missing_identity_meaning": "엔진 기록이 없으면 현재 기본 코어를 과거 실행에 대입하지 않는다."}
 
 
+def project_structure_reference():
+    return {
+        "verification_flow": [
+            "검증기에서 ONNX 모델과 VNNLIB 속성, LP 엔진 및 제한 시간을 선택한다. 지원하는 ReLU 모델과 속성을 선형 제약과 Boolean 조건으로 변환한다.",
+            "DPLL(T)가 Boolean 조건을 선택하고, ReLUplex가 주어진 조건의 선형 제약과 ReLU 관계를 검사한다.",
+            "기본 Simplex, GLPK, Z3는 선형 제약의 가능성을 검사하는 경로다. 최종 SAT는 반례가 검증됐을 때 COUNTEREXAMPLE로 보고하고, UNSAT는 VERIFIED로 보고한다. 시간 제한이나 판정 불가 조건은 UNKNOWN으로 남을 수 있다.",
+            "외부 LP 엔진의 Core 모드는 ReLUplex 타블로의 선형 풀이에 결합한다. Oracle 모드는 현재 등식과 변수 경계를 넘겨 해가 있는지 확인한다.",
+            "실시간과 피드백 시각화는 DPLL 라운드, LP 호출, ReLU 분기와 탐색 트리, Reluplex 기법을 보여 준다. 통합 LLM은 기록 또는 구현 설명으로 질문에 답한다.",
+        ],
+        "components": implementation_reference("all")["principles"],
+    }
+
+
 def analysis_support(topic, settings, context, event_counts, files):
     """Small causal context, kept separate from potentially huge raw-log summaries."""
     def compact(config):

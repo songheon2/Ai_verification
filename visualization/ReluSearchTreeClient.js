@@ -197,6 +197,7 @@
     const scope={topic:'tree'};
     if(Number.isInteger(node.roundIndex))scope.round=node.roundIndex;
     if(Number.isInteger(node.layer)&&Number.isInteger(node.neuron)){scope.layer=node.layer;scope.neuron=node.neuron;}
+    if(node.branchId)scope.branch_id=node.branchId;
     const caption=[`트리 · 노드 #${node.id}`,node.roundIndex==null?'':`R${node.roundIndex}`,`${neuronLabel(node)} (${node.phase})`].filter(Boolean).join(' · ');
     window.parent.postMessage({type:'log-analysis-select',id:`tree-node-${node.id}`,label:caption,scope,text:`${label}\n${node.roundIndex==null?'':'DPLL Round: '+node.roundIndex+'\n'}${tip(node)}`},'*');
   }
@@ -258,11 +259,15 @@
   function flatFilter() {
     return $('#treeOrder').value !== 'node' || (!ancestorSearch && !subtreeSearch && $('#statusFilter').value !== 'FINAL' && ($('#statusFilter').value !== 'ALL' || $('#layerFilter').value.trim() !== '' || $('#neuronFilter').value.trim() !== ''));
   }
+  function compareCompletion(a, b) {
+    if (a.completionSequence != null && b.completionSequence != null) return a.completionSequence - b.completionSequence;
+    return (a.completedAt ?? Infinity) - (b.completedAt ?? Infinity) || a.id - b.id;
+  }
   function compareTreeNodes(a, b) {
     const order = $('#treeOrder').value;
     if (order === 'layer') return (a.layer ?? Infinity) - (b.layer ?? Infinity) || (a.neuron ?? Infinity) - (b.neuron ?? Infinity) || a.id - b.id;
     if (order === 'duration') return b.duration - a.duration || a.id - b.id;
-    if (order === 'completion') return (a.completedAt ?? Infinity) - (b.completedAt ?? Infinity) || a.id - b.id;
+    if (order === 'completion') return compareCompletion(a, b);
     return a.id - b.id;
   }
   function indexData(data) {
@@ -359,7 +364,7 @@
       const node = SCOPED[i];
       MATCHED.set(node.id, matches(node) || (!flatFilter() && node.children.some(child => MATCHED.get(child.id))));
     }
-    TIMELINE = [...ALL].sort((a, b) => (a.completedAt ?? Number.MAX_VALUE) - (b.completedAt ?? Number.MAX_VALUE) || a.order - b.order);
+    TIMELINE = [...ALL].sort(compareCompletion);
     TIMELINE.forEach((node, index) => { node.completionOrder = index + 1; });
     const DURATION_TIMELINE = [...ALL].sort((a, b) => b.duration - a.duration || a.order - b.order);
     DURATION_TIMELINE.forEach((node, index) => { node.durationOrder = index + 1; });

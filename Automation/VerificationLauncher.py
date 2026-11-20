@@ -628,6 +628,7 @@ class VerificationLauncher:
         selection = body.get("id") if isinstance(body, dict) else None
         if not isinstance(selection, str):
             raise ValueError("후속 질문의 기준이 될 저장 결과를 선택해 주세요.")
+        overview = False
         if selection.startswith("run:"):
             report = self._read_run_analysis(selection[4:])
             if report is None:
@@ -644,6 +645,7 @@ class VerificationLauncher:
             if batch.get("status") not in ("complete", "cancelled") or not isinstance(batch.get("runs"), list):
                 raise ValueError("종료된 검증 묶음의 분석을 선택해 주세요.")
             runs, sources, status = batch["runs"], report["sources"], batch["status"]
+            overview = bool(batch.get("overview"))
         source = {"title": report["title"], "sources": sources}
         prior = {key: report[key] for key in ("question", "report", "model", "saved_at") if key in report}
         prior["status"] = "complete"
@@ -654,7 +656,7 @@ class VerificationLauncher:
             self.analysis_conversation.remember(question if isinstance(question, str) else "", prior["report"])
             self.batch_dashboards.clear()
             self.batch = {"id": secrets.token_hex(12), "status": status, "runs": runs,
-                          "analysis": prior, "followup_source": source}
+                          "analysis": prior, "followup_source": source, "overview": overview}
             return {"id": self.batch["id"]}
 
     @staticmethod
@@ -675,8 +677,10 @@ class VerificationLauncher:
                     sources.append(source)
         if not sources and isinstance(data.get("followup_source"), dict):
             sources = data["followup_source"].get("sources", [])
+        if not sources and data.get("overview"):
+            sources = [{"network": "프로젝트 구조", "property": "전체"}]
         return {**result, "id": data["id"], "saved_at": result.get("saved_at") or modified,
-                "title": _saved_question_title(result.get("question"), "전체 실행 비교"),
+                "title": _saved_question_title(result.get("question"), "프로젝트 구조" if data.get("overview") else "전체 실행 비교"),
                 "sources": sources,
                 "run_count": len(runs) if isinstance(runs, list) else 0}
 
@@ -853,7 +857,7 @@ class VerificationLauncher:
                      or run["status"] == "running" and bool(state.get("dashboard"))),
                      "phase": state.get("phase", "starting") if run["status"] == "running" else None}
                     for run in batch["runs"]]
-            analysis_ready = bool(batch.get("followup_source")) or any(
+            analysis_ready = bool(batch.get("followup_source") or batch.get("overview")) or any(
                 self._has_analysis_evidence(run) or self._batch_log_limits(run, state) for run in runs)
             return {**{key: value for key, value in batch.items() if key != "saved_analysis"},
                     "runs": runs, "analysis_ready": analysis_ready}
@@ -913,20 +917,31 @@ class VerificationLauncher:
         with self.lock:
             if self.closing:
                 raise RuntimeError("검증기를 종료하고 있습니다.")
-            batch = self._get_batch(body.get("id"))
+            batch_id = body.get("id")
+            if batch_id is None and self.batch is None:
+                self._require_idle()
+                self.batch = {"id": secrets.token_hex(12), "status": "complete", "runs": [],
+                              "analysis": {"status": "idle"}, "overview": True}
+            elif batch_id is None and not self.batch.get("overview"):
+                raise ValueError("현재 검증 묶음을 먼저 불러와 주세요.")
+            batch = self._get_batch(batch_id) if batch_id is not None else self.batch
             if batch["analysis"]["status"] == "running":
                 raise RuntimeError("통합 분석이 진행 중입니다.")
+            if batch.get("overview") and self.current is not None and self.current["process"].poll() is None:
+                raise RuntimeError("검증이 끝난 뒤 프로젝트 구조를 질문해 주세요.")
             state = self._worker_state(self.batch_log)
             limits = [self._batch_log_limits(run, state) for run in batch["runs"]]
             runs = [{key: value for key, value in run.items()
                      if key not in ("result_path", "run_manifest_path", "run_log_directory", "error")}
                     for run in batch["runs"]]
-            if not batch.get("followup_source") and not any(limits) and not any(self._has_analysis_evidence(run) for run in runs):
+            if not (batch.get("followup_source") or batch.get("overview")) and not any(limits) and not any(self._has_analysis_evidence(run) for run in runs):
                 raise RuntimeError("아직 분석할 검증 로그가 없습니다.")
             snapshot = {"snapshot_at": datetime.now().astimezone().isoformat(),
                         "partial": any(run["status"] != "complete" for run in runs)}
             if batch.get("followup_source"):
                 snapshot["followup_source"] = batch["followup_source"]
+            if batch.get("overview"):
+                snapshot["overview"] = True
             conversation = self.analysis_conversation.snapshot()
             if batch["analysis"]["status"] == "complete":
                 batch["saved_analysis"] = batch["analysis"]
@@ -935,7 +950,7 @@ class VerificationLauncher:
             Thread(target=self._analyze_batch,
                    args=(batch, runs, limits, snapshot, question, conversation, client_factory, max_calls),
                    name="verification-batch-analysis", daemon=True).start()
-        return {"status": "running", "request_budget": budget}
+        return {"id": batch["id"], "status": "running", "request_budget": budget}
 
     def _analyze_batch(self, batch, runs, limits, snapshot, question, conversation, client_factory, max_calls):
         from Automation.LogAnalysisIndex import safe_data
@@ -953,7 +968,9 @@ class VerificationLauncher:
             for run, sources in zip(runs, limits):
                 if observations := summarize_logs(sources):
                     run["recorded_logs"] = observations
-            if not batch.get("followup_source") and not any(self._has_analysis_evidence(run) or run.get("recorded_logs") for run in runs):
+            if not (snapshot.get("followup_source") or snapshot.get("overview")) and not any(
+                self._has_analysis_evidence(run) or run.get("recorded_logs") for run in runs
+            ):
                 raise ValueError("요청 시점에 읽을 수 있는 검증 기록이 없습니다.")
             client = client_factory()
             client.max_requests = max_calls

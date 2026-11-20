@@ -28,7 +28,8 @@ class VerificationLauncherTests(unittest.TestCase):
         self.group.mkdir(parents=True)
         for name in ("network.onnx", "network.onnx.gz", "prop_3.vnnlib.gz"):
             (self.group / name).touch()
-        self.app = LauncherPage()
+        with patch("Automation.AnalyzeLogs.load_gemini_api_key", return_value=""):
+            self.app = LauncherPage()
         self.app.verification = VerificationLauncher(self.workspace, self.root)
         self.server = make_server(self.app)
         self.thread = Thread(target=self.server.serve_forever, daemon=True)
@@ -52,6 +53,55 @@ class VerificationLauncherTests(unittest.TestCase):
             return response.status, response.read()
         finally:
             connection.close()
+
+    @unittest.skipUnless(chromium_path(), "Chromium is not installed")
+    def test_browser_can_ask_about_structure_without_running_verification(self):
+        from Automation.AnalyzeLogs import DEFAULT_MODEL, GeminiClient
+
+        self.app.batch_client = Mock(key="test-key", model=DEFAULT_MODEL)
+        client = GeminiClient("test-key")
+        result = {"candidates": [{"content": {"parts": [{"text": "DPLL과 ReLUplex로 검증합니다."}]}}]}
+        harness = r'''<script>(async()=>{
+const out=document.createElement('pre');out.id='overview-test';
+async function wait(test){for(let i=0;i<200;i++){if(test())return;await new Promise(r=>setTimeout(r,40));}throw Error('timeout');}
+try{
+ const panel=document.getElementById('verify-batch-analysis');
+ const model=panel.querySelector('[data-batch-model]'), analyze=panel.querySelector('[data-analyze]');
+ const report=panel.querySelector('[data-report]'), question=panel.querySelector('textarea');
+ await wait(()=>!panel.hidden&&!model.disabled);
+ if(analyze.textContent!=='질문하기'||!analyze.disabled)throw Error('label or consent gate');
+ await wait(()=>model.value);
+ const consent=panel.querySelector('input[type=checkbox]');
+ consent.checked=true;consent.dispatchEvent(new Event('change',{bubbles:true}));
+ for(const text of ['현재 검증기의 구조는?', '그럼 GLPK의 역할은?']){
+  await wait(()=>!analyze.disabled);
+  question.value=text;analyze.click();
+  await wait(()=>report.textContent.includes('DPLL과 ReLUplex로 검증합니다.'));
+ }
+ if(!document.querySelector('[data-runs]').hidden)throw Error('fake run appeared');
+ out.textContent='PASS';
+}catch(error){out.textContent='FAIL '+error.message;}document.body.append(out);
+})();</script>'''
+        page = self.app.dashboard().decode("utf-8")
+        self.app.dashboard = lambda: page.replace("</body>", harness + "</body>").encode("utf-8")
+        with patch("Automation.AnalyzeLogs.GeminiClient", return_value=client), \
+                patch.object(client, "list_models", return_value={"analysis_models": [DEFAULT_MODEL]}), \
+                patch.object(client, "_post_generation", return_value=result) as generate, \
+                patch.object(self.app.verification, "_launch") as launch:
+            browser = subprocess.run([
+                chromium_path(), "--headless", "--no-sandbox", "--disable-gpu", "--no-first-run",
+                f"--user-data-dir={self.workspace / 'overview-profile'}", "--virtual-time-budget=18000",
+                "--dump-dom", f"http://127.0.0.1:{self.server.server_port}/s/{self.app.token}/",
+            ], capture_output=True, timeout=30)
+            launch.assert_not_called()
+        dom = browser.stdout.decode("utf-8", errors="replace")
+        match = re.search(r'<pre id="overview-test">([^<]+)</pre>', dom)
+        self.assertIsNotNone(match, dom[-1000:])
+        self.assertEqual(match[1], "PASS")
+        sent = [json.loads(call.args[0]["contents"][0]["parts"][0]["text"]) for call in generate.call_args_list]
+        self.assertEqual([request["runs"] for request in sent], [[], []])
+        self.assertTrue(sent[0]["project_structure"]["verification_flow"])
+        self.assertEqual(sent[1]["session_conversation"][0]["question"], "현재 검증기의 구조는?")
 
     def test_catalog_choice_is_local_and_starts_one_validated_process(self):
         status, page = self.request("")

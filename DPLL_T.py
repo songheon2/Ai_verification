@@ -276,6 +276,7 @@ def dpll_t_detailed(
     realtime_output_path: Optional[str] = None,
     realtime_tree_output_path: Optional[str] = None,
     realtime_tree_title: str = "Realtime ReLU Search Tree",
+    realtime_tree_enabled: bool = True,
     mechanism_panels=None,
     realtime_open_view: bool = False,
     realtime_playback_ms: int = 0,
@@ -324,6 +325,7 @@ def dpll_t_detailed(
 
         resolved_split_log_path = split_log_path or DEFAULT_SPLIT_LOG_PATH
         update_callback = split_update_callback
+        branch_update_callback = split_update_callback
         if split_mode == "realtime" and realtime_output_path is not None:
             visualizer = RealtimeSplitVisualizer(
                 resolved_split_log_path,
@@ -350,6 +352,8 @@ def dpll_t_detailed(
                 title=realtime_tree_title,
                 mechanism_panels=mechanism_panels,
                 model_layer_sizes=model_layer_sizes,
+                tree_enabled=realtime_tree_enabled,
+                render_in_process=True,
             )
             previous_callback = update_callback
 
@@ -357,11 +361,17 @@ def dpll_t_detailed(
                 tree_visualizer.request_update()
                 if previous_callback is not None:
                     previous_callback()
+
+            def branch_update_callback():
+                tree_visualizer.request_update()
+                if split_update_callback is not None:
+                    split_update_callback()
         split_logger = SplitEventLogger(
             resolved_split_log_path,
             update_callback=update_callback,
             reset_log=True,
             model_layer_sizes=model_layer_sizes,
+            branch_update_callback=branch_update_callback,
         )
         # split이 한 번도 발생하지 않아도 0개 상태의 실시간 화면을 만든다.
         split_logger.request_update()

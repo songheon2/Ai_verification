@@ -334,8 +334,8 @@ class LogAnalysisTests(unittest.TestCase):
             result = analyze({"run": self.index()}, client, "분석", 8)
         self.assertEqual(result["status"], "api_error")
         self.assertEqual(result["api_calls"], 1)
-        self.assertIn("TimeoutError", result["analysis"])
-        self.assertIn("--check-api", result["analysis"])
+        self.assertIn("응답 대기 시간(1200초)", result["analysis"])
+        self.assertIn("추론 강도를 낮춰", result["analysis"])
         self.assertNotIn("private-key", result["analysis"])
         send.assert_called_once()
 
@@ -404,6 +404,22 @@ class LogAnalysisTests(unittest.TestCase):
         self.assertEqual(GeminiClient("key", model="gemini-4-hydrogen", thinking_level="xhigh").generation_config()["thinkingConfig"], {"thinkingLevel": "xhigh"})
         with self.assertRaises(ValueError):
             GeminiClient("key", model="gemini-3.8-flash", thinking_level="minimal")
+
+    def test_gemini_uses_one_default_timeout_without_retrying_a_read_timeout(self):
+        class SlowResponse(BytesIO):
+            def read(self, *_args):
+                raise TimeoutError("The read operation timed out")
+
+        client = GeminiClient("offline-key", model="gemini-4-neon")
+        self.assertEqual(client.timeout, 1200)
+        client.thinking_level = "xhigh"
+        with patch.object(client.opener, "open", return_value=SlowResponse()) as send:
+            with self.assertRaisesRegex(RuntimeError, r"응답 대기 시간\(1200초\)"):
+                client.generate([{"role": "user", "parts": [{"text": "test"}]}], final=True)
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.kwargs["timeout"], 1200)
+        explicit = GeminiClient("offline-key", model="gemini-4-neon", thinking_level="xhigh", timeout=20)
+        self.assertEqual(explicit.timeout, 20)
 
 
 if __name__ == "__main__":

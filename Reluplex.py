@@ -26,6 +26,7 @@ import copy
 import random
 import re
 import time
+import uuid
 
 _NEURON_VAR_RE = re.compile(r"^[zh](\d+)_(\d+)(?:_.*)?$")
 
@@ -520,12 +521,42 @@ def reluplex(
             outcome["sat"] = answer is not None
             return answer
 
+    current_branch_id = None
+    branch_logging = hasattr(split_logger, "branch_begin")
+    round_index = base_progress_context.get("round_index")
+
+    @contextmanager
+    def _branch_span(variable, layer, index, *, phase, depth, bound, split_id, split_event):
+        nonlocal current_branch_id
+        if trace is None and not branch_logging:
+            yield None, None
+            return
+        parent_id = current_branch_id
+        log_id = None
+        if branch_logging:
+            log_id = split_logger.branch_begin(
+                variable, layer, index, phase=phase, depth=depth, bound=bound,
+                split_id=split_id, parent_branch_id=parent_id,
+            )
+        branch_id = log_id
+        if branch_id is None and trace is not None:
+            branch_id = uuid.uuid4().hex
+        split_key = split_event.meta.setdefault("split_key", branch_id) if split_event is not None else None
+        current_branch_id = branch_id
+        try:
+            with span(trace, "reluplex_branch", depth=depth, branch_x=variable, phase=phase,
+                      layer=layer, index=index, bound=bound, round_index=round_index,
+                      branch_id=branch_id, parent_branch_id=parent_id, split_key=split_key) as event:
+                yield event, log_id
+        finally:
+            current_branch_id = parent_id
+
     record_mechanisms = trace is not None or hasattr(split_logger, "mechanism")
 
     def _record_mechanism(kind: str, depth: int, **metadata) -> None:
         if not record_mechanisms:
             return
-        metadata.update(kind=kind, round_index=base_progress_context.get("round_index"))
+        metadata.update(kind=kind, round_index=round_index, branch_id=current_branch_id)
         with span(trace, "reluplex_mechanism", depth=depth, **metadata):
             pass
         if hasattr(split_logger, "mechanism"):
@@ -610,8 +641,8 @@ def reluplex(
                 "before": [value if isfinite(value) else None for value in before[x]],
                 "after": [value if isfinite(value) else None for value in after[x]],
             })
-        metadata = {"source": source, "records": records,
-                    "round_index": base_progress_context.get("round_index")}
+        metadata = {"source": source, "records": records, "round_index": round_index,
+                    "branch_id": current_branch_id}
         with span(trace, "reluplex_stable", depth=depth, **metadata):
             pass
         if hasattr(split_logger, "stable"):
@@ -1224,28 +1255,11 @@ def reluplex(
                     warm1 = _child_tableau(tableau, new_rows1)
 
                 try:
-                    active_branch_log_id = None
-                    if split_logger is not None and hasattr(split_logger, "branch_begin"):
-                        active_branch_log_id = split_logger.branch_begin(
-                            branch_x,
-                            layer,
-                            index,
-                            phase="+",
-                            depth=depth + 1,
-                            bound=f"[{max(0.0, lo)}, {hi}]",
-                            split_id=split_id,
-                        )
-                    with span(
-                        trace,
-                        "reluplex_branch",
-                        depth=depth + 1,
-                        branch_x=branch_x,
-                        phase="+",
-                        layer=layer,
-                        index=index,
-                        bound=f"[{max(0.0, lo)}, {hi}]",
-                        round_index=base_progress_context.get("round_index"),
-                    ) as active_branch_event:
+                    with _branch_span(
+                        branch_x, layer, index, phase="+", depth=depth + 1,
+                        bound=f"[{max(0.0, lo)}, {hi}]", split_id=split_id,
+                        split_event=split_trace_event,
+                    ) as (active_branch_event, active_branch_log_id):
                         try:
                             r1, sat1 = _rec(
                                 bounds1, depth + 1, row_defs1, warm1, child_active,
@@ -1318,28 +1332,11 @@ def reluplex(
                                 if y_hi > 0.0:
                                     deps2.set_hi(relu_y, bit)   # y = 0은 이 분기 결정
 
-                    inactive_branch_log_id = None
-                    if split_logger is not None and hasattr(split_logger, "branch_begin"):
-                        inactive_branch_log_id = split_logger.branch_begin(
-                            branch_x,
-                            layer,
-                            index,
-                            phase="-",
-                            depth=depth + 1,
-                            bound=f"[{lo}, {min(0.0, hi)}]",
-                            split_id=split_id,
-                        )
-                    with span(
-                        trace,
-                        "reluplex_branch",
-                        depth=depth + 1,
-                        branch_x=branch_x,
-                        phase="-",
-                        layer=layer,
-                        index=index,
-                        bound=f"[{lo}, {min(0.0, hi)}]",
-                        round_index=base_progress_context.get("round_index"),
-                    ) as inactive_branch_event:
+                    with _branch_span(
+                        branch_x, layer, index, phase="-", depth=depth + 1,
+                        bound=f"[{lo}, {min(0.0, hi)}]", split_id=split_id,
+                        split_event=split_trace_event,
+                    ) as (inactive_branch_event, inactive_branch_log_id):
                         if backjumped and not check_backjump:
                             r2, sat2 = None, False
                             c2 = c1

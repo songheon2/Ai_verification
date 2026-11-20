@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from visualization.LiveSnapshot import snapshot_path
 from visualization.ReluSearchTree import BranchLogReader, RealtimeSearchTreeVisualizer, trace_from_branch_log
-from visualization.ReluSearchTree import write_relu_search_tree_html
+from visualization.ReluSearchTree import build_relu_search_tree, build_stable_records, write_relu_search_tree_html
 from visualization.SolverMechanisms import mechanism_report_path, write_solver_mechanisms_html
 from visualization.SolveTrace import SolveTrace, TraceEvent
 from visualization.UpgradeReport import upgrade_saved_report
@@ -110,6 +110,21 @@ class IncrementalTreeTests(unittest.TestCase):
                 self.assertEqual(event.meta["result"], "UNSAT")
             self.assertEqual(reader.trace, trace_from_branch_log(path))
 
+    def test_legacy_log_matches_ownership_in_file_order_even_when_wall_time_reverses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "branches.jsonl"
+            append(path, start_record("first"))
+            append(path, {"event": "relu_stable", "depth": 1, "time_ns": 1000000000,
+                          "records": [{"variable": "z1_1"}]})
+            append(path, {"event": "branch_end", "branch_id": "first", "time_ns": 1000000000,
+                          "result": "UNSAT"})
+            append(path, {**start_record("second"), "time_ns": 900000000})
+            append(path, {"event": "relu_stable", "depth": 1, "time_ns": 900000000,
+                          "records": [{"variable": "z1_2"}]})
+            trace = trace_from_branch_log(path)
+            self.assertEqual([node["branchId"] for node in build_relu_search_tree(trace)], ["first", "second"])
+            self.assertEqual([entry["nodeId"] for entry in build_stable_records(trace)], [1, 2])
+
     def test_partial_utf8_line_waits_for_completion(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "branches.jsonl"
@@ -173,6 +188,34 @@ class IncrementalTreeTests(unittest.TestCase):
             stats["DERIVE_FIXED_RELUS"] = 3
             writer._write_once()
             self.assertIn('"fixed": 3', snapshot_path(writer.output_path).read_text(encoding="utf-8"))
+
+    def test_live_bound_history_only_publishes_new_changes_and_keeps_all_chunk_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log, page = root / "branches.jsonl", root / "tree.html"
+            append(log, start_record())
+            writer = RealtimeSearchTreeVisualizer(log, page, mechanism_panels=["bounds"], tree_enabled=False)
+            report = mechanism_report_path(page)
+
+            def publish(after):
+                append(log, {"event": "relu_mechanism", "kind": "bound_updates", "time_ns": 2000000000,
+                             "depth": 1, "changes": [{"variable": "z1_0", "after": after}]})
+                writer._write_once()
+                snapshot = snapshot_path(report).read_text(encoding="utf-8")
+                data = json.JSONDecoder().raw_decode(snapshot.split("parent.postMessage(", 1)[1])[0]["data"]
+                self.assertEqual(data["report"]["boundHistory"], [])
+                return [root / file for file in data["report"]["boundHistoryFiles"]]
+
+            first, = publish([0, 1])
+            original = first.read_bytes()
+            second_series = publish([0, 0])
+            self.assertEqual(second_series[0], first)
+            self.assertEqual(first.read_bytes(), original)
+            self.assertEqual(len(second_series), 2)
+            self.assertIn('"id":1', original.decode("utf-8"))
+            self.assertIn('"id":2', second_series[1].read_text(encoding="utf-8"))
+            self.assertIn('"nodeId":1', second_series[1].read_text(encoding="utf-8"))
+            self.assertFalse(page.exists())
 
     def test_worker_throttles_updates_but_flush_can_bypass_delay(self):
         writer = RealtimeSearchTreeVisualizer("unused", "unused", update_interval_seconds=3)

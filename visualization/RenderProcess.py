@@ -110,10 +110,20 @@ def _serve_renderer(connection) -> None:
         matplotlib.use("Agg", force=True)
         _lower_priority()
         actions = {"solver": _render_solver, "relu": _render_relu}
+        tree_writers = {}
         while True:
             action, args = connection.recv()
             try:
-                actions[action](*args)
+                if action == "tree":
+                    config, status, reason, stats, version = args
+                    if config not in tree_writers:
+                        from visualization.ReluSearchTree import TreeSnapshotWriter
+                        tree_writers[config] = TreeSnapshotWriter(*config)
+                    tree_writers[config].write(status, reason, stats, version)
+                    if status != "RUNNING":
+                        del tree_writers[config]
+                else:
+                    actions[action](*args)
             except Exception as exc:
                 connection.send(f"{type(exc).__name__}: {exc}")
             else:
@@ -195,3 +205,7 @@ def submit_relu_render(
         window_seconds,
         model_layer_sizes,
     )
+
+
+def submit_tree_render(config, status, reason, stats, version) -> Future:
+    return _pool().submit(_execute_render, "tree", config, status, reason, stats, version)

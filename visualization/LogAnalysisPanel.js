@@ -112,7 +112,8 @@
     }
     return value;
   };
-  const scope=()=>multiSelect.checked&&selectedItems.length?{selections:selectedItems.map(item=>item.scope)}:controlScope();
+  const scope=()=>selectedItems.length?
+    (multiSelect.checked?{selections:selectedItems.map(item=>item.scope)}:selectedItems.at(-1).scope):controlScope();
   const caption=()=>multiSelect.checked&&selectedItems.length?
     `${selectedItems.length}개 항목 선택 · `+[...new Set(selectedItems.map(item=>[...topic.options].find(option=>option.value===item.scope.topic)?.textContent||item.scope.topic))].join(' / '):
     [topic.selectedOptions[0].textContent,
@@ -158,8 +159,10 @@
     setChoice(layer,value.layer);options(neuron,info?.options.neurons[layer.value]||[],'전체 Neuron');setChoice(neuron,value.neuron);
   }
   function writeSelections(next){
+    const nextControls={...(next.at(-1)?.scope||{topic:'all'})};
+    delete nextControls.branch_id;
     if(next.length===selectedItems.length&&next.every((item,index)=>item.key===selectedItems[index].key&&item.text===selectedItems[index].text&&item.label===selectedItems[index].label)&&
-      JSON.stringify(Object.entries(controlScope()).sort())===JSON.stringify(Object.entries(next.at(-1)?.scope||{topic:'all'}).sort()))return true;
+      JSON.stringify(Object.entries(controlScope()).sort())===JSON.stringify(Object.entries(nextControls).sort()))return true;
     if(next.length>20){$('llm-progress').textContent='한 번에 최대 20개 항목을 선택할 수 있습니다.';return false;}
     const payload=next.map(({scope,text})=>({scope,text}));
     if(new TextEncoder().encode(JSON.stringify(payload)).length>32000){$('llm-progress').textContent='선택 정보가 너무 큽니다. 일부 항목을 해제해 주세요.';return false;}
@@ -172,9 +175,10 @@
   function selectChartItem(selection){
     const value=selection?.scope;
     if(!value || !availableTopics.has(value.topic) || value.topic==='all' || typeof selection.text!=='string' || selection.text.length>5000)return;
-    if(Object.keys(value).some(key=>!['topic','mechanism','round','call_id','layer','neuron'].includes(key)))return;
+    if(Object.keys(value).some(key=>!['topic','mechanism','round','call_id','layer','neuron','branch_id'].includes(key)))return;
     for(const key of ['round','layer','neuron'])if(value[key]!=null && (!Number.isInteger(value[key]) || value[key]<(key==='round'?1:0) || value[key]>1000000))return;
     if(value.call_id!=null && (value.topic!=='simplex' || typeof value.call_id!=='string' || !/^[A-Za-z0-9_-]{1,100}$/.test(value.call_id)))return;
+    if(value.branch_id!=null && (value.topic!=='tree' || typeof value.branch_id!=='string' || !/^[A-Za-z0-9_-]{1,100}$/.test(value.branch_id)))return;
     if(value.topic==='mechanisms' && !mechanismTabs.some(tab=>tab.dataset.mechanism===(value.mechanism||'all')))return;
     if(value.mechanism!=null && value.topic!=='mechanisms')return;
     if((value.layer!=null || value.neuron!=null) && !(['relu','tree'].includes(value.topic)||value.topic==='mechanisms'&&value.mechanism==='bounds'))return;

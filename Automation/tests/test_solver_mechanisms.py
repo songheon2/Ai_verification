@@ -4,6 +4,8 @@ import copy
 import json
 import tempfile
 import unittest
+import json
+from itertools import count
 from unittest.mock import patch
 
 import matplotlib.pyplot as plt
@@ -15,7 +17,7 @@ from Simplex import DRIFT_CHECK_AT_EXIT, DRIFT_TOL
 from BoundDerivation import derive_bounds
 from visualization.RealtimeSplitVisualization import SplitEventLogger
 from visualization.ReluSearchTree import (
-    branch_log_path, build_mechanism_report, build_relu_search_tree,
+    branch_log_path, build_mechanism_report, build_relu_search_tree, build_stable_records,
     trace_from_branch_log,
 )
 from visualization.SolveTrace import SolveTrace, span
@@ -212,16 +214,36 @@ class MechanismObservationTests(unittest.TestCase):
         trace = SolveTrace()
         with tempfile.TemporaryDirectory() as directory:
             logger = SplitEventLogger(Path(directory) / "relu.jsonl", reset_log=True)
-            observed = reluplex(rows, dict(bounds), relus, max_recursion=100,
-                                trace=trace, split_logger=logger)
+            wall_clock = count(1_800_000_000_000_000_000, -1_000_000)
+            with (
+                patch("visualization.SolveTrace.monotonic", return_value=100.0),
+                patch("visualization.RealtimeSplitVisualization.monotonic_ns", return_value=200_000_000_000),
+                patch("visualization.RealtimeSplitVisualization.time_ns", side_effect=wall_clock),
+            ):
+                observed = reluplex(rows, dict(bounds), relus, max_recursion=100,
+                                    trace=trace, split_logger=logger)
+            records = [json.loads(line) for line in logger.branch_path.read_text(encoding="utf-8").splitlines()]
             live = trace_from_branch_log(branch_log_path(logger.path))
+        active = []
+        for record in records:
+            if record["event"] == "branch_start":
+                self.assertEqual(record.get("parent_branch_id"), active[-1] if active else None)
+                active.append(record["branch_id"])
+            elif record["event"] == "branch_end":
+                self.assertEqual(record["branch_id"], active.pop())
+            else:
+                self.assertEqual(record["branch_id"], active[-1] if active else None)
+        self.assertFalse(active)
         self.assertEqual(observed, baseline)
         report, nodes = report_for(trace, "UNSAT")
-        live_report, _ = report_for(live, "UNSAT")
-        self.assertEqual(report["totals"], live_report["totals"])
-        self.assertEqual(report["boundRounds"], live_report["boundRounds"])
-        self.assertEqual(report["boundHistory"], live_report["boundHistory"])
-        self.assertEqual(report["numericalPivots"], live_report["numericalPivots"])
+        live_report, live_nodes = report_for(live, "UNSAT")
+        self.assertEqual(report, live_report)
+        self.assertEqual(build_stable_records(trace), build_stable_records(live))
+        fields = ("id", "branchId", "parentId", "splitNumber", "completionSequence", "result")
+        self.assertEqual(
+            [tuple(node[field] for field in fields) for node in nodes],
+            [tuple(node[field] for field in fields) for node in live_nodes],
+        )
         self.assertGreater(report["totals"]["bounds_changed"], 0)
         self.assertGreater(report["totals"]["update_f"], 0)
         self.assertGreater(report["totals"]["update_b"], 0)

@@ -15,7 +15,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from time import sleep, time_ns
+from time import monotonic_ns, sleep, time_ns
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from visualization.RenderLock import serialized_render
@@ -176,6 +176,7 @@ class SplitEventLogger:
         *,
         reset_log: bool = False,
         model_layer_sizes: Optional[Sequence[int]] = None,
+        branch_update_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         self.path = Path(path)
         self.branch_path = branch_log_path(self.path)
@@ -199,6 +200,7 @@ class SplitEventLogger:
                 encoding="utf-8",
             )
         self.update_callback = update_callback
+        self.branch_update_callback = branch_update_callback or update_callback
         self.global_split_count = 0
         self._round_index: Optional[int] = None
         self._sequence = 0
@@ -241,12 +243,14 @@ class SplitEventLogger:
         depth: int,
         bound: str,
         split_id: Optional[str] = None,
+        parent_branch_id: Optional[str] = None,
     ) -> str:
         """Record entry into one active (+) or inactive (-) ReLU branch."""
         branch_id = uuid.uuid4().hex
         self._append_branch({
             "event": "branch_start",
             "branch_id": branch_id,
+            **({"parent_branch_id": parent_branch_id} if parent_branch_id is not None else {}),
             "variable": variable,
             "layer": layer,
             "index": index,
@@ -276,11 +280,12 @@ class SplitEventLogger:
         })
 
     def stable(self, *, depth: int, source: str, records: List[Dict],
-               round_index: Optional[int] = None) -> None:
+               round_index: Optional[int] = None, branch_id: Optional[str] = None) -> None:
         """Batch newly fixed ReLUs without treating them as search branches."""
         self._append_branch({
             "event": "relu_stable", "depth": depth, "source": source,
             "records": records,
+            "branch_id": branch_id,
             "round_index": self._round_index if round_index is None else round_index,
         })
 
@@ -295,12 +300,13 @@ class SplitEventLogger:
             record = {
                 "timestamp": datetime.now().astimezone().isoformat(timespec="microseconds"),
                 "time_ns": time_ns(),
+                "monotonic_ns": monotonic_ns(),
                 **values,
             }
             with self.branch_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
                 stream.flush()
-        self.request_update()
+        self.request_update(branch=True)
 
     def _append(
         self,
@@ -326,11 +332,12 @@ class SplitEventLogger:
             stream.flush()
         self.request_update()
 
-    def request_update(self) -> None:
+    def request_update(self, *, branch=False) -> None:
         """현재 로그 상태를 visualizer에 알린다. callback 오류는 solver와 격리한다."""
-        if self.update_callback is not None:
+        callback = self.branch_update_callback if branch else self.update_callback
+        if callback is not None:
             try:
-                self.update_callback()
+                callback()
             except Exception as exc:  # 시각화 실패가 solver 결과를 바꾸면 안 된다.
                 warnings.warn(f"실시간 split visualizer 업데이트 실패: {exc}")
 

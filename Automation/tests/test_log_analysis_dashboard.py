@@ -262,6 +262,35 @@ class ScopedLogTests(ScopeFixture):
         events = [row["data"]["event"] for row in selected.query({})["records"]]
         self.assertEqual(sorted(events), ["+", "branch_end", "branch_start"])
 
+    def test_tree_node_scope_keeps_only_the_selected_branch_and_its_observations(self):
+        first = {"event": "branch_start", "branch_id": "first", "round_index": 1,
+                 "layer": 1, "index": 0, "variable": "z1_0", "depth": 1, "phase": "+"}
+        change = {"event": "relu_mechanism", "kind": "bound_updates", "round_index": 1,
+                  "depth": 1, "changes": [{"variable": "z1_9", "after": [0, 1]}]}
+        self.write("relu_events_branches.jsonl", [
+            first,
+            dict(change, branch_id="first"),
+            {"event": "branch_end", "branch_id": "first", "result": "UNSAT"},
+            dict(first, branch_id="selected", monotonic_ns=10),
+            dict(change, branch_id="selected"),
+            {"event": "relu_stable", "depth": 1, "round_index": 1, "branch_id": "selected",
+             "records": [{"variable": "z1_9"}]},
+            {"event": "branch_end", "branch_id": "selected", "result": "UNSAT"},
+            dict(first, branch_id="legacy"),
+            change,
+            dict(change, branch_id=None),
+        ])
+        for branch_id, events in (
+            ("selected", ["branch_start", "relu_mechanism", "relu_stable", "branch_end"]),
+            ("legacy", ["branch_start", "relu_mechanism"]),
+        ):
+            with self.subTest(branch_id=branch_id):
+                scope = {"topic": "tree", "round": 1, "layer": 1, "neuron": 0, "branch_id": branch_id}
+                rows = [row["data"] for row in self.selected(scope).query({})["records"]]
+                self.assertEqual([record["event"] for record in rows], events)
+                self.assertTrue(all(record["branch_id"] == branch_id for record in rows))
+                self.assertEqual(rows[1]["changes"][0]["variable"], "z1_9")
+
     def test_mechanism_topics_do_not_include_other_mechanism_records(self):
         selected = self.selected({"topic": "numeric", "round": 1})
         rows = selected.query({})["records"]
@@ -708,9 +737,14 @@ try{
         tree = self.run / 'tree.html'
         trace = SolveTrace(events=[
             TraceEvent('reluplex_branch', 1, 2, 1, 'z1_0',
-                       {'phase': '+', 'result': 'UNSAT', 'layer': 1, 'index': 0, 'round_index': 1}),
+                       {'phase': '+', 'result': 'UNSAT', 'layer': 1, 'index': 0, 'round_index': 1, 'branch_id': 'first'}),
             TraceEvent('reluplex_branch', 3, 4, 1, 'z1_0',
-                       {'phase': '-', 'result': 'UNSAT', 'layer': 1, 'index': 0, 'round_index': 1}),
+                       {'phase': '-', 'result': 'UNSAT', 'layer': 1, 'index': 0, 'round_index': 1, 'branch_id': 'second'}),
+        ])
+        self.write("relu_events_branches.jsonl", [
+            {"event": "branch_start", "branch_id": branch_id, "monotonic_ns": index,
+             "round_index": 1, "depth": 1, "layer": 1, "index": 0, "variable": "z1_0"}
+            for index, branch_id in enumerate(("first", "second"), 1)
         ])
         write_relu_search_tree_html(trace, tree, overall_status='UNSAT', mechanism_panels=[])
         page = self.run / 'relu_realtime.html'
@@ -720,6 +754,13 @@ const $=id=>document.getElementById(id),assert=(p,m)=>{if(!p)throw Error(m);};
 const wait=async(p,label)=>{for(let i=0;i<350;i++){if(p())return;await fetch(new URL('api/info',location.href));await new Promise(r=>setTimeout(r,20));}throw Error('timeout '+label);};
 const out=document.createElement('pre');out.id='tree-node-selection-test';
 const chips=()=>[...$('llm-selected-items').querySelectorAll('span')];
+let resultScope;
+const request=window.fetch;
+window.fetch=(url,options)=>{
+ const parsed=new URL(url,location.href);
+ if(parsed.pathname.endsWith('/api/result')&&parsed.searchParams.has('scope'))resultScope=JSON.parse(parsed.searchParams.get('scope'));
+ return request(url,options);
+};
 try{
  await wait(()=>$('llm-connection').textContent.includes('gemini-'),'connection');
  const frame=$('relu-tree-dashboard');
@@ -740,6 +781,7 @@ try{
  assert(chips().length===1&&chips()[0].textContent.includes('노드 #1'),'single mode retains last node');
  nodes[1].querySelector('.subtree-focus').click();
  await wait(()=>chips().length===1&&chips()[0].textContent.includes('노드 #2'),'branch focus button');
+ assert(resultScope.branch_id==='second','single selection queries only the clicked branch');
  assert($('llm-question').value==='이 두 노드를 비교해 주세요.','node selection stays outside question');
  $('llm-clear-selection').click();assert(chips().length===0,'node selections can be cleared');
  out.textContent='PASS';
@@ -756,6 +798,7 @@ try{
         result = next(iter(self.app.results.values()))
         self.assertEqual(result['question'], '이 두 노드를 비교해 주세요.')
         self.assertEqual(len(result['selected_items']), 2)
+        self.assertEqual({item['branch_id'] for item in result['scope']['selections']}, {'first', 'second'})
         context = json.loads(self.clients[0].requests[0][0][0]['parts'][1]['text'])['visualization_selection']
         self.assertEqual(context, result['selected_items'])
         self.assertTrue(any('노드 #1' in item['text'] for item in context))

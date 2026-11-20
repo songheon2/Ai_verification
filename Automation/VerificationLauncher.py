@@ -981,9 +981,9 @@ def _worker(model, prop, engine, timeout, *, settings=None, state_path=None, man
 
     settings = _run_settings({} if settings is None else settings)
     mode = VisualizationMode(settings["visualization_mode"])
-    solver_settings = {"lp_engine": engine}
-    if tuple(settings["features"]) != DEFAULT_FEATURES:
-        solver_settings.update(feature_options(settings["features"], settings["under_approx_eps"]))
+    # Record the selected features explicitly; glpk_extract etc. follow Reluplex defaults (best setting).
+    solver_settings = {"lp_engine": engine,
+                       **feature_options(settings["features"], settings["under_approx_eps"])}
     if engine != "native" and settings["lp_mode"] != "core":
         solver_settings["lp_mode"] = settings["lp_mode"]
 

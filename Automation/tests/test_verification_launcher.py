@@ -735,7 +735,10 @@ try{
         self.assertEqual(Path(args[0]).name, "network.onnx")
         self.assertEqual(args[1], str(prop))
         self.assertEqual(options["visualization_mode"], "both")
-        self.assertEqual(options["reluplex_options"], {"lp_engine": "glpk"})
+        # 기본값 = 전남대_reluplex 최고 설정의 기법 ①②③ (엔진 쪽은 Reluplex 기본값 glpk-core-basis)
+        from Reluplex import feature_options
+        self.assertEqual(options["reluplex_options"],
+                         {"lp_engine": "glpk", **feature_options("bound,backjump,numeric")})
         self.assertFalse(Path(args[0]).exists())
 
     def test_worker_automatically_opens_only_realtime_modes(self):

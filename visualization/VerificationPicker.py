@@ -150,7 +150,7 @@ def picker_markup(*, standalone=False):
         <legend>Reluplex 기법</legend>
         <div class="verify-checks">
           <label class="verify-check"><input type="checkbox" value="bound" data-feature checked>경계 유도</label>
-          <label class="verify-check"><input type="checkbox" value="backjump" data-feature>충돌 분석·백점프</label>
+          <label class="verify-check"><input type="checkbox" value="backjump" data-feature checked>충돌 분석·백점프</label>
           <label class="verify-check"><input type="checkbox" value="numeric" data-feature checked>부동소수점 안전장치</label>
           <label class="verify-check"><input type="checkbox" value="underapprox" data-feature>과소근사</label>
         </div>

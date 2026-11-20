@@ -58,9 +58,9 @@ class VisualizationOutputPathTests(unittest.TestCase):
                 started_at=started_at, output_root=output_root,
             )
             local_started_at = started_at.astimezone()
-            self.assertEqual(run_directory.parent.name, "simplex-original")
+            self.assertEqual(run_directory.parent.name, "glpk-core-basis")   # 기본 해결기 = 최고 설정
             property_group = output_root / "acasxu_2023" / "prop_3"
-            self.assertEqual(run_directory.parent, property_group / "ACASXU_run2a_2_8_batch_2000" / "simplex-original")
+            self.assertEqual(run_directory.parent, property_group / "ACASXU_run2a_2_8_batch_2000" / "glpk-core-basis")
             self.assertEqual(
                 run_directory.name, f"{local_started_at:%Y%m%d_%H%M%S}~running"
             )
@@ -68,7 +68,7 @@ class VisualizationOutputPathTests(unittest.TestCase):
                 "ACASXU_run2a_2_9_batch_2000.onnx", property_path="prop_3.vnnlib",
                 started_at=started_at, output_root=output_root,
             )
-            self.assertEqual(other_model.parent, property_group / "ACASXU_run2a_2_9_batch_2000" / "simplex-original")
+            self.assertEqual(other_model.parent, property_group / "ACASXU_run2a_2_9_batch_2000" / "glpk-core-basis")
             self.assertEqual(other_model.name, run_directory.name)
 
     def test_finalized_directory_stays_in_model_folder(self):
@@ -96,13 +96,14 @@ class VisualizationOutputPathTests(unittest.TestCase):
 
     def test_variants_are_below_same_network_and_never_share_a_run(self):
         started = datetime(2026, 9, 18, 3, 4, 5, tzinfo=timezone.utc)
-        variants = [({}, "simplex-original"),
-                    ({"lp_engine": "glpk"}, "glpk-core"),
+        # 기본값({}) = 최고 설정 glpk-core-basis. 표 전체 가져오기(full)는 예전처럼 glpk-core.
+        variants = [({}, "glpk-core-basis"),
+                    ({"lp_engine": "glpk", "glpk_extract": "full"}, "glpk-core"),
                     ({"lp_engine": "glpk", "lp_mode": "oracle"}, "glpk-oracle"),
                     ({"lp_engine": "z3"}, "z3-core"),
                     ({"lp_engine": "z3", "lp_mode": "oracle"}, "z3-oracle"),
                     ({"lp_engine": "simplex"}, "simplex-oracle"),
-                    ({"lp_engine": "glpk", "glpk_extract": "basis"}, "glpk-core-basis")]
+                    ({"lp_engine": "native"}, "simplex-original")]
         with tempfile.TemporaryDirectory() as directory:
             paths = []
             for options, expected in variants:
@@ -117,7 +118,7 @@ class VisualizationOutputPathTests(unittest.TestCase):
             self.assertEqual(len(set(paths)), len(variants))
             second = create_visualization_run_directory(
                 "model.onnx.gz", property_path="prop_3.vnnlib.gz", started_at=started, output_root=directory,
-                stable_path=True, solver_options={"lp_engine": "glpk"},
+                stable_path=True, solver_options={"lp_engine": "glpk", "glpk_extract": "full"},
             )
             self.assertEqual(second.parent, paths[1].parent)
             self.assertEqual(second.name, paths[1].name + "_2")
@@ -127,7 +128,8 @@ class VisualizationOutputPathTests(unittest.TestCase):
             self.assertEqual(finalized.parent, paths[1].parent)
 
     def test_explicit_and_implicit_engine_defaults_have_same_variant(self):
-        self.assertEqual(solver_variant_name(), solver_variant_name({"lp_engine": "native"}))
+        self.assertEqual(solver_variant_name(), solver_variant_name(
+            {"lp_engine": "glpk", "lp_mode": "core", "glpk_extract": "basis"}))
         for engine in ("glpk", "z3", "simplex"):
             mode = "oracle" if engine == "simplex" else "core"
             self.assertEqual(solver_variant_name({"lp_engine": engine}),

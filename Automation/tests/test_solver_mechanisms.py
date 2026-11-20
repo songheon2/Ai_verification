@@ -240,7 +240,8 @@ class MechanismObservationTests(unittest.TestCase):
         rows, bounds, relus, *_ = _random_relu_problem(36)
         trace = SolveTrace()
         stats = {}
-        _, sat = reluplex(rows, dict(bounds), relus, max_recursion=100,
+        # 이 문제(seed 36)는 자체 simplex 경로에서 백점프가 일어나는 예라 엔진을 고정한다
+        _, sat = reluplex(rows, dict(bounds), relus, max_recursion=100, lp_engine="native",
                           backjump=True, trace=trace, stats=stats)
         self.assertFalse(sat)
         report, nodes = report_for(trace, "UNSAT")
@@ -254,7 +255,8 @@ class MechanismObservationTests(unittest.TestCase):
                 self.assertEqual(by_id[jump["targetNodeId"]]["depth"], jump["target_depth"])
             self.assertTrue(set(jump["cause_depths"]) <= set(range(1, jump["from_depth"])))
         disabled = SolveTrace()
-        reluplex(rows, dict(bounds), relus, max_recursion=100, trace=disabled)
+        reluplex(rows, dict(bounds), relus, max_recursion=100, lp_engine="native", backjump=False,
+                 trace=disabled)
         off, _ = report_for(disabled, "UNSAT")
         self.assertFalse(off["settings"][0]["backjump"])
         self.assertEqual(off["totals"].get("backjump", 0), 0)

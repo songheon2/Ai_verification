@@ -1013,7 +1013,7 @@ def run_vnnlib_verification(
         )
 
     model_context = {"model_name": Path(model_path).name, "model_layer_sizes": list(info.layer_sizes),
-                     "lp_engine": (reluplex_options or {}).get("lp_engine", "native")}
+                     "lp_engine": (reluplex_options or {}).get("lp_engine", "glpk")}
     property_name = property_display_name(vnnlib_path, model_path)
     if property_name:
         model_context["property_name"] = property_name
@@ -1782,15 +1782,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reluplex 구현 기법 켜기/끄기 (기능별 비교 실험용). 쉼표로 구분: "
         + ", ".join(FEATURES)
         + " (1 경계 유도, 2 백점프, 3 부동소수 안전장치, 4 과소근사). "
-        "default=bound,numeric(현재 기본값), all, none",
+        "default=bound,backjump,numeric(현재 기본값), all, none",
     )
     verify_parser.add_argument(
         "--under-approx-eps", type=float, default=0.1,
         help="--features에 underapprox가 있을 때 과소근사의 eps (기본 0.1)",
     )
     verify_parser.add_argument(
-        "--lp-engine", default="native", choices=("native",) + LP_ENGINES,
-        help="노드 LP를 푸는 엔진 (엔진 비교 실험용). native=지금 방식(자체 simplex의 "
+        "--lp-engine", default="glpk", choices=("native",) + LP_ENGINES,
+        help="노드 LP를 푸는 엔진 (엔진 비교 실험용). glpk=기본값(코어 방식 + 기저 맞추기, "
+        "전남대_reluplex 최고 설정), native=자체 simplex의 "
         "tableau를 Reluplex가 직접 다룸), simplex=자체 simplex를 엔진처럼(통제군), "
         "glpk, z3",
     )
@@ -1835,15 +1836,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reluplex 구현 기법 켜기/끄기 (기능별 비교 실험용). 쉼표로 구분: "
         + ", ".join(FEATURES)
         + " (1 경계 유도, 2 백점프, 3 부동소수 안전장치, 4 과소근사). "
-        "default=bound,numeric(현재 기본값), all, none",
+        "default=bound,backjump,numeric(현재 기본값), all, none",
     )
     vnnlib_parser.add_argument(
         "--under-approx-eps", type=float, default=0.1,
         help="--features에 underapprox가 있을 때 과소근사의 eps (기본 0.1)",
     )
     vnnlib_parser.add_argument(
-        "--lp-engine", default="native", choices=("native",) + LP_ENGINES,
-        help="노드 LP를 푸는 엔진 (엔진 비교 실험용). native=지금 방식(자체 simplex의 "
+        "--lp-engine", default="glpk", choices=("native",) + LP_ENGINES,
+        help="노드 LP를 푸는 엔진 (엔진 비교 실험용). glpk=기본값(코어 방식 + 기저 맞추기, "
+        "전남대_reluplex 최고 설정), native=자체 simplex의 "
         "tableau를 Reluplex가 직접 다룸), simplex=자체 simplex를 엔진처럼(통제군), "
         "glpk, z3",
     )

@@ -31,7 +31,9 @@ _NEURON_VAR_RE = re.compile(r"^[zh](\d+)_(\d+)(?:_.*)?$")
 
 # 논문 4절의 구현 기법 4가지를 켜고 끄는 이름 (기능별 비교 실험용)
 FEATURES = ("bound", "backjump", "numeric", "underapprox")
-DEFAULT_FEATURES = ("bound", "numeric")
+# 기본값 = 전남대_reluplex 최고 설정의 기법 ①②③ (논문 Reluplex와 같은 구성).
+# 엔진 기본값(reluplex의 lp_engine="glpk", glpk_extract="basis")과 함께 최고 설정이 된다.
+DEFAULT_FEATURES = ("bound", "backjump", "numeric")
 
 
 def feature_options(features: Any = "default", under_approx_eps: float = 0.1) -> Dict[str, Any]:
@@ -43,7 +45,7 @@ def feature_options(features: Any = "default", under_approx_eps: float = 0.1) ->
     numeric     — 3. 부동소수 안전장치: 작은 계수로 피벗하지 않기, 누적 오차 검사·복원
     underapprox — 4. 과소근사 (eps = under_approx_eps)
 
-    "default"는 지금 기본값(bound, numeric), "all"은 넷 다, "none"은 모두 끈다.
+    "default"는 지금 기본값(bound, backjump, numeric), "all"은 넷 다, "none"은 모두 끈다.
     쉼표로 구분한 문자열이나 이름 목록을 받는다.
     """
     if isinstance(features, str):
@@ -266,14 +268,14 @@ def reluplex(
     derive_incremental: bool = True,
     pivot_tighten: bool = True,
     full_tighten_every: int = 1000,
-    backjump: bool = False,
+    backjump: bool = True,
     check_backjump: bool = False,
     under_approx: float = 0.0,
     under_approx_share: float = 0.3,
     numeric_safeguards: bool = True,
-    lp_engine: str = "native",
+    lp_engine: str = "glpk",
     lp_mode: Optional[str] = None,
-    glpk_extract: str = "full",
+    glpk_extract: str = "basis",
     glpk_row_error: str = "auto",
 ) -> Tuple[Optional[Dict[str, float]], bool]:
     """
@@ -312,7 +314,8 @@ def reluplex(
         올린다. 첫째 가지의 모순이 이 분기와 무관하면 둘째 가지도 같은 이유로
         UNSAT이므로 풀지 않고 건너뛴다 — 여러 층이 무관하면 그만큼 한꺼번에
         되돌아간다(논문 예: 분기 8, 7, 6을 한 번에 취소).
-        기본값은 꺼 둔다. 실측에서 모순의 원인이 경로 분기의 67~100%를 차지해
+        기본값은 켠다 (전남대_reluplex 최고 설정, GLPK 코어와 함께). 아래는 자체
+        simplex 시절의 실측이다: 모순의 원인이 경로 분기의 67~100%를 차지해
         건너뛴 것이 매번 바로 닫힐 형제 잎 하나뿐이었고, 원인 기록 비용으로 경계
         유도가 33~44% 느려져 ACAS Xu 증명 3개가 10~15% 느려졌다. 켜면
         CONFLICT_BITS / CONFLICT_DEPTH로 "모순이 경로의 몇 할에 기대는가"를 잴 수 있다.
@@ -331,7 +334,8 @@ def reluplex(
         끈다 — simplex와 PivotForRelu가 계수 크기를 보지 않고 이름순 첫 후보로
         피벗하고, 누적 오차 검사·복원을 하지 않는다. 판정이 틀릴 수 있다.
     lp_engine: 노드 LP("경계 위반 고치기")를 누가 푸는가. "native"는 자체 simplex.
-        "glpk" / "z3"는 lp_mode에 따라 두 가지로 쓴다(LpEngines.py).
+        "glpk" / "z3"는 lp_mode에 따라 두 가지로 쓴다(LpEngines.py). 기본값 "glpk"
+        (코어 방식 + glpk_extract="basis" = 전남대_reluplex 최고 설정).
     lp_mode: 엔진을 어떻게 끼우는가 (lp_engine이 native가 아닐 때).
         "core"   — 카츠 Reluplex의 구조. Reluplex가 자기 tableau를 들고 native
                    경로를 그대로 돌고, Simplex.simplex 자리만 엔진이 맡는다. 그래서
@@ -344,7 +348,7 @@ def reluplex(
                    쓰는 통제군)는 이 방식뿐이다.
     glpk_extract: lp_engine="glpk", lp_mode="core"일 때 다 푼 LP를 tableau로 가져오는
         방법(LpEngines.GlpkCore). "full"은 기저 row 전부를 GLPK에서 새로 계산해 오고,
-        "basis"는 카츠 Reluplex처럼 기저 목록만 받아 우리 tableau를 그만큼 피벗한다.
+        "basis"(기본값)는 카츠 Reluplex처럼 기저 목록만 받아 우리 tableau를 그만큼 피벗한다.
     glpk_row_error: 노드 경계 유도에서 tableau row에 GLPK 잡음 대비 오차 상한을 붙이는
         때(LpEngines.GlpkCore row_error). "auto"는 표 row를 GLPK에서 가져온 tableau만
         ("full"은 늘, "basis"는 우리 피벗만 거쳤으면 안 붙임), "always"는 늘.

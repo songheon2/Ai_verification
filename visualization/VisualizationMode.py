@@ -140,13 +140,13 @@ def benchmark_folder_name(model_path: str | Path, property_path: str | Path | No
 def solver_variant_name(options: Mapping[str, Any] | None = None) -> str:
     """Effective LP implementation, including implicit engine mode defaults."""
     options = options or {}
-    engine = options.get("lp_engine", "native")
+    engine = options.get("lp_engine", "glpk")
     if engine == "native":
         return "simplex-original"
     mode = options.get("lp_mode") or ("oracle" if engine == "simplex" else "core")
     name = f"{engine}-{mode}"
     if engine == "glpk" and mode == "core":
-        extract = options.get("glpk_extract", "full")
+        extract = options.get("glpk_extract", "basis")
         if extract != "full":
             name += f"-{extract}"
         row_error = options.get("glpk_row_error", "auto")

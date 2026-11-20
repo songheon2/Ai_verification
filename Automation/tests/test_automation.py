@@ -1069,7 +1069,7 @@ class FeatureSwitchTests(unittest.TestCase):
         self.assertTrue(everything["derive_bound"] and everything["backjump"])
         self.assertTrue(everything["numeric_safeguards"])
         self.assertEqual(everything["under_approx"], 0.2)
-        self.assertEqual(feature_options("bound, numeric"), feature_options("default"))
+        self.assertEqual(feature_options("bound, backjump, numeric"), feature_options("default"))
         self.assertEqual(feature_options(FEATURES), everything | {"under_approx": 0.1})
         with self.assertRaises(ValueError):
             feature_options("bound,typo")
@@ -1334,6 +1334,18 @@ class LpEngineTests(unittest.TestCase):
                 if sat:
                     self.assertGreaterEqual(forward([model["x0"], model["x1"]]), theta - 1e-6)
 
+    def test_default_solver_is_best_setting(self):
+        """기본값 = 전남대_reluplex 최고 설정: 기법 ①②③ + GLPK 코어 + 기저 맞추기."""
+        import inspect
+        from Reluplex import DEFAULT_FEATURES
+        from visualization.VisualizationMode import solver_variant_name
+        params = inspect.signature(reluplex).parameters
+        self.assertEqual(DEFAULT_FEATURES, ("bound", "backjump", "numeric"))
+        self.assertEqual((params["lp_engine"].default, params["lp_mode"].default,
+                          params["glpk_extract"].default, params["backjump"].default),
+                         ("glpk", None, "basis", True))
+        self.assertEqual(solver_variant_name(None), "glpk-core-basis")
+
     @unittest.skipUnless(_importable("swiglpk"), "swiglpk 없음")
     def test_glpk_row_error_only_for_imported_rows(self):
         """row 오차는 GLPK에서 표 row를 가져온 tableau에만 붙인다(row_error="auto").
@@ -1439,7 +1451,7 @@ class LpEngineTests(unittest.TestCase):
             {k: v for k, v in options.items() if k != "lp_engine"}, feature_options("default")
         )
         args = build_parser().parse_args(["verify-vnnlib", "--model", "m.onnx", "--vnnlib", "p.vnnlib"])
-        self.assertEqual(_reluplex_options(args)["lp_engine"], "native")
+        self.assertEqual(_reluplex_options(args)["lp_engine"], "glpk")   # 기본값 = 최고 설정
 
 
 if __name__ == "__main__":

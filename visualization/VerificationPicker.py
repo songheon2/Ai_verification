@@ -584,10 +584,10 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     modelLoading = true;
     options(batchModel, [], '모델 불러오는 중…');
     try {
-      const {models, default_model:preferred, thinking_levels:levels, paid_only:paid = []} = await api('verify-models');
+      const {models, default_model:preferred, thinking_levels:levels} = await api('verify-models');
       batchLevels = levels || {};
       const hasPreferred = models.includes(preferred);
-      options(batchModel, models.map(id => ({id,label:paid.includes(id) ? id + ' · 유료' : id})),
+      options(batchModel, models.map(id => ({id,label:id})),
         hasPreferred ? null : models.length ? '모델 선택' : '사용 가능한 모델 없음');
       if (hasPreferred) batchModel.value = preferred;
       setAnalysisEffortOptions(batchEffort, batchLevels[batchModel.value]);

@@ -70,8 +70,7 @@ def validate_thinking_level(model, level):
 
 def analysis_model_options(models):
     choices = list(dict.fromkeys(model for model in models if is_analysis_model(model)))
-    return {"models": choices, "thinking_levels": {model: model_thinking_levels(model) for model in choices},
-            "paid_only": [model for model in choices if TEXT_MODEL.fullmatch(model)[3] in {"carbon", "argon", "neon"}]}
+    return {"models": choices, "thinking_levels": {model: model_thinking_levels(model) for model in choices}}
 
 
 MAX_TOOL_BYTES = 16000

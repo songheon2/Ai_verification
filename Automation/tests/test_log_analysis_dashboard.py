@@ -360,7 +360,7 @@ try{
         self.assertEqual(status, 200)
         catalog = json.loads(raw)
         self.assertEqual(catalog["models"], [self.app.model, chosen, "gemini-4-carbon"])
-        self.assertEqual(catalog["paid_only"], ["gemini-4-carbon"])
+        self.assertEqual(catalog["thinking_levels"]["gemini-4-carbon"], ["default", "low", "medium", "high"])
         self.request(self.base + "api/models")
         self.assertEqual(len(listed), 1)
         headers = {"Content-Type": "application/json", "X-Analysis-Token": self.app.csrf}

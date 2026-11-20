@@ -214,11 +214,11 @@
     if(!info?.model_selection || modelCatalogLoaded || modelCatalogPending)return;
     modelCatalogPending=true;
     try{
-      const {models,thinking_levels:levels,paid_only:paid=[]}=await api('models');
+      const {models,thinking_levels:levels}=await api('models');
       modelLevels=levels||{};
       const current=modelSelect.value;
       const choices=[...new Set(models)];
-      const modelOptions=choices.map(name=>new Option(paid.includes(name)?name+' · 유료':name,name));
+      const modelOptions=choices.map(name=>new Option(name,name));
       if(choices.includes(current)){
         modelSelect.replaceChildren(...modelOptions);
         modelSelect.value=current;

@@ -622,7 +622,7 @@ GEMINI_API_KEY=
 
 키가 없거나 형식이 잘못되었거나 서버 준비에 실패해도 검증은 중단하지 않고 기존 파일 시각화를 엽니다. 사용자 지정 대시보드를 실행 폴더 밖에 저장하는 경우에도 파일 시각화를 유지합니다. 시각화 미사용·feedback 전용·dry run에서는 분석 서버를 자동 실행하지 않습니다.
 
-개별·통합 분석의 **모델** 드롭다운에는 API 키로 조회한 Gemini 3.5 이상 텍스트 모델이 표시됩니다. 모델별 **추론 강도**를 다음 분석 요청에 적용할 수 있습니다. 유료 모델은 Google 프로젝트의 결제 설정과 [Gemini API 요금](https://aistudio.google.com/docs/pricing)을 따릅니다.
+개별·통합 분석의 **모델** 드롭다운에는 API 키로 조회한 Gemini 3.5 이상 텍스트 모델이 표시됩니다. 모델별 **추론 강도**를 다음 분석 요청에 적용할 수 있습니다.
 
 **새 검증 실행**에서 벤치마크, ONNX, VNNLIB, 엔진 및 제한 시간을 고를 수 있습니다. 로컬 파일은 `Onnx`, `Automation/SmokeTest`, `Vnnlib`, `Properties`에서, 벤치마크는 인접 `vnncomp2025_benchmarks/benchmarks`에서 읽습니다. 압축 ONNX는 임시 폴더에서 풉니다.
 

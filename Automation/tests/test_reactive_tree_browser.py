@@ -129,7 +129,7 @@ setTimeout(async ()=>{
     const target=panels.find(panel=>panel.id==='dpll-theory-dashboard');
     target.uri='data:image/svg+xml,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="720"></svg>')+'#';
     refreshPanel(target);
-    await new Promise(resolve=>setTimeout(resolve,100));
+    for(let i=0;i<100&&document.querySelector('#dpll-theory-dashboard').naturalWidth!==1500;i++)await new Promise(resolve=>setTimeout(resolve,10));
     const wider=document.querySelector('#dpll-theory-dashboard').getBoundingClientRect();
     assert(wider.width>dpll.width && Math.abs(wider.height-dpll.height)<1,'only DPLL grows horizontally without stretching its height');
     assert(Math.abs(document.querySelector('#simplex-dashboard').getBoundingClientRect().width-simplex.width)<1 && Math.abs(document.querySelector('#relu-dashboard').getBoundingClientRect().width-relu.width)<1,'DPLL expansion does not resize Simplex or ReLU');

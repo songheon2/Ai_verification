@@ -38,6 +38,7 @@ z3       Z3의 QF_LRA. 계수와 경계를 float 값 그대로의 정확한 유�
 """
 from fractions import Fraction
 from math import isfinite
+from threading import current_thread
 from time import monotonic
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -271,27 +272,43 @@ class SimplexEngine(_EngineBase):
 #  GLPK
 # ─────────────────────────────────────────────
 
-class GlpkEngine(_EngineBase):
+class _GlpkProblem:
+    def _open_problem(self):
+        import swiglpk as glp
+
+        self.glp = glp
+        self._owner_thread = current_thread()
+        self.lp = glp.glp_create_prob()
+        glp.glp_set_obj_dir(self.lp, glp.GLP_MIN)
+        return glp
+
+    def close(self) -> None:
+        if getattr(self, "lp", None) is None:
+            return
+        if current_thread() is not self._owner_thread:
+            raise RuntimeError("GLPK problems must be closed by their creating thread")
+        lp, self.lp = self.lp, None
+        self.glp.glp_delete_prob(lp)
+
+    def __del__(self) -> None:
+        # A cyclic search frame may be collected by the visualization thread.
+        # GLPK's allocator uses thread-local bookkeeping.
+        if current_thread() is getattr(self, "_owner_thread", None):
+            self.close()
+
+
+class GlpkEngine(_EngineBase, _GlpkProblem):
     """GLPK 5.0 (swiglpk) — 정의식과 경계만 받아 답하는 방식(oracle)."""
 
     name = "glpk"
 
     def __init__(self, tol_bnd: float = 1e-10, method: str = "dual") -> None:
         super().__init__()
-        import swiglpk as glp
-        self.glp = glp
-        self.lp = glp.glp_create_prob()
-        glp.glp_set_obj_dir(self.lp, glp.GLP_MIN)
+        glp = self._open_problem()
         self.parm = _glpk_parm(glp, tol_bnd, method)
         self._row_set: Dict[int, Tuple[int, float, float]] = {}
         self._col_set: Dict[int, Tuple[int, float, float]] = {}
         self.failures = 0
-
-    def __del__(self) -> None:
-        try:
-            self.glp.glp_delete_prob(self.lp)
-        except Exception:
-            pass
 
     def _solve(self, new_rows, new_cols, row_b, col_b, deadline):
         glp, lp = self.glp, self.lp
@@ -575,7 +592,7 @@ def _bound_mag(bounds):
     return mag
 
 
-class GlpkCore:
+class GlpkCore(_GlpkProblem):
     """카츠 Reluplex처럼 GLPK를 '경계 위반 고치기' 엔진으로 쓴다.
 
     부를 때마다 (1) tableau의 원래 등식·경계·기저를 GLPK에 넘기고, (2) GLPK가 그
@@ -622,10 +639,7 @@ class GlpkCore:
             raise ValueError(f"알 수 없는 row_error: {row_error} (가능: auto, always)")
         self.extract = extract
         self.row_error = row_error
-        import swiglpk as glp
-        self.glp = glp
-        self.lp = glp.glp_create_prob()
-        glp.glp_set_obj_dir(self.lp, glp.GLP_MIN)
+        glp = self._open_problem()
         self.parm = _glpk_parm(glp, tol_bnd, "primal")
         self.dual_parm = _glpk_parm(glp, tol_bnd, "dual-only")
         self.row_heads: List[str] = []
@@ -637,12 +651,6 @@ class GlpkCore:
         self.tightened = 0
         self.conflicts_found = 0
         self._buf_n = -1
-
-    def __del__(self) -> None:
-        try:
-            self.glp.glp_delete_prob(self.lp)
-        except Exception:
-            pass
 
     # ── tableau → GLPK ──
     def _sync(self, tableau) -> None:

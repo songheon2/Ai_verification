@@ -24,23 +24,52 @@ from visualization.SolveTrace import SolveTrace, TraceEvent
 from visualization.VisualizationMode import (
     create_visualization_run_directory,
     finalize_visualization_run_directory,
+    resolve_visualization_output,
+    solver_variant_name,
 )
 from visualization.UnifiedRealtimeDashboard import UnifiedRealtimeDashboard
 
 
 class VisualizationOutputPathTests(unittest.TestCase):
-    def test_run_directory_is_grouped_by_model_then_start_time(self):
+    def test_old_run_paths_resolve_after_property_move(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            before = Path("model/glpk-core/20260918_030405")
+            after = Path("local/prop_3/model/glpk-core/20260918_030405")
+            (root / after).mkdir(parents=True)
+            (root / after / "result.json").touch()
+            (root / after / "logs").mkdir()
+            (root / after / "logs" / "solver_progress.jsonl").touch()
+            (root / ".run-relocations.json").write_text(
+                json.dumps({before.as_posix(): after.as_posix()}), encoding="utf-8")
+            self.assertEqual(resolve_visualization_output(root / before, root), root / after)
+            self.assertEqual(resolve_visualization_output(root / before / "result.json", root),
+                             root / after / "result.json")
+            for location in (before, after):
+                self.assertEqual(resolve_visualization_output(root / location / "solver_progress.jsonl", root),
+                                 root / after / "logs" / "solver_progress.jsonl")
+
+    def test_run_directory_groups_benchmark_then_property_then_model(self):
         started_at = datetime(2026, 9, 18, 3, 4, 5, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as directory:
             output_root = Path(directory)
             run_directory = create_visualization_run_directory(
-                "model.onnx", started_at=started_at, output_root=output_root
+                "ACASXU_run2a_2_8_batch_2000.onnx", property_path="prop_03.vnnlib.gz",
+                started_at=started_at, output_root=output_root,
             )
             local_started_at = started_at.astimezone()
-            self.assertEqual(run_directory.parent.name, "model")
+            self.assertEqual(run_directory.parent.name, "simplex-original")
+            property_group = output_root / "acasxu_2023" / "prop_3"
+            self.assertEqual(run_directory.parent, property_group / "ACASXU_run2a_2_8_batch_2000" / "simplex-original")
             self.assertEqual(
                 run_directory.name, f"{local_started_at:%Y%m%d_%H%M%S}~running"
             )
+            other_model = create_visualization_run_directory(
+                "ACASXU_run2a_2_9_batch_2000.onnx", property_path="prop_3.vnnlib",
+                started_at=started_at, output_root=output_root,
+            )
+            self.assertEqual(other_model.parent, property_group / "ACASXU_run2a_2_9_batch_2000" / "simplex-original")
+            self.assertEqual(other_model.name, run_directory.name)
 
     def test_finalized_directory_stays_in_model_folder(self):
         started_at = datetime(2026, 9, 18, 3, 4, 5, tzinfo=timezone.utc)
@@ -63,6 +92,78 @@ class VisualizationOutputPathTests(unittest.TestCase):
                 f"{finished_at.astimezone():%Y%m%d_%H%M%S}",
             )
             self.assertTrue(finalized.is_dir())
+
+
+    def test_variants_are_below_same_network_and_never_share_a_run(self):
+        started = datetime(2026, 9, 18, 3, 4, 5, tzinfo=timezone.utc)
+        variants = [({}, "simplex-original"),
+                    ({"lp_engine": "glpk"}, "glpk-core"),
+                    ({"lp_engine": "glpk", "lp_mode": "oracle"}, "glpk-oracle"),
+                    ({"lp_engine": "z3"}, "z3-core"),
+                    ({"lp_engine": "z3", "lp_mode": "oracle"}, "z3-oracle"),
+                    ({"lp_engine": "simplex"}, "simplex-oracle"),
+                    ({"lp_engine": "glpk", "glpk_extract": "basis"}, "glpk-core-basis")]
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for options, expected in variants:
+                self.assertEqual(solver_variant_name(options), expected)
+                path = create_visualization_run_directory(
+                    "model.onnx.gz", property_path="prop3.vnnlib", started_at=started, output_root=directory,
+                    stable_path=True, solver_options=options,
+                )
+                self.assertEqual(path.parent, Path(directory) / "local" / "prop_3" / "model" / expected)
+                self.assertEqual(path.name, started.astimezone().strftime("%Y%m%d_%H%M%S"))
+                paths.append(path)
+            self.assertEqual(len(set(paths)), len(variants))
+            second = create_visualization_run_directory(
+                "model.onnx.gz", property_path="prop_3.vnnlib.gz", started_at=started, output_root=directory,
+                stable_path=True, solver_options={"lp_engine": "glpk"},
+            )
+            self.assertEqual(second.parent, paths[1].parent)
+            self.assertEqual(second.name, paths[1].name + "_2")
+            finalized = finalize_visualization_run_directory(
+                second, "model.onnx.gz", started_at=started, finished_at=started,
+            )
+            self.assertEqual(finalized.parent, paths[1].parent)
+
+    def test_explicit_and_implicit_engine_defaults_have_same_variant(self):
+        self.assertEqual(solver_variant_name(), solver_variant_name({"lp_engine": "native"}))
+        for engine in ("glpk", "z3", "simplex"):
+            mode = "oracle" if engine == "simplex" else "core"
+            self.assertEqual(solver_variant_name({"lp_engine": engine}),
+                             solver_variant_name({"lp_engine": engine, "lp_mode": mode}))
+
+
+    def test_autoverify_routes_options_to_directory_and_records_variant(self):
+        from unittest.mock import patch
+        from Automation.AutoVerify import run_vnnlib_verification
+        from Automation.SolverStatus import SolverResult, SolverStatus
+        model = Path(__file__).resolve().parents[2] / "xor_network.bin"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prop = root / "property.vnnlib"
+            prop.write_text('(declare-const X_0 Real) (declare-const X_1 Real) '
+                            '(declare-const Y_0 Real) (assert (= X_0 0)) '
+                            '(assert (= X_1 0)) (assert (<= Y_0 0))', encoding="utf-8")
+
+            def create(*args, **kwargs):
+                return create_visualization_run_directory(*args, **kwargs, output_root=root / "outputs")
+
+            for options in ({}, {"lp_engine": "glpk"},
+                            {"lp_engine": "z3", "lp_mode": "oracle"}):
+                with patch("Automation.AutoVerify.create_visualization_run_directory", side_effect=create), \
+                     patch("Automation.AutoVerify.dpll_t_detailed", return_value=SolverResult(SolverStatus.UNSAT)):
+                    result = run_vnnlib_verification(str(model), str(prop), reluplex_options=options)
+                folder = Path(result["visualization"]["output_directory"])
+                variant = solver_variant_name(options)
+                self.assertEqual(folder.parent.name, variant)
+                self.assertEqual(folder.parent.parent.parent.name, "property")
+                self.assertEqual(folder.parent.parent.name, "xor_network")
+                self.assertEqual(result["solver"]["variant"], variant)
+                self.assertTrue((folder / "inputs" / "model.bin").is_file())
+                self.assertTrue((folder / "inputs" / "property.vnnlib").is_file())
+                self.assertEqual(json.loads((folder / "run_info.json").read_text(encoding="utf-8"))["solver_variant"], variant)
+                self.assertEqual(json.loads((folder / "result.json").read_text(encoding="utf-8"))["solver"]["variant"], variant)
 
 
 class ReLUSearchTreeTests(unittest.TestCase):
@@ -598,6 +699,22 @@ class RealtimeSearchTreeTests(unittest.TestCase):
 
 
 class TheoryFlowLabelTests(unittest.TestCase):
+    def test_current_solver_worker_keeps_selected_panels_and_flushes_terminal_update(self):
+        from concurrent.futures import Future
+        from unittest.mock import patch
+        from visualization.SolverProgress import SolverProgressPanelVisualizer
+        completed = Future()
+        completed.set_result(None)
+        worker = SolverProgressPanelVisualizer("solver.jsonl", "solver.png", enabled_panels={"simplex"})
+        with patch("visualization.SolverProgress.submit_solver_render", return_value=completed) as submit:
+            worker.request_update(event="solver_end")
+            worker.flush()
+        submit.assert_called_once_with(Path("solver.jsonl"),
+                                       {"simplex": Path("solver_simplex.png")}, ("simplex",))
+        self.assertIsNone(worker._worker)
+        self.assertFalse(hasattr(worker, "live_view_path"))
+        self.assertFalse(hasattr(worker, "_preserved_frames"))
+
     def test_simplex_call_counts_are_centered_unless_bar_is_too_small(self):
         import matplotlib.pyplot as plt
         from visualization.SolverProgress import draw_dpll_theory_panel
@@ -729,7 +846,7 @@ class TheoryFlowLabelTests(unittest.TestCase):
         from DPLL import parse_prop
         from DPLL_T import dpll_t_detailed
         from visualization.SolverProgress import (
-            SolverProgressLogger, read_solver_progress, draw_dpll_theory_panel, draw_theory_panel,
+            SolverProgressLogger, read_solver_progress, draw_dpll_theory_panel,
         )
         formula = parse_prop('(ineq(1,x,1) and not ineq(1,x,0)) or (ineq(1,x,1) and ineq(1,x,0))')
         with tempfile.TemporaryDirectory() as directory:
@@ -741,18 +858,17 @@ class TheoryFlowLabelTests(unittest.TestCase):
         self.assertEqual(result.rounds, 2)
         self.assertEqual([event['result'] for event in events if event['event']=='theory_result'],
                          ['THEORY_CONFLICT', 'THEORY_SAT'])
-        for draw in (draw_dpll_theory_panel, draw_theory_panel):
-            figure, _axes = draw(events)
-            try:
-                results_axis = next(axis for axis in figure.axes if axis.get_title()=='Theory Solver Result')
-                self.assertEqual(results_axis.get_xlabel(), 'Count')
-                self.assertEqual([label.get_text() for label in results_axis.texts], ['1','1'])
-                flow = next(axis for axis in figure.axes if 'selected atoms' in axis.get_title(loc='left'))
-                self.assertEqual(flow.get_title(loc='left'), 'Round | selected atoms | Simplex | theory result')
-                self.assertTrue(any('R1 |' in label.get_text() and 'R2 |' in label.get_text() for label in flow.texts))
-                self.assertFalse(any('→' in label.get_text() for label in flow.texts))
-            finally:
-                plt.close(figure)
+        figure, _axes = draw_dpll_theory_panel(events)
+        try:
+            results_axis = next(axis for axis in figure.axes if axis.get_title()=='Theory Solver Result')
+            self.assertEqual(results_axis.get_xlabel(), 'Count')
+            self.assertEqual([label.get_text() for label in results_axis.texts], ['1','1'])
+            flow = next(axis for axis in figure.axes if 'selected atoms' in axis.get_title(loc='left'))
+            self.assertEqual(flow.get_title(loc='left'), 'Round | selected atoms | Simplex | theory result')
+            self.assertTrue(any('R1 |' in label.get_text() and 'R2 |' in label.get_text() for label in flow.texts))
+            self.assertFalse(any('→' in label.get_text() for label in flow.texts))
+        finally:
+            plt.close(figure)
 
 
 if __name__ == "__main__":

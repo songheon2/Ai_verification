@@ -437,6 +437,48 @@ def reluplex(
     # engine: oracle 방식의 엔진, core: core 방식에서 Simplex.simplex 자리를 맡는 엔진
     engine = None
     core = None
+    previous_lp_model = None
+
+    @contextmanager
+    def _external_lp_progress(row_count, variable_count, context, engine_name, owner=None, model=None, bounds=None):
+        from Automation.LpTelemetry import ExternalMetrics, observe_bounds
+        call_id = None
+        result = "ERROR"
+        outcome = {}
+        failure_details = {}
+        collector = None
+        if progress is not None:
+            call_id = progress.simplex_start(
+                round_index=context.get("round_index"),
+                depth=context.get("depth"),
+                origin=str(context.get("origin", "reluplex")),
+                theory_atom_ids=context.get("theory_atom_ids", []),
+                row_count=row_count, variable_count=variable_count,
+                lp_engine=engine_name, work_counts_available=False,
+            )
+            # A long external solve may emit no intermediate events.
+            if "simplex" in getattr(progress, "enabled_panels", {"simplex"}):
+                collector = ExternalMetrics(owner, progress, call_id, context)
+                if bounds is not None:
+                    progress.simplex_bound_observations(call_id, observe_bounds(model, bounds), source="call_boundary")
+            progress.flush()
+        try:
+            yield outcome
+            result = "SAT" if outcome["sat"] else "UNSAT"
+        except SolverLimitReached as exc:
+            result = exc.reason
+            if isinstance(getattr(exc, "details", None), dict):
+                failure_details["model_validation"] = exc.details
+            raise
+        finally:
+            if call_id is not None:
+                metrics = collector.finish() if collector is not None else {
+                    "iterations": None, "pivots": None, "work_counts_available": False}
+                progress.simplex_end(
+                    call_id, result, iterations=metrics.pop("iterations"), pivots=metrics.pop("pivots"),
+                    lp_engine=engine_name, **metrics,
+                    **failure_details,
+                )
 
     def _simplex(*args, **kwargs):
         if core is None:
@@ -444,16 +486,35 @@ def reluplex(
         # 엔진 코어(LpEngines)는 시각화 기록 콜백을 받지 않는다
         for key in ("mechanism_callback", "numerical_callback", "bound_change_callback"):
             kwargs.pop(key, None)
-        return core.simplex(*args, **kwargs)
+        tableau = args[0]
+        with _external_lp_progress(
+            len(tableau.rows), len(tableau.assign),
+            dict(kwargs.get("progress_context") or {}), core.name, owner=core,
+            model=tableau.assign, bounds=tableau.bounds,
+        ) as outcome:
+            answer = core.simplex(*args, **kwargs)
+            outcome["sat"] = answer[1]
+            return answer
 
     def _engine_solve(
         rows_now: List[Tuple[str, Dict[str, float]]],
         bounds_now: Dict[str, Tuple[float, float]],
         repair: bool = False,
+        depth: int = 0,
     ) -> Optional[Dict[str, float]]:
-        with _lp_timer(repair):
+        nonlocal previous_lp_model
+        with _lp_timer(repair), _external_lp_progress(
+            len(rows_now), len(bounds_now),
+            {**base_progress_context, "depth": depth,
+             "origin": "relu_repair" if repair else "reluplex"}, lp_engine, owner=engine,
+            model=previous_lp_model, bounds=bounds_now,
+        ) as outcome:
             # repair는 값을 잠깐 고정하고 푼다: 그때 좁힌 경계는 노드 전체에서 성립하지 않는다
-            return engine.solve(rows_now, bounds_now, deadline)
+            answer = engine.solve(rows_now, bounds_now, deadline)
+            if answer is not None:
+                previous_lp_model = answer
+            outcome["sat"] = answer is not None
+            return answer
 
     record_mechanisms = trace is not None or hasattr(split_logger, "mechanism")
 
@@ -472,6 +533,10 @@ def reluplex(
                       drift_threshold=DRIFT_TOL, drift_check_every=DRIFT_CHECK_EVERY,
                       drift_check_at_exit=DRIFT_CHECK_AT_EXIT,
                       numeric_safeguards=numeric_safeguards,
+                      lp_engine=lp_engine, lp_mode=lp_mode or "native",
+                      numeric_event_support="native_callbacks" if lp_engine == "native" else "not_exposed_by_external_engine",
+                      search_derive_rows=search_derive_rows, warm_start=warm_start,
+                      local_repair_max_iter=local_repair_max_iter, branch_tau=branch_tau,
                       underapprox_enabled=under_approx > 0.0, underapprox_epsilon=under_approx)
 
     def _lp_events(depth: int, **metadata) -> None:
@@ -846,7 +911,7 @@ def reluplex(
             # tableau를 들여다보는 기법(피벗마다 경계 강화, tableau row로 경계 유도,
             # 부모 tableau 물려받기)은 쓰지 않고, 이어 풀기는 엔진이 알아서 한다.
             with span(trace, "simplex", depth=depth):
-                assign = _engine_solve(current_row_defs, bounds_now)
+                assign = _engine_solve(current_row_defs, bounds_now, depth=depth)
             if assign is None:
                 return _unsat(depth, "LP", None)
 
@@ -886,7 +951,7 @@ def reluplex(
                         pinned = dict(bounds_now)
                         pinned[var] = (target, target)
                         try:
-                            fixed_assign = _engine_solve(current_row_defs, pinned, repair=True)
+                            fixed_assign = _engine_solve(current_row_defs, pinned, repair=True, depth=depth)
                         except SolverLimitReached as exc:
                             if exc.reason == "TIMEOUT":
                                 raise
@@ -1516,6 +1581,8 @@ def reluplex(
         return _rec(active_bounds, 0, active_row_defs)
     finally:
         used = engine if engine is not None else core
+        if used is not None and lp_engine == "glpk":
+            used.close()
         if used is not None and stats is not None:
             stats["LP_ENGINE"] = f"{used.name}-{lp_mode}"
             stats["LP_ENGINE_FAILURES"] = (

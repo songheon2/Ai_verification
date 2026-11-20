@@ -4,7 +4,7 @@
 
 `--visualization-mode realtime|feedback|both`는 ReLU split뿐 아니라
 DPLL(T) round, theory 선택, Reluplex에서 호출한 Simplex의 세부 동작도
-같이 계측한다.
+같이 계측한다. 옵션을 생략하면 시각화하지 않으며, `--panels`로 표시할 패널을 선택한다.
 
 ```text
 DPLL round
@@ -21,8 +21,11 @@ DPLL round
 | 구역 | 표시 내용 |
 |---|---|
 | `DPLL Rounds & Theory Flow` | round 시간·결과·Simplex 호출 수와 theory atom→Simplex→반환 결과의 흐름 |
-| `Simplex Internals` | 호출 시간·결과, 호출별 pivot 수, 위반 변수, entering/leaving 변수, pivot row |
-| `Realtime ReLU Split History` | 최근 5분 활성 ReLU split 수의 실시간 선 그래프 |
+| `Simplex Internals` | 호출 시간·결과, 호출별 pivot 수, 반복 선택된 경계 위반 변수 |
+| `Realtime ReLU Split History` | 기본 최근 5분의 열린 ReLU 분기 수와 뉴런별 분기 상태 |
+| ReLU search tree | 가지별 탐색 결과·완료 순서·STABLE 확정 뉴런 |
+| Solver mechanisms | 경계 유도·충돌 분석/백점프·수치 안전장치·과소근사 기록 |
+| 항목별 LLM 분석 | 선택한 항목의 현재까지 기록을 고정해 수동 분석 |
 
 Simplex `Call duration`의 y축은 실제 호출 중 가장 긴 `duration_seconds`를 상한으로
 사용한다. 자동 눈금 반올림 때문에 실제 데이터보다 큰 빈 시간 범위가 표시되지 않는다.
@@ -66,30 +69,20 @@ ReLU의 heatmap, realtime, full-history feedback은 서로 다른 그림이므�
 유지한다. JSON에는 round/call 상세, 누적 iteration/pivot 수, 상위 위반 변수,
 entering/leaving 변수, pivot row, theory 연결 결과가 들어 있다.
 
-## 제어 데모
-
-repository root에서:
-
-```powershell
-python -m visualization.solver_progress_demo --interval 0.2
-```
-
-이 데모는 round 3개, Simplex call 5개, `SAT`/`UNSAT`/`ITERATION_LIMIT`
-상태와 반복 pivot 통계를 제어된 이벤트로 보여 준다. visualization
-동작 확인용이며 실제 안전성 검증 결과가 아니다.
-
 ## AutoVerify 실행
 
 ```powershell
-python Automation\run_large_model.py verify-vnnlib `
-  --model Custom\ACASXU_experimental_v2a_1_1_custom.bin `
-  --vnnlib ..\neuralsat\src\example\vnnlib\prop_1.vnnlib `
+python Automation/AutoVerify.py verify-vnnlib `
+  --model "모델.onnx" `
+  --vnnlib "속성.vnnlib.gz" `
   --allow-large-model --timeout-seconds 300 `
   --visualization-mode both
 ```
 
-realtime이 켜지면 하나의 HTML 안에서 DPLL+Theory, Simplex, ReLU split을
-세 구역으로 표시한다. 개별 HTML은 AutoVerify에서 생성하거나 열지 않는다.
+realtime은 선택한 패널을 하나의 대시보드에 표시한다. 트리와 기법 보고서는
+그 안에 포함되며 별도 창으로 열지 않는다. `GEMINI_API_KEY`가 설정되어 있으면
+LLM 분석 서버도 자동 연결한다. 로그 전송 동의 후 분석 버튼을 누를 때만 API를
+호출하며, 검증과 별도 프로세스에서 동작한다.
 feedback이 켜지면 ReLU split heatmap/history와 solver 공통 JSON이 생성된다.
 feedback-only에서는 solver PNG 두 장도 만들고, `both`에서는 realtime solver
 PNG 두 장을 그대로 공유한다.
@@ -110,9 +103,10 @@ stem으로 생성하며, 선택 패널 수와 관계없이 HTML은 하나다.
 
 - progress는 visualization을 켰 때만 수집한다.
 - iteration 단위 JSONL 기록은 아예 계측하지 않는 실행보다 I/O를 늘린다.
-- realtime PNG 렌더링은 background worker가 담당하지만 JSONL append 비용은
+- realtime PNG 렌더링은 별도 렌더 프로세스에 위임하지만 JSONL append 비용은
   solver 실행 시간에 포함된다.
 - ReLU split이 없어도 DPLL round와 Simplex progress는 theory solver가 호출되면
   기록된다.
-- ReLU split 재귀 깊이 상한은 `max(50, 모델 hidden ReLU 수 + 1)`로만
-  자동 계산하며 CLI나 spec에서 수동 지정하지 않는다.
+- ReLU 분기 재귀 깊이 상한은 `--max-recursion`으로 지정한다(기본 50).
+- entering/leaving 변수와 pivot row는 원본 진단 로그의 필드이며 현재 그래프의 별도 구역은 아니다.
+- LLM 분석의 설정·한도·보조 명령은 [README](../README.md#시각화의-gemini-로그-분석)를 참고한다.

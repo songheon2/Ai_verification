@@ -127,6 +127,11 @@
   let TIMELINE = [];
   let snapshotFrame = null;
   let snapshotPending = false;
+  let inputBusy=false;
+  let snapshotTimeout=null,snapshotRequest=0;
+  let finalSnapshotQueued = false;
+  const snapshotAsset = {};
+  let requestedSnapshotVersion = null;
   const SCROLL_IDLE_MS = 220;
   let lastScrollInput = -Infinity, scrollIdleTimer = null;
   let queuedSnapshot = null, queuedSnapshotRequest = false, scrollbarDragging = false;
@@ -137,7 +142,7 @@
       scrollIdleTimer = null;
       if (scrollActive() || scrollbarDragging) {settleScroll();return;}
       if (queuedSnapshot) {const latest=queuedSnapshot;queuedSnapshot=null;applySnapshot(latest,false);}
-      if (queuedSnapshotRequest) {queuedSnapshotRequest=false;requestSnapshot();}
+      if (queuedSnapshotRequest) {queuedSnapshotRequest=false;const force=finalSnapshotQueued;finalSnapshotQueued=false;requestSnapshot(force);}
     }, SCROLL_IDLE_MS);
   }
   function noteScrollInput() {lastScrollInput=performance.now();settleScroll();}
@@ -149,7 +154,7 @@
       (event.clientX>=box.left+viewport.clientWidth || event.clientY>=box.top+viewport.clientHeight);
     if(scrollbarDragging)noteScrollInput();
   },{passive:true,capture:true});
-  document.addEventListener('pointermove',()=>{if(scrollbarDragging)noteScrollInput();},{passive:true,capture:true});
+  document.addEventListener('pointermove',event=>{if(scrollbarDragging){if(event.buttons===0)endScrollbarDrag();else noteScrollInput();}},{passive:true,capture:true});
   const endScrollbarDrag=()=>{if(scrollbarDragging){scrollbarDragging=false;noteScrollInput();}};
   document.addEventListener('pointerup',endScrollbarDrag,{passive:true,capture:true});
   document.addEventListener('pointercancel',endScrollbarDrag,{passive:true,capture:true});
@@ -187,6 +192,14 @@
   }
   function neuronLabel(node) { return node.layer == null ? node.variable : `L${node.layer}:N${node.neuron}`; }
   function sourceLabel(node) { return `${neuronLabel(node)} (${node.phase}) · 방문 #${node.order}`; }
+  function selectForAnalysis(node, label='ReLU 탐색 트리') {
+    if(!node || window.parent===window)return;
+    const scope={topic:'tree'};
+    if(Number.isInteger(node.roundIndex))scope.round=node.roundIndex;
+    if(Number.isInteger(node.layer)&&Number.isInteger(node.neuron)){scope.layer=node.layer;scope.neuron=node.neuron;}
+    const caption=[`트리 · 노드 #${node.id}`,node.roundIndex==null?'':`R${node.roundIndex}`,`${neuronLabel(node)} (${node.phase})`].filter(Boolean).join(' · ');
+    window.parent.postMessage({type:'log-analysis-select',id:`tree-node-${node.id}`,label:caption,scope,text:`${label}\n${node.roundIndex==null?'':'DPLL Round: '+node.roundIndex+'\n'}${tip(node)}`},'*');
+  }
   function tip(node) {
     const lines = [
       `노드 #${node.id} · Split #${node.splitNumber ?? '?'}`, `${neuronLabel(node)} (${node.phase})`,
@@ -392,6 +405,7 @@
     view.focus.textContent = '이 가지 보기';
     view.focus.addEventListener('click', event => {
       event.preventDefault(); event.stopPropagation();
+      selectForAnalysis(NODE_BY_ID.get(view.id));
       changeScope(view.id, true);
     });
     summary.appendChild(view.focus);
@@ -410,6 +424,7 @@
       event.preventDefault();
       const node = NODE_BY_ID.get(view.id);
       if (!node) return;
+      selectForAnalysis(node);
       acknowledgeGrowth(node);
       // Record the click synchronously, before an arriving snapshot can patch
       // this row. The native toggle event is otherwise delivered later.
@@ -538,6 +553,7 @@
         const row = document.createElement('div'); row.className = 'row'; row.dataset.id = node.id;
         view = {row, number: span('', row), label: span('', row), badge: span('badge', row), duration: span('duration', row)};
         row.addEventListener('mouseenter', () => { const current = NODE_BY_ID.get(node.id); if (current) row.title = tip(current); });
+        row.addEventListener('click',()=>selectForAnalysis(NODE_BY_ID.get(node.id),'ReLU 탐색 타임라인'));
         timelineViews.set(node.id, view);
       }
       const number = order === 'completion' ? node.completionOrder : order === 'duration' ? node.durationOrder : node.order;
@@ -593,6 +609,13 @@
           view[name] = document.createElement('td'); row.appendChild(view[name]);
         }
         view.badge.appendChild(document.createElement('span')).className = 'badge STABLE';
+        row.addEventListener('click',event=>{
+          if(event.target.closest('button'))return;
+          const record=view.record,scope={topic:'tree'};
+          if(Number.isInteger(record.roundIndex))scope.round=record.roundIndex;
+          if(Number.isInteger(record.layer)&&Number.isInteger(record.neuron)){scope.layer=record.layer;scope.neuron=record.neuron;}
+          if(window.parent!==window)window.parent.postMessage({type:'log-analysis-select',scope,text:`ReLU 탐색 트리 · STABLE\n${neuronLabel(record)}\n${stableSourceLabel(record.source)}\n${boundsLabel(record.before)} → ${boundsLabel(record.after)}`},'*');
+        });
         view.range.className = 'range';
         view.location = document.createElement('button'); view.scope.appendChild(view.location);
         view.location.onclick = () => {
@@ -719,6 +742,7 @@
   function applySnapshot(data, allowFollow = true) {
     if (!data || !Array.isArray(data.roots)) return;
     if (data.snapshotVersion != null && data.snapshotVersion === DATA.snapshotVersion) return;
+    if(inputBusy){queuedSnapshot=data;return;}
     if (scrollActive() || scrollbarDragging) {queuedSnapshot=data;settleScroll();return;}
     const scrollX = window.scrollX, scrollY = window.scrollY, timelineScroll = readPanelScroll('timeline');
     const stableScroll = readPanelScroll('stable');
@@ -737,27 +761,54 @@
     restorePanelScroll('stable', stableScroll);
     saveState(); announceStatus();
   }
-  function requestSnapshot() {
-    if (snapshotPending || DATA.status !== 'RUNNING') return;
-    if(scrollActive() || scrollbarDragging){queuedSnapshotRequest=true;settleScroll();return;}
+  function finishSnapshotRequest(){
+    if(snapshotTimeout!==null){clearTimeout(snapshotTimeout);snapshotTimeout=null;}
+    snapshotPending=false;
+    if(finalSnapshotQueued){finalSnapshotQueued=false;requestSnapshot(true);}
+  }
+  async function requestSnapshot(force=false) {
+    if(inputBusy){queuedSnapshotRequest=true;finalSnapshotQueued=finalSnapshotQueued||force;return;}
+    if(snapshotPending){finalSnapshotQueued=finalSnapshotQueued||force;return;}
+    if(DATA.status!=='RUNNING'&&!force)return;
+    if(scrollActive() || scrollbarDragging){queuedSnapshotRequest=true;finalSnapshotQueued=finalSnapshotQueued||force;settleScroll();return;}
+    snapshotPending = true;
+    const request=++snapshotRequest;
+    snapshotTimeout=setTimeout(()=>{
+      if(request!==snapshotRequest)return;
+      snapshotRequest++;snapshotAsset.version=null;finishSnapshotRequest();
+      if(DATA.status==='RUNNING')requestSnapshot();
+    },6000);
+    let update;
+    try { update = await visualizationAssetUpdate(DATA.snapshotFile || location.href, snapshotAsset,force); }
+    catch (_error) { if(request===snapshotRequest)finishSnapshotRequest();return; }
+    if(request!==snapshotRequest)return;
+    if (!update) { finishSnapshotRequest(); return; }
     if (!snapshotFrame) {
       snapshotFrame = document.createElement('iframe');
       snapshotFrame.hidden = true; snapshotFrame.id = 'treeSnapshotLoader';
       snapshotFrame.setAttribute('aria-hidden', 'true'); snapshotFrame.tabIndex = -1;
-      snapshotFrame.addEventListener('load', () => { snapshotPending = false; });
+      snapshotFrame.addEventListener('load', finishSnapshotRequest);
       document.body.appendChild(snapshotFrame);
     }
-    snapshotPending = true;
-    const url = new URL(DATA.snapshotFile || location.href, location.href);
-    url.searchParams.set('tree-snapshot', '1'); url.searchParams.set('t', Date.now());
+    const url = new URL(update.url);
+    url.searchParams.set('tree-snapshot', '1');
+    requestedSnapshotVersion = update.version;
     snapshotFrame.src = url.href;
   }
   window.addEventListener('message', event => {
     const message = event.data || {};
+    if(event.source===window.parent&&message.type==='visualization-input-activity'){
+      inputBusy=message.active===true;
+      if(!inputBusy){
+        if(queuedSnapshot){const latest=queuedSnapshot;queuedSnapshot=null;applySnapshot(latest,false);}
+        if(queuedSnapshotRequest){queuedSnapshotRequest=false;const force=finalSnapshotQueued;finalSnapshotQueued=false;requestSnapshot(force);}
+      }
+      return;
+    }
     if (message.type === SNAPSHOT_TYPE && snapshotFrame && event.source === snapshotFrame.contentWindow) {
-      snapshotPending = false;
+      if(message.data && Array.isArray(message.data.roots))snapshotAsset.version=requestedSnapshotVersion;
       applySnapshot(message.data);
-    } else if (message.type === 'relu-search-tree-refresh' && window.parent !== window && event.source === window.parent) requestSnapshot();
+    } else if (message.type === 'relu-search-tree-refresh' && window.parent !== window && event.source === window.parent) requestSnapshot(message.final===true);
   });
 
   function renderTrackingButton() {
@@ -967,5 +1018,5 @@
   if (trackLatestPath) revealRecentPath(false);
   if (window.parent === window && DATA.status === 'RUNNING') standaloneTimer = setInterval(requestSnapshot, 2000);
   announceStatus();
-  if (DATA.snapshotFile) requestAnimationFrame(() => setTimeout(requestSnapshot, 0));
+  if (DATA.snapshotFile) setTimeout(requestSnapshot, 0);
 })();

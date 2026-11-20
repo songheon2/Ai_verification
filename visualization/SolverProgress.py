@@ -9,21 +9,21 @@ from __future__ import annotations
 import json
 import inspect
 import math
-import os
 import threading
 import warnings
-import webbrowser
-from collections import Counter, deque
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from time import monotonic, sleep, time_ns
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, TextIO
+from Automation.LpTelemetry import METRIC_META, metric_available
 
 import matplotlib
 
 matplotlib.use("Agg")
 
 from visualization.RenderLock import render_turn
+from visualization.RunLabels import network_display_name
 from visualization.RenderProcess import (
     REALTIME_RENDER_INTERVAL_SECONDS,
     submit_solver_render,
@@ -312,6 +312,7 @@ class SolverProgressLogger:
         variable_count: int,
         theory_atom_ids: Iterable[str] = (),
         selection_id: Optional[str] = None,
+        **meta: Any,
     ) -> str:
         atom_ids = [] if self.compact_simplex_calls else list(theory_atom_ids)
         with self._lock:
@@ -335,6 +336,7 @@ class SolverProgressLogger:
                     # potentially large id list hundreds of thousands of times.
                     "row_count": row_count,
                     "variable_count": variable_count,
+                    **meta,
                 }
             if round_index is not None:
                 self._round_simplex_calls[round_index] += 1
@@ -352,6 +354,7 @@ class SolverProgressLogger:
                 ),
                 row_count=row_count,
                 variable_count=variable_count,
+                **meta,
                 force_update=False,
             )
         return call_id
@@ -445,13 +448,26 @@ class SolverProgressLogger:
         self._append("simplex_cycle", call_id=call_id, iteration=iteration,
                      pivot=pivot, random_steps=random_steps)
 
+    def simplex_bound_observations(self, call_id: str, observations, *, source="call_boundary") -> None:
+        # Batch once-per-call snapshots separately from sampled internal iterations.
+        # Chunking retains all observations without oversized JSONL records.
+        observations = list(observations)
+        for offset in range(0, len(observations), 128):
+            with self._lock:
+                number = self._simplex_numbers.get(call_id)
+                round_index = self._simplex_rounds.get(call_id)
+            self._append("simplex_bound_observation", call_id=call_id, call_number=number,
+                         round=round_index, observation_source=source,
+                         observations=observations[offset:offset + 128], force_update=False)
+
     def simplex_end(
         self,
         call_id: str,
         result: str,
         *,
-        iterations: int,
-        pivots: int,
+        iterations: Optional[int],
+        pivots: Optional[int],
+        **meta: Any,
     ) -> None:
         with self._lock:
             # Active-call membership is sufficient for idempotence and avoids
@@ -462,13 +478,13 @@ class SolverProgressLogger:
             call_number = self._simplex_numbers.pop(call_id, None)
             self._simplex_rounds.pop(call_id, None)
             metadata = self._simplex_metadata.pop(call_id, {})
-            cycles = self._simplex_cycle_counts.pop(call_id, 0)
+            cycles = meta.pop("cycles", self._simplex_cycle_counts.pop(call_id, 0))
         terminal_event = "simplex_call" if self.compact_simplex_calls else "simplex_end"
         self._append(
             terminal_event,
             call_id=call_id,
             call_number=call_number,
-            **(metadata if self.compact_simplex_calls else {}),
+            **({**metadata, **meta} if self.compact_simplex_calls else meta),
             result=result,
             duration_seconds=max(0.0, (time_ns() - started) / 1_000_000_000),
             iterations=iterations,
@@ -505,6 +521,7 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
     leaving: Counter[str] = Counter()
     pivot_rows: Counter[str] = Counter()
     violation_refs: Counter[tuple[Optional[int], str]] = Counter()
+    observed_refs: Counter[tuple[Optional[int], str]] = Counter()
     constraint_details: Dict[tuple[str, bool], Dict[str, Any]] = {}
     slack_references: Dict[tuple[int, str], Dict[str, Any]] = {}
     theory_links: List[Dict[str, Any]] = []
@@ -560,6 +577,7 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
                 "theory_atom_ids": list(event.get("theory_atom_ids", [])),
                 "row_count": event.get("row_count"),
                 "variable_count": event.get("variable_count"),
+                **{key: event[key] for key in METRIC_META if key in event},
             }
         elif kind == "simplex_iteration":
             call_id = str(event.get("call_id"))
@@ -579,6 +597,12 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
                     for key, value in event.items()
                     if key not in {"event", "timestamp", "time_ns"}
                 }
+        elif kind == "simplex_bound_observation":
+            round_index = event.get("round", calls.get(str(event.get("call_id")), {}).get("round"))
+            for observation in event.get("observations", []):
+                variable = observation.get("variable")
+                if isinstance(variable, str):
+                    observed_refs[(round_index, variable)] += 1
         elif kind == "simplex_cycle":
             call = calls.setdefault(str(event["call_id"]), {"call_id": str(event["call_id"])})
             call["cycles"] = int(call.get("cycles", 0)) + 1
@@ -600,9 +624,10 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
                 ),
                 "end_timestamp": event.get("timestamp"),
                 "duration_seconds": float(event.get("duration_seconds", 0.0)),
-                "iterations": int(event.get("iterations", 0)),
-                "pivots": int(event.get("pivots", 0)),
-                "cycles": int(event.get("cycles", calls.get(call_id, {}).get("cycles", 0))),
+                "iterations": int(event.get("iterations") or 0),
+                "pivots": int(event.get("pivots") or 0),
+                "cycles": int(event.get("cycles", calls.get(call_id, {}).get("cycles", 0)) or 0),
+                **{key: event[key] for key in METRIC_META if key in event},
             }
             if kind == "simplex_call":
                 completed.update(
@@ -647,8 +672,10 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
             call.setdefault("result", "RUNNING")
             call.setdefault("iterations", 0)
             call.setdefault("pivots", 0)
-    resolved_by_constraint: Dict[tuple[Any, Any], Dict[str, Any]] = {}
-    for (round_index, slack_name), count in violation_refs.items():
+    resolved_by_constraint: Dict[tuple[Any, ...], Dict[str, Any]] = {}
+    scoped_refs = [(key, count, "solver_iteration") for key, count in violation_refs.items()]
+    scoped_refs.extend((key, count, "call_boundary") for key, count in observed_refs.items())
+    for (round_index, slack_name), count, observation_scope in scoped_refs:
         reference = (
             slack_references.get((int(round_index), slack_name), {})
             if round_index is not None
@@ -659,7 +686,7 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
         )
         polarity = bool(reference.get("polarity"))
         detail = constraint_details.get((str(constraint_id), polarity), {})
-        key = (constraint_id, polarity)
+        key = (constraint_id, polarity, observation_scope)
         item = resolved_by_constraint.setdefault(
             key,
             {
@@ -667,6 +694,7 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
                 "atom_id": reference.get("atom_id", detail.get("atom_id")),
                 "polarity": reference.get("polarity", detail.get("polarity")),
                 "slack_name": slack_name,
+                "observation_scope": observation_scope,
                 "count": 0,
                 "rounds": [],
                 "occurrences": [],
@@ -686,7 +714,12 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
     resolved_constraints = sorted(
         resolved_by_constraint.values(),
         key=lambda item: (-int(item["count"]), str(item["constraint_id"])),
-    )[:20]
+    )
+
+    from Automation.LpTelemetry import metric_available
+    def total(field):
+        measured = [int(call.get(field, 0)) for call in ordered_calls if metric_available(call, field)]
+        return sum(measured) if measured or not ordered_calls else None
 
     return {
         "solver": solver_result,
@@ -695,11 +728,13 @@ def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]
         "counts": {
             "rounds": len(ordered_rounds),
             "simplex_calls": len(ordered_calls),
-            "simplex_iterations": sum(int(call.get("iterations", 0)) for call in ordered_calls),
-            "simplex_pivots": sum(int(call.get("pivots", 0)) for call in ordered_calls),
+            "simplex_iterations": total("iterations"),
+            "simplex_pivots": total("pivots"),
+            "pivot_measured_calls": sum(metric_available(call, "pivots") for call in ordered_calls),
         },
         "top_violated_variables": dict(violations.most_common(20)),
-        "top_violated_constraints": resolved_constraints,
+        "top_violated_constraints": [item for item in resolved_constraints if item["observation_scope"] == "solver_iteration"][:20],
+        "top_observed_bound_constraints": [item for item in resolved_constraints if item["observation_scope"] == "call_boundary"][:20],
         "top_entering_variables": dict(entering.most_common(20)),
         "top_leaving_variables": dict(leaving.most_common(20)),
         "top_pivot_rows": dict(pivot_rows.most_common(20)),
@@ -794,7 +829,7 @@ def _annotate_violation_variable_types(axis) -> None:
     """Explain generated variable names without competing with the chart data."""
     axis.text(
         1.0,
-        -0.16,
+        -0.21,
         "h: ReLU output  ·  z: value before ReLU  ·  ineq_slack: inequality auxiliary variable",
         transform=axis.transAxes,
         ha="right",
@@ -828,189 +863,6 @@ def _theory_outcome(round_item: Mapping[str, Any]) -> Optional[str]:
     if round_result == "RUNNING":
         return "RUNNING"
     return "UNKNOWN"
-
-
-def draw_solver_dashboard(
-    events_or_path: Iterable[Mapping[str, Any]] | str | Path,
-    *,
-    title: str = "DPLL(T) / Simplex Progress",
-):
-    import matplotlib.pyplot as plt
-
-    events = (
-        read_solver_progress(events_or_path)
-        if isinstance(events_or_path, (str, Path))
-        else [dict(event) for event in events_or_path]
-    )
-    feedback = build_solver_feedback(events)
-    rounds = feedback["rounds"][-20:]
-    # Simplex 통계는 최근 일부 호출만 자르지 않고 실행 시작 이후의
-    # 모든 call을 누적해서 보여준다.
-    calls = feedback["simplex_calls"]
-
-    fig = plt.figure(figsize=(15, 10.5))
-    grid = fig.add_gridspec(3, 2, height_ratios=[1, 1, 0.9])
-    ax_round = fig.add_subplot(grid[0, 0])
-    ax_duration = fig.add_subplot(grid[0, 1])
-    ax_work = fig.add_subplot(grid[1, 0])
-    ax_vars = fig.add_subplot(grid[1, 1])
-    ax_links = fig.add_subplot(grid[2, :])
-    axes = [ax_round, ax_duration, ax_work, ax_vars, ax_links]
-    fig.suptitle(title, fontsize=16, fontweight="bold")
-
-    round_ids = [int(item["round"]) for item in rounds]
-    round_durations = [
-        max(0.0, float(item.get("duration_seconds", 0.0))) for item in rounds
-    ]
-    round_colors = [_result_color(item.get("result")) for item in rounds]
-    ax_round.bar(round_ids, round_durations, color=round_colors)
-    ax_round.set_xticks(round_ids)
-    for x_pos, duration, item in zip(round_ids, round_durations, rounds):
-        ax_round.annotate(
-            f"{item.get('result', 'RUNNING')}\nS={item.get('simplex_calls', 0)}",
-            (x_pos, duration),
-            xytext=(0, 3),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=7,
-        )
-    ax_round.set_title("DPLL rounds (latest 20)")
-    ax_round.set_xlabel("Round")
-    ax_round.set_ylabel("Duration (s)")
-    ax_round.set_ylim(bottom=0)
-    ax_round.grid(axis="y", alpha=0.3)
-
-    call_numbers = list(range(max(1, len(feedback["simplex_calls"]) - len(calls) + 1), len(feedback["simplex_calls"]) + 1))
-    call_durations = [
-        max(0.0, float(item.get("duration_seconds", 0.0))) for item in calls
-    ]
-    call_colors = [_result_color(item.get("result")) for item in calls]
-    ax_duration.bar(call_numbers, call_durations, color=call_colors)
-    ax_duration.set_xticks(call_numbers)
-    ax_duration.set_xticklabels(
-        [f"{number}\n{item.get('result', 'RUNNING')}" for number, item in zip(call_numbers, calls)],
-        fontsize=7,
-    )
-    ax_duration.set_title("Simplex call duration (all calls)")
-    ax_duration.set_xlabel("Simplex call order")
-    ax_duration.set_ylabel("Duration (s)")
-    # Keep the cumulative completed-call maximum.  A RUNNING call's elapsed
-    # time changes on every refresh, but its final duration is not known yet.
-    _set_duration_ylim(ax_duration, _completed_call_durations(calls))
-    ax_duration.grid(axis="y", alpha=0.3)
-
-    pivots = [int(item.get("pivots", 0)) for item in calls]
-    marker_stride = max(1, (len(call_numbers) + 79) // 80)
-    ax_work.plot(
-        call_numbers, pivots, marker="s", markevery=marker_stride,
-        markersize=2.0, markeredgewidth=0, linewidth=0.75, alpha=0.9,
-        color="#9333ea",
-    )
-    ax_work.set_xticks(call_numbers)
-    _set_integer_ticks(ax_work, "y")
-    ax_work.set_title("Simplex pivots per call")
-    ax_work.set_xlabel("Simplex call order")
-    ax_work.set_ylabel("Pivots within call")
-    ax_work.grid(alpha=0.3)
-
-    cycle_calls = [(number, call) for number, call in zip(call_numbers, calls)
-                   if call.get("cycles", 0)]
-    if cycle_calls:
-        for axis, field in ((ax_duration, "duration_seconds"), (ax_work, "pivots")):
-            axis.scatter([number for number, _ in cycle_calls],
-                         [call.get(field, 0) for _, call in cycle_calls],
-                         marker="^", s=38, color="#7c3aed", zorder=5,
-                         label="Cycle detected / random pivot")
-            axis.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0),
-                        borderaxespad=0, ncol=1, fontsize=9)
-        ax_work.text(0.02, 0.96,
-                     f"Cycles: {sum(call['cycles'] for _, call in cycle_calls)} "
-                     f"in {len(cycle_calls)} calls", transform=ax_work.transAxes,
-                     va="top", fontsize=10, color="#6d28d9")
-
-    _simplex_result_legend(ax_duration, calls)
-    selected = feedback.get("top_violated_constraints", [])[:8]
-    if selected:
-        labels = [_constraint_label(item) for item in reversed(selected)]
-        values = [int(item.get("count", 0)) for item in reversed(selected)]
-        ax_vars.barh(labels, values, color="#ef4444")
-        ax_vars.tick_params(axis="y", labelsize=7)
-    ax_vars.set_title("Repeated bound violations")
-    ax_vars.set_xlabel("Selections")
-    _annotate_violation_variable_types(ax_vars)
-    _set_integer_ticks(ax_vars, "x")
-    ax_vars.grid(axis="x", alpha=0.3)
-
-    ax_links.axis("off")
-    ax_links.set_title("DPLL | theory atoms | Simplex calls | theory result", loc="left")
-    all_calls = feedback["simplex_calls"]
-    call_number_by_id = {
-        str(call.get("call_id")): index for index, call in enumerate(all_calls, start=1)
-    }
-    link_lines = []
-    for round_item in feedback["rounds"][-6:]:
-        round_index = round_item.get("round")
-        atom_labels = []
-        for atom in round_item.get("theory_atoms", [])[:5]:
-            sign = "+" if atom.get("polarity") else "-"
-            atom_labels.append(f"{sign}{atom.get('atom_id')}:{atom.get('kind')}")
-        round_calls = [call for call in all_calls if call.get("round") == round_index]
-        call_labels = [
-            f"S{call_number_by_id.get(str(call.get('call_id')), '?')}"
-            f"[{call.get('origin', '?')},{call.get('result', 'RUNNING')}]"
-            for call in round_calls
-        ]
-        link_lines.append(
-            f"R{round_index}  atoms=({', '.join(atom_labels) or '-'})"
-            f"  |  {', '.join(call_labels) or 'no Simplex'}"
-            f"  |  {round_item.get('theory_result', round_item.get('result', 'RUNNING'))}"
-        )
-    ax_links.text(
-        0.01,
-        0.9,
-        "\n".join(link_lines) if link_lines else "No round progress yet",
-        transform=ax_links.transAxes,
-        va="top",
-        family="monospace",
-        fontsize=9,
-    )
-
-    latest_round = rounds[-1] if rounds else {}
-    solver = feedback.get("solver", {})
-    model_name = solver.get("witness_context", {}).get("model_name")
-    if model_name:
-        fig.text(0.98, 0.055, f"Network: {model_name}",
-                 ha="right", va="bottom", fontsize=11, color="#111827")
-        layer_sizes = solver.get("witness_context", {}).get("model_layer_sizes", [])
-        if layer_sizes:
-            structure = " -> ".join(str(size) for size in layer_sizes)
-            fig.text(0.98, 0.035,
-                     f"Structure (input -> hidden -> output): {structure} | ReLU: {sum(layer_sizes[1:-1])}",
-                     ha="right", va="bottom", fontsize=10, color="#374151")
-    fig.text(
-        0.01,
-        0.01,
-        " | ".join(
-            [
-                f"rounds={feedback['counts']['rounds']}",
-                f"simplex calls={feedback['counts']['simplex_calls']}",
-                f"pivots={feedback['counts']['simplex_pivots']}",
-                f"latest round result={latest_round.get('result', 'RUNNING')}",
-                f"solver={solver.get('status', 'RUNNING')} / {solver.get('reason', '-')}",
-            ]
-        ),
-        fontsize=9,
-    )
-    fig.subplots_adjust(
-        left=0.08,
-        right=0.80,
-        top=0.94,
-        bottom=0.08,
-        hspace=0.58,
-        wspace=1.05,
-    )
-    return fig, axes
 
 
 def solver_panel_paths(base_path: str | Path) -> Dict[str, Path]:
@@ -1066,93 +918,6 @@ def _compact_theory_flow_lines(
             f"   {call_summary} | {theory_result}"
         )
     return lines
-
-
-def draw_dpll_panel(events_or_path, *, title: str = "DPLL Round Progress"):
-    import matplotlib.pyplot as plt
-
-    feedback = _feedback_from(events_or_path)
-    rounds = feedback["rounds"][-20:]
-    fig, (ax_duration, ax_calls) = plt.subplots(1, 2, figsize=(13, 4.2))
-    fig.suptitle(title, fontsize=16, fontweight="bold")
-    round_ids = [int(item["round"]) for item in rounds]
-    durations = [
-        max(0.0, float(item.get("duration_seconds", 0.0))) for item in rounds
-    ]
-    colors = [_result_color(item.get("result")) for item in rounds]
-    ax_duration.bar(round_ids, durations, color=colors)
-    ax_duration.set_xticks(round_ids)
-    for x_pos, duration, item in zip(round_ids, durations, rounds):
-        ax_duration.annotate(
-            str(item.get("result", "RUNNING")),
-            (x_pos, duration),
-            xytext=(0, 3),
-            textcoords="offset points",
-            ha="center",
-            fontsize=7,
-        )
-    ax_duration.set_title("Round duration and result")
-    ax_duration.set_xlabel("DPLL round")
-    ax_duration.set_ylabel("Duration (s)")
-    ax_duration.set_ylim(bottom=0)
-    ax_duration.grid(axis="y", alpha=0.3)
-
-    call_counts = [int(item.get("simplex_calls", 0)) for item in rounds]
-    ax_calls.bar(round_ids, call_counts, color="#2563eb")
-    ax_calls.set_xticks(round_ids)
-    ax_calls.set_title("Simplex calls per round")
-    ax_calls.set_xlabel("DPLL round")
-    ax_calls.set_ylabel("Calls")
-    _set_integer_ticks(ax_calls, "y")
-    ax_calls.grid(axis="y", alpha=0.3)
-    for x_pos, count in zip(round_ids, call_counts):
-        ax_calls.annotate(str(count), (x_pos, count), ha="center", va="bottom")
-
-    solver = feedback.get("solver", {})
-    fig.text(
-        0.01,
-        0.01,
-        f"rounds={feedback['counts']['rounds']} | solver={solver.get('status', 'RUNNING')} / {solver.get('reason', '-')}",
-        fontsize=9,
-    )
-    fig.subplots_adjust(left=0.07, right=0.98, top=0.84, bottom=0.18, wspace=0.25)
-    return fig, (ax_duration, ax_calls)
-
-
-def draw_theory_panel(events_or_path, *, title: str = "DPLL ↔ Theory Flow"):
-    import matplotlib.pyplot as plt
-
-    feedback = _feedback_from(events_or_path)
-    rounds = feedback["rounds"][-12:]
-    fig, (ax_results, ax_links) = plt.subplots(1, 2, figsize=(14, 5.2), gridspec_kw={"width_ratios": [1, 2]})
-    fig.suptitle(title, fontsize=16, fontweight="bold")
-    results = Counter(
-        outcome for item in rounds if (outcome := _theory_outcome(item)) is not None
-    )
-    labels = list(results)
-    values = [results[label] for label in labels]
-    ax_results.barh(labels, values, color=[_result_color(label) for label in labels])
-    ax_results.set_title("Theory Solver Result")
-    ax_results.set_xlabel("Count")
-    _set_integer_ticks(ax_results, "x")
-    ax_results.set_xlim(0, max(values, default=1) * 1.2)
-    for row, count in enumerate(values):
-        ax_results.annotate(str(count), (count, row), xytext=(5, 0), textcoords="offset points", va="center")
-
-    link_lines = _compact_theory_flow_lines(feedback, rounds)
-    ax_links.axis("off")
-    ax_links.set_title("Round | selected atoms | Simplex | theory result", loc="left")
-    ax_links.text(
-        0.01,
-        0.96,
-        "\n".join(link_lines) if link_lines else "No theory selection yet",
-        transform=ax_links.transAxes,
-        va="top",
-        family="monospace",
-        fontsize=8.5,
-    )
-    fig.subplots_adjust(left=0.08, right=0.98, top=0.84, bottom=0.12, wspace=0.24)
-    return fig, (ax_results, ax_links)
 
 
 def _sat_witness_lines(feedback: Dict[str, Any]) -> List[str]:
@@ -1235,7 +1000,7 @@ def draw_dpll_theory_panel(
         max(0.0, float(item.get("duration_seconds", 0.0))) for item in rounds
     ]
     colors = [_result_color(item.get("result")) for item in rounds]
-    round_bars = ax_duration.bar(round_ids, durations, color=colors)
+    ax_duration.bar(round_ids, durations, color=colors)
     ax_duration.set_xticks(round_ids)
     for x_pos, duration, item in zip(round_ids, durations, rounds):
         ax_duration.annotate(
@@ -1304,7 +1069,7 @@ def draw_dpll_theory_panel(
         f"rounds={feedback['counts']['rounds']} | solver={solver.get('status', 'RUNNING')} / {solver.get('reason', '-')}",
         fontsize=9,
     )
-    model_name = solver.get("witness_context", {}).get("model_name")
+    model_name = network_display_name(solver.get("witness_context", {}))
     if model_name:
         fig.text(0.91, 0.055, f"Network: {model_name}",
                  ha="right", va="bottom", fontsize=11, color="#111827")
@@ -1329,25 +1094,33 @@ def draw_dpll_theory_panel(
             value_lines = textwrap.wrap(value, width=75) or ["unavailable"]
             # Keep long counterexamples inside the existing flow area.
             value_lines = value_lines[:4]
-            ax_links.text(
+            label_artist = ax_links.text(
                 0.01, cursor, label, transform=ax_links.transAxes,
                 va="top", family="monospace", fontsize=9,
                 color="#111827", fontweight="bold",
                 clip_on=True,
             )
             cursor -= 0.052
-            ax_links.text(
+            value_artist = ax_links.text(
                 0.01, cursor, "\n".join(value_lines),
                 transform=ax_links.transAxes, va="top",
                 family="monospace", fontsize=9, color="#166534",
                 clip_on=True,
             )
+            from visualization.AnalysisSelection import select_text
+            for artist in (label_artist, value_artist):
+                select_text(fig, artist, {"scope": {"topic": "dpll"}, "text": f"{label}\n{value}"}, label="DPLL · 반례 해")
             cursor -= 0.052 * len(value_lines) + 0.035
     fig.subplots_adjust(left=0.09, right=0.91, top=0.91, bottom=0.14, hspace=0.38, wspace=0.5)
     flow_line_count = max(1, sum(line.count("\n") + 1 for line in link_lines))
     available_points = ax_links.get_position().height * fig.get_figheight() * 72 * 0.90
     flow_text.set_fontsize(min(8.5, available_points / (1.2 * flow_line_count)))
     renderer = fig.canvas.get_renderer()
+    # Font ascenders/descenders differ: fit measured text, not a fixed line ratio.
+    text_height = flow_text.get_window_extent(renderer).height
+    available_height = ax_links.get_window_extent(renderer).height * 0.90
+    if text_height > available_height:
+        flow_text.set_fontsize(flow_text.get_fontsize() * available_height / text_height)
     for bars, axis, values in ((call_bars, ax_calls, call_counts),):
         for bar, label, x_pos, value in zip(bars, axis.texts, round_ids, values):
             label.update_positions(renderer)
@@ -1358,6 +1131,8 @@ def draw_dpll_theory_panel(
                 label.xy = (x_pos, value)
                 label.set_verticalalignment("bottom")
                 label.set_position((0, 6))
+    from visualization.AnalysisSelection import solver_selection
+    solver_selection(fig, axes, feedback, simplex=False)
     return fig, axes
 
 
@@ -1382,16 +1157,47 @@ def _annotate_simplex_rounds(axes, calls):
         previous = round_index
 
 
+LP_ENGINE_LABELS = {"native": "Python Simplex", "simplex": "Python Simplex Oracle",
+                    "glpk": "GLPK", "z3": "Z3"}
+
+
+def _simplex_panel_engine(feedback):
+    calls = feedback.get("simplex_calls", [])
+    configured = feedback.get("solver", {}).get("witness_context", {}).get("lp_engine")
+    engines = {call.get("lp_engine") or configured for call in calls}
+    engines.discard(None)
+    if not calls:
+        return configured
+    return next(iter(engines)) if len(engines) == 1 else "mixed" if engines else None
+
+
+def _simplex_work_labels(engine, calls):
+    if engine == "glpk":
+        return "iterations", "GLPK iterations per call", "GLPK iterations", "Internal steps counted during each call"
+    if engine == "z3":
+        return "pivots", "Z3 arithmetic pivots per call", "Arithmetic pivots", "From Z3 solver statistics"
+    if engine == "mixed":
+        return None, "LP work per call", "", ""
+    if engine in ("native", "simplex") or any(metric_available(call, "pivots") for call in calls):
+        return "pivots", "Pivots per call", "Pivots within call", ""
+    if any(metric_available(call, "iterations") for call in calls):
+        return "iterations", "Iterations per call", "Reported iterations", ""
+    return None, "LP work per call", "", ""
+
+
 def draw_simplex_panel(
     events_or_path, *, title: str = "Simplex Progress", show_round_boundaries: bool = False,
 ):
     import matplotlib.pyplot as plt
-
     feedback = _feedback_from(events_or_path)
     calls = feedback["simplex_calls"]
+    engine = _simplex_panel_engine(feedback)
+    engine_label = LP_ENGINE_LABELS.get(engine, "Mixed LP engines" if engine == "mixed" else engine)
+    external = engine is not None and engine != "native"
+    call_order_label = "LP call order" if external else "Simplex call order"
     fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.2))
     ax_duration, ax_work, ax_results, ax_violations = axes.flat
-    fig.suptitle(title, fontsize=16, fontweight="bold")
+    fig.suptitle(f"{title} · {engine_label}" if engine_label else title, fontsize=16, fontweight="bold")
     call_numbers = list(range(1, len(calls) + 1))
     durations = [
         max(0.0, float(item.get("duration_seconds", 0.0))) for item in calls
@@ -1402,19 +1208,22 @@ def draw_simplex_panel(
                        linewidth=1.0)
     _set_integer_ticks(ax_duration, "x")
     ax_duration.set_xlim(0.5, max(1.5, len(calls) + 0.5))
-    ax_duration.set_title("Call duration (all calls)")
-    ax_duration.set_xlabel("Simplex call order")
+    ax_duration.set_title("LP call duration" if external else "Call duration (all calls)")
+    ax_duration.set_xlabel(call_order_label)
     ax_duration.set_ylabel("Seconds")
     _set_duration_ylim(ax_duration, _completed_call_durations(calls))
     ax_duration.grid(axis="y", alpha=0.3)
 
-    pivots = [int(item.get("pivots", 0)) for item in calls]
+    metric, work_title, work_unit, work_source = _simplex_work_labels(engine, calls)
+    measured = [int(item.get(metric, 0)) if metric and metric_available(item, metric) else None
+                for item in calls]
+    reported = [value for value in measured if value is not None]
     # 수백~수천 call에서도 선 자체는 모든 값을 연결하되 마커는 최대 약
     # 80개만 보이게 한다.
     marker_stride = max(1, (len(call_numbers) + 79) // 80)
     ax_work.plot(
         call_numbers,
-        pivots,
+        [value if value is not None else float("nan") for value in measured],
         marker="s",
         markevery=marker_stride,
         markersize=2.0,
@@ -1426,22 +1235,37 @@ def draw_simplex_panel(
     _set_integer_ticks(ax_work, "x")
     ax_work.set_xlim(0.5, max(1.5, len(calls) + 0.5))
     _set_integer_ticks(ax_work, "y")
-    ax_work.set_title("Pivots per call")
-    ax_work.set_xlabel("Simplex call order")
-    ax_work.set_ylabel("Pivots within call")
+    ax_work.set_title(work_title)
+    if engine == "mixed":
+        ax_work.text(0.5, 0.5, "Work counts use different units by engine",
+                     transform=ax_work.transAxes, ha="center", va="center", fontsize=9, color="#6b7280")
+    elif not reported:
+        waiting = not calls or all(call.get("result", "RUNNING") == "RUNNING" for call in calls)
+        ax_work.text(0.5, 0.5, "Waiting for LP calls" if not calls else
+                     "Waiting for call results" if waiting else "No counts reported",
+                     transform=ax_work.transAxes, ha="center", va="center", fontsize=9, color="#6b7280")
+    elif len(reported) < len(calls):
+        ax_work.text(0.02, 0.96, "Gaps: count not reported", transform=ax_work.transAxes, va="top", fontsize=8)
+    ax_work.set_xlabel(f"{call_order_label}\n{work_source}" if work_source else call_order_label)
+    ax_work.set_ylabel(work_unit)
     ax_work.grid(alpha=0.3)
 
     cycle_calls = [(number, call) for number, call in zip(call_numbers, calls)
                    if call.get("cycles", 0)]
     if cycle_calls:
-        for axis, field in ((ax_duration, "duration_seconds"), (ax_work, "pivots")):
-            axis.scatter([number for number, _ in cycle_calls],
-                         [call.get(field, 0) for _, call in cycle_calls],
+        for axis, field in ((ax_duration, "duration_seconds"), (ax_work, metric)):
+            points = [(number, call.get(field, 0) if axis is ax_duration else measured[number - 1])
+                      for number, call in cycle_calls]
+            points = [(number, value) for number, value in points if value is not None]
+            if not points:
+                continue
+            x, y = zip(*points)
+            axis.scatter(x, y,
                          marker="^", s=38, color="#7c3aed", zorder=5,
-                         label="Cycle detected / random pivot")
+                         label="Cycle detected")
             axis.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0),
                         borderaxespad=0, ncol=1, fontsize=9)
-        ax_work.text(0.02, 0.96,
+        ax_work.text(0.02, 0.86,
                      f"Cycles: {sum(call['cycles'] for _, call in cycle_calls)} "
                      f"in {len(cycle_calls)} calls", transform=ax_work.transAxes,
                      va="top", fontsize=10, color="#6d28d9")
@@ -1458,11 +1282,12 @@ def draw_simplex_panel(
         [result_counts[label] for label in result_labels],
         color=[_result_color(label) for label in result_labels],
     )
-    ax_results.set_title("Call results (all calls)")
+    ax_results.set_title("LP call results" if external else "Call results (all calls)")
     _set_integer_ticks(ax_results, "y")
     ax_results.tick_params(axis="x", labelrotation=20)
 
-    violated = feedback.get("top_violated_constraints", [])[:8]
+    violated, violation_scope = bound_violation_items(feedback)
+    violated = violated[:8]
     if violated:
         ax_violations.barh(
             [_constraint_label(item) for item in reversed(violated)],
@@ -1470,17 +1295,24 @@ def draw_simplex_panel(
             color="#ef4444",
         )
         ax_violations.tick_params(axis="y", labelsize=7)
-    ax_violations.set_title("Repeated bound violations")
+    internal = violation_scope == "solver_iteration"
+    ax_violations.set_title("Repeated bound violations" if internal else "Bound violations at LP call entry",
+                            fontsize=10)
+    ax_violations.set_xlabel("Internal check samples" if internal else "LP call-entry observations")
+    if not violated:
+        ax_violations.text(.5, .5, "No sampled violations" if internal
+                           else "No call-entry violations recorded", transform=ax_violations.transAxes,
+                           ha="center", va="center", fontsize=9, color="#6b7280")
     _annotate_violation_variable_types(ax_violations)
     _set_integer_ticks(ax_violations, "x")
     ax_violations.grid(axis="x", alpha=0.3)
 
-    fig.text(
-        0.01,
-        0.01,
-        f"calls={feedback['counts']['simplex_calls']} | pivots={feedback['counts']['simplex_pivots']}",
-        fontsize=9,
-    )
+    summary = f"Calls: {len(calls)}"
+    if reported:
+        summary += f" | {work_unit}: {sum(reported)}"
+        if len(reported) < len(calls):
+            summary += f" (reported for {len(reported)}/{len(calls)} calls)"
+    fig.text(0.01, 0.01, summary, fontsize=9)
     # Keep useful plot area in each quadrant; long legend labels must not
     # reserve the width of another graph.
     import textwrap
@@ -1494,111 +1326,27 @@ def draw_simplex_panel(
     if ax_work.get_legend() is not None:
         position = ax_work.get_position()
         ax_work.set_position([position.x0, position.y0, position.width - 0.13, position.height])
+    from visualization.AnalysisSelection import solver_selection
+    solver_selection(fig, axes, feedback, simplex=True)
     return fig, axes
 
 
-class SolverProgressVisualizer:
-    def __init__(
-        self,
-        log_path: str | Path,
-        output_path: str | Path,
-        *,
-        live_view: bool = False,
-        open_live_view: bool = False,
-        refresh_interval_ms: int = 500,
-    ) -> None:
-        self.log_path = Path(log_path)
-        self.output_path = Path(output_path)
-        self.live_view_path = self.output_path.with_suffix(".html")
-        self.live_view = live_view or open_live_view
-        self.open_live_view = open_live_view
-        self.refresh_interval_ms = refresh_interval_ms
-        self._view_opened = False
-        self._state_lock = threading.Lock()
-        self._pending = False
-        self._worker: Optional[threading.Thread] = None
-
-    def _write_live_view(self) -> None:
-        image_name = json.dumps(self.output_path.name)
-        html = f"""<!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Solver progress</title><style>
-body{{margin:0;background:#111827;color:#f9fafb;font-family:sans-serif}}main{{max-width:1500px;margin:auto;padding:18px}}
-h1{{margin:0 0 4px}}p{{margin:0 0 12px;color:#9ca3af}}img{{width:100%;display:block;background:white;border-radius:8px}}
-</style></head><body><main><h1>DPLL(T) / Simplex progress</h1>
-<p>이미지 약 {REALTIME_RENDER_INTERVAL_SECONDS:g}초 주기 생성 · 브라우저 {self.refresh_interval_ms}ms 간격 확인</p><img id="dashboard" alt="solver progress dashboard"></main>
-<script>const name={image_name},img=document.getElementById('dashboard');
-function refresh(){{img.src=name+'?t='+Date.now()}}refresh();setInterval(refresh,{self.refresh_interval_ms});</script>
-</body></html>"""
-        self.live_view_path.parent.mkdir(parents=True, exist_ok=True)
-        self.live_view_path.write_text(html, encoding="utf-8")
-
-    def _render_once(self) -> None:
-        import matplotlib.pyplot as plt
-
-        with render_turn():
-            fig, _ = draw_solver_dashboard(self.log_path)
-            self.output_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.output_path.with_name(f"{self.output_path.stem}.tmp{self.output_path.suffix}")
-            try:
-                fig.savefig(temporary, dpi=110, bbox_inches="tight")
-                os.replace(temporary, self.output_path)
-            finally:
-                plt.close(fig)
-                if temporary.exists():
-                    temporary.unlink()
-        if self.live_view:
-            if not self.live_view_path.exists():
-                self._write_live_view()
-            if self.open_live_view and not self._view_opened:
-                self._view_opened = True
-                webbrowser.open(self.live_view_path.resolve().as_uri())
-
-    def _run_updates(self) -> None:
-        try:
-            while True:
-                with self._state_lock:
-                    self._pending = False
-                self._render_once()
-                with self._state_lock:
-                    if self._pending:
-                        continue
-                    self._worker = None
-                    return
-        except Exception as exc:
-            warnings.warn(f"solver progress background render 실패: {exc}")
-            with self._state_lock:
-                self._worker = None
-
-    def request_update(
-        self, *, panel: Optional[str] = None, event: Optional[str] = None
-    ) -> None:
-        with self._state_lock:
-            self._pending = True
-            if self._worker is not None:
-                return
-            self._worker = threading.Thread(
-                target=self._run_updates,
-                name="solver-progress-renderer",
-                daemon=True,
-            )
-            self._worker.start()
-
-    def flush(self) -> None:
-        while True:
-            with self._state_lock:
-                worker = self._worker
-            if worker is None:
-                return
-            worker.join()
+def bound_violation_items(feedback):
+    internal = feedback.get("top_violated_constraints", [])
+    if not feedback.get("simplex_calls") and _simplex_panel_engine(feedback) in ("native", "simplex"):
+        return internal, "solver_iteration"
+    if internal or any(call.get("bound_violation_scope", "solver_iteration" if call.get("work_counts_available", True)
+                                else "call_boundary") == "solver_iteration"
+                       for call in feedback.get("simplex_calls", [])):
+        return internal, "solver_iteration"
+    return feedback.get("top_observed_bound_constraints", []), "call_boundary"
 
 
-class SolverProgressPanelVisualizer(SolverProgressVisualizer):
-    """DPLL/Theory와 Simplex를 서로 다른 PNG로 비동기 렌더링한다.
+class SolverProgressPanelVisualizer:
+    """Render the current DPLL/Theory and Simplex panels in a separate process.
 
-    Simplex의 많은 이벤트는 최신 상태 하나로 합치지만, round 시작/종료 프레임은
-    FIFO에 보존한다. 따라서 PNG 생성 중 다음 round가 끝나도 브라우저가 각 round
-    상태를 최소 한 번은 볼 수 있다.
+    Coalesce updates to the latest state; keep refreshing during an active round.
+    Browser HTML and polling belong to UnifiedRealtimeDashboard, not this worker.
     """
 
     def __init__(
@@ -1607,13 +1355,10 @@ class SolverProgressPanelVisualizer(SolverProgressVisualizer):
         base_output_path: str | Path,
         *,
         enabled_panels: Optional[Iterable[str]] = None,
-        refresh_interval_ms: int = 500,
     ) -> None:
-        super().__init__(
-            log_path,
-            base_output_path,
-            refresh_interval_ms=refresh_interval_ms,
-        )
+        self.log_path = Path(log_path)
+        self._state_lock = threading.Lock()
+        self._worker: Optional[threading.Thread] = None
         allowed_panels = {"dpll_theory", "simplex"}
         selected_panels = (
             allowed_panels if enabled_panels is None else set(enabled_panels)
@@ -1627,38 +1372,7 @@ class SolverProgressPanelVisualizer(SolverProgressVisualizer):
             name: all_paths[name] for name in sorted(selected_panels)
         }
         self._pending_panels: set[str] = set()
-        self._preserved_frames = deque()
         self._round_active = False
-
-    def _render_once(
-        self,
-        panels: Optional[Iterable[str]] = None,
-        events: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
-        import matplotlib.pyplot as plt
-
-        renderers = {
-            "dpll_theory": draw_dpll_theory_panel,
-            "simplex": draw_simplex_panel,
-        }
-        with render_turn():
-            selected = self.panel_paths if panels is None else panels
-            feedback = build_solver_feedback(
-                read_solver_progress(self.log_path) if events is None else events
-            )
-            for name in selected:
-                renderer = renderers[name]
-                output = self.panel_paths[name]
-                output.parent.mkdir(parents=True, exist_ok=True)
-                temporary = output.with_name(f"{output.stem}.tmp{output.suffix}")
-                fig, _ = renderer(feedback)
-                try:
-                    fig.savefig(temporary, dpi=100)
-                    os.replace(temporary, output)
-                finally:
-                    plt.close(fig)
-                    if temporary.exists():
-                        temporary.unlink()
 
     def request_update(
         self, *, panel: Optional[str] = None, event: Optional[str] = None
@@ -1699,9 +1413,17 @@ class SolverProgressPanelVisualizer(SolverProgressVisualizer):
                     if not selected:
                         self._worker = None
                         return
-                submit_solver_render(
-                    self.log_path, self.panel_paths, tuple(sorted(selected))
-                ).result()
+                try:
+                    submit_solver_render(
+                        self.log_path, self.panel_paths, tuple(sorted(selected))
+                    ).result()
+                except Exception as exc:
+                    # A temporarily locked PNG must not kill the round's
+                    # heartbeat when the LP engine emits no new events.
+                    warnings.warn(f"solver progress background render 실패; 다음 갱신에서 재시도합니다: {exc}")
+                    with self._state_lock:
+                        if self._round_active:
+                            self._pending_panels.update(selected)
                 with self._state_lock:
                     more = bool(self._pending_panels) or self._round_active
                     if not more:
@@ -1716,29 +1438,14 @@ class SolverProgressPanelVisualizer(SolverProgressVisualizer):
             with self._state_lock:
                 self._worker = None
 
+    def flush(self) -> None:
+        while True:
+            with self._state_lock:
+                worker = self._worker
+            if worker is None:
+                return
+            worker.join()
 
-def write_solver_feedback(
-    log_path: str | Path,
-    image_path: str | Path,
-    json_path: Optional[str | Path] = None,
-) -> Dict[str, Any]:
-    import matplotlib.pyplot as plt
-
-    events = read_solver_progress(log_path)
-    feedback = build_solver_feedback(events)
-    image = Path(image_path)
-    image.parent.mkdir(parents=True, exist_ok=True)
-    with render_turn():
-        fig, _ = draw_solver_dashboard(events, title="DPLL(T) / Simplex Feedback")
-        fig.savefig(image, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-    resolved_json = Path(json_path) if json_path is not None else image.with_suffix(".json")
-    resolved_json.parent.mkdir(parents=True, exist_ok=True)
-    resolved_json.write_text(
-        json.dumps(feedback, ensure_ascii=False, separators=(",", ":")) + "\n",
-        encoding="utf-8",
-    )
-    return feedback
 
 
 def write_solver_feedback_panels(
@@ -1778,6 +1485,8 @@ def write_solver_feedback_panels(
             options = {"show_round_boundaries": True} if name == "simplex" else {}
             fig, _ = renderer(feedback, title=titles[name], **options)
             fig.savefig(output, dpi=150, bbox_inches="tight")
+            from visualization.AnalysisSelection import write_selection_map
+            write_selection_map(fig, output, cropped=True)
             plt.close(fig)
     resolved_json = (
         Path(json_path) if json_path is not None else Path(base_image_path).with_suffix(".json")

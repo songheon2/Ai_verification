@@ -1,6 +1,6 @@
 :root{color-scheme:light;--bg:#ffffff;--panel:#ffffff;--line:#cbd5e1;--text:#1f2937;--muted:#64748b;--sat:#16a34a;--unsat:#dc2626;--closed:#2563eb;--unknown:#64748b;--timeout:#b45309;--running:#ea580c;--other:#94a3b8}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,sans-serif}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 var(--visualization-font)}
 header{position:sticky;top:0;z-index:3;background:#fffffff2;border-bottom:1px solid #dbe3ed;padding:16px 22px}
 h1{font-size:20px;margin:0 0 8px}
 .summary,.controls{display:flex;gap:5px;align-items:center;flex-wrap:wrap}
@@ -17,7 +17,7 @@ h1{font-size:20px;margin:0 0 8px}
 .ancestor-search button{white-space:nowrap}
 .ancestor-search #ancestorInfo{flex-basis:100%}
 .ancestor-search #ancestorInfo:empty{display:none}
-header .controls>button,header .tree-filters select,header .ancestor-search button,header .ancestor-search input{font:13px/1.3 system-ui,sans-serif;min-height:30px;padding:5px 6px}
+header .controls>button,header .tree-filters select,header .ancestor-search button,header .ancestor-search input{font:13px/1.3 var(--visualization-font);min-height:30px;padding:5px 6px}
 header .tree-filters,header .ancestor-search{gap:4px;padding:4px}
 header .neuron-combo>button{padding:4px 0}
 .pill,.badge{border-radius:999px;padding:2px 8px;font-weight:700}
@@ -30,7 +30,7 @@ header .neuron-combo>button{padding:4px 0}
 .RUNNING{background:#ffedd5;color:#9a3412}
 .OTHER{background:#f1f5f9;color:#475569}
 .STABLE{background:#f3e8ff;color:#6b21a8}
-button,select,input{background:#ffffff;color:var(--text);border:1px solid #cbd5e1;border-radius:6px;padding:6px 9px}
+button,select,input{font-family:var(--visualization-font);background:#ffffff;color:var(--text);border:1px solid #cbd5e1;border-radius:6px;padding:6px 9px}
 button{cursor:pointer}
 button:hover{background:#f1f5f9}
 button:disabled{opacity:.45;cursor:default}
@@ -62,7 +62,7 @@ summary.s-RUNNING{border-color:var(--running)}
 .label{font-weight:750}
 .meta,.collapsed{color:var(--muted);font-size:12px}
 .collapsed{margin-left:auto}
-.phase{font-family:ui-monospace,monospace;background:#e2e8f0;border-radius:4px;padding:1px 6px}
+.phase{font-family:var(--visualization-font);background:#e2e8f0;border-radius:4px;padding:1px 6px}
 .phase.plus,.stable-state.plus{color:#0369a1}
 .phase.minus,.stable-state.minus{color:#7e22ce}
 .timeline{max-height:330px;overflow:auto}
@@ -91,7 +91,7 @@ summary.s-RUNNING{border-color:var(--running)}
 .stable-table{width:100%;min-width:820px;border-collapse:collapse;text-align:left}
 .stable-table th,.stable-table td{padding:7px 9px;border-bottom:1px solid #e2e8f0}
 .stable-table th{position:sticky;top:0;background:#f1f5f9;z-index:1}
-.stable-table .range{font-family:ui-monospace,monospace;font-size:12px}
+.stable-table .range{font-family:var(--visualization-font);font-size:12px}
 .stable-table button{white-space:nowrap}
 .stable-state{font-weight:700;white-space:nowrap}
 .report-panel>summary{background:none;border:0;min-height:24px;padding:0}

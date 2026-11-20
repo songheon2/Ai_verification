@@ -8,9 +8,16 @@ from typing import Mapping, Optional
 from urllib.parse import quote
 
 from visualization.RenderProcess import REALTIME_RENDER_INTERVAL_SECONDS
+from visualization.AtomicFile import write_atomic_text
 from visualization.ReluNeuronHover import HOVER_SCRIPT
+from visualization.LogAnalysisPanel import panel_markup
+from visualization.Fonts import font_style
 import webbrowser
 
+_ASSET_REFRESH_SCRIPT = Path(__file__).with_name("AssetRefresh.js").read_text(encoding="utf-8")
+def publish_dashboard_status(dashboard_path: str | Path, status: str) -> Path:
+    path = Path(dashboard_path).with_suffix(".status.js")
+    return write_atomic_text(path, f"window.receiveVerificationStatus?.({json.dumps(status, ensure_ascii=True)});\n")
 
 PANEL_SPECS = {
     "dpll-theory": (
@@ -43,6 +50,7 @@ class UnifiedRealtimeDashboard:
         *,
         refresh_interval_ms: int = 500,
         embedded_pages: Optional[Mapping[str, str | Path]] = None,
+        managed_completion: bool = False,
     ) -> None:
         if refresh_interval_ms <= 0:
             raise ValueError("refresh_interval_ms는 양수여야 합니다")
@@ -58,6 +66,7 @@ class UnifiedRealtimeDashboard:
         }
         self.output_path = Path(output_path)
         self.refresh_interval_ms = refresh_interval_ms
+        self.managed_completion = managed_completion
         self.embedded_pages = {
             name: Path(path) for name, path in (embedded_pages or {}).items()
         }
@@ -120,15 +129,18 @@ class UnifiedRealtimeDashboard:
         selected_names = " + ".join([*self.panel_images, *self.embedded_pages])
         panel_json = json.dumps(browser_panels, ensure_ascii=False)
         page_json = json.dumps(browser_pages, ensure_ascii=False)
+        completion_uri = json.dumps(quote(self.output_path.with_suffix(".status.js").name)
+                                    if self.managed_completion else None)
         html = f"""<!doctype html>
 <html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AI Verification Realtime Dashboard</title>
+  {font_style(self.output_path)}
   <style>
     :root {{ color-scheme: dark; }}
-    body {{ margin: 0; background: #0f172a; color: #f8fafc; font-family: Arial, sans-serif; }}
+    body {{ margin: 0; background: #0f172a; color: #f8fafc; font-family: var(--visualization-font); }}
     header {{ position: sticky; top: 0; z-index: 2; padding: 14px 20px; background: #111827ee; backdrop-filter: blur(8px); }}
     h1 {{ margin: 0; font-size: 22px; }}
     header p {{ margin: 4px 0 0; color: #94a3b8; }}
@@ -152,47 +164,140 @@ class UnifiedRealtimeDashboard:
     <h1>AI Verification Realtime Dashboard</h1>
     <p><span id="status">LIVE</span> · 이미지 약 {REALTIME_RENDER_INTERVAL_SECONDS:g}초 주기 생성 · 브라우저 {self.refresh_interval_ms}ms 간격 확인 · {selected_names}</p>
   </header>
-  <main>
+  <main class="dashboard-layout">
+    <div class="dashboard-graphs">
 {chr(10).join(sections)}
+    </div>
+{panel_markup()}
   </main>
   <script>
+    {_ASSET_REFRESH_SCRIPT}
     {HOVER_SCRIPT}
     const panels = {panel_json};
     const pages = {page_json};
+    const completionUri = {completion_uri};
+    const completionAsset = {{}};
+    let completionStatus = null;
     let verificationComplete = false;
     let imageTimer;
     let pageTimer;
-    function refreshPanel(panel, finalSnapshot = false) {{
-      if (panel.pending) {{ panel.finalQueued = panel.finalQueued || finalSnapshot; return; }}
+    let inputRefreshQueued = false;
+    let inputFinalQueued = false;
+    const inputBusy = () => window.logAnalysisInputBusy?.() === true;
+    async function refreshPanel(panel, finalSnapshot = false) {{
+      if(inputBusy()){{inputRefreshQueued=true;inputFinalQueued=inputFinalQueued||finalSnapshot;return;}}
+      if (panel.pending) {{
+        panel.finalQueued = panel.finalQueued || (finalSnapshot && !panel.finalPending);
+        return;
+      }}
       panel.pending = true;
+      panel.finalPending = finalSnapshot;
       const current = document.getElementById(panel.id);
       const next = new Image();
+      let loadTimer;
       const finished = () => {{
+        clearTimeout(loadTimer);
+        next.onload = next.onerror = null;
         panel.pending = false;
+        panel.finalPending = false;
         if (panel.finalQueued) {{ panel.finalQueued = false; refreshPanel(panel, true); }}
       }};
-      next.onload = () => {{
+      next.onload = async () => {{
+        clearTimeout(loadTimer);
+        if(inputBusy()){{inputRefreshQueued=true;inputFinalQueued=inputFinalQueued||finalSnapshot;finished();return;}}
+        const [selection, hover] = await Promise.all([
+          window.loadAnalysisSelection ? loadAnalysisSelection(panel.uri) : Promise.resolve(null),
+          panel.id === "relu-dashboard" ? loadReluNeuronHover(panel.uri) : Promise.resolve(null),
+        ]);
+        if(inputBusy()){{inputRefreshQueued=true;inputFinalQueued=inputFinalQueued||finalSnapshot;finished();return;}}
+        if ((panel.hasSelectionMap && selection === null) || (panel.hasHoverMap && hover === null)) {{ finished(); return; }}
         if (panel.id === "dpll-theory-dashboard" && next.naturalHeight > 0) {{
           const width = Math.max(1050, Math.min(1500, 720 * next.naturalWidth / next.naturalHeight));
           current.closest("section").style.setProperty("--dpll-panel-width", (width + 30) + "px");
         }}
-        next.id = current.id;
-        next.alt = current.alt;
-        current.replaceWith(next);
-        if (panel.id === "relu-dashboard") attachReluNeuronHover(next,panel.uri);
+        panel.displayed = next;
+        current.src = next.src;
+        current.dataset.renderVersion = String(Number(current.dataset.renderVersion || 0) + 1);
+        if (panel.id === "relu-dashboard") commitReluNeuronHover(current,panel.uri,hover);
+        if (window.commitAnalysisSelection) commitAnalysisSelection(current,selection);
+        panel.hasSelectionMap = selection !== null;
+        panel.hasHoverMap = hover !== null;
+        panel.version = update.version;
+        if (finalSnapshot && completionUri) panel.finalPublished = true;
         finished();
+        finishIfReady();
       }};
       next.onerror = finished;
-      next.src = panel.uri + "?t=" + Date.now();
+      let update;
+      try {{ update = await visualizationAssetUpdate(panel.uri, panel, finalSnapshot); }}
+      catch (_error) {{ finished(); return; }}
+      if (!update) {{ finished(); return; }}
+      loadTimer = setTimeout(finished, 5000);
+      next.src = update.url;
     }}
     function refresh(finalSnapshot = false) {{
       if (verificationComplete && !finalSnapshot) return;
-      for (const panel of panels) refreshPanel(panel, finalSnapshot);
+      if (completionUri) {{
+        pollCompletion();
+        finalSnapshot = completionStatus !== null;
+      }}
+      for (const panel of panels) {{
+        if (!completionUri || !panel.finalPublished) refreshPanel(panel, finalSnapshot);
+      }}
+      refreshPages(finalSnapshot);
+      finishIfReady();
+    }}
+    async function pollCompletion() {{
+      if (completionStatus !== null || completionAsset.pending) return;
+      completionAsset.pending = true;
+      try {{
+        const update = await visualizationAssetUpdate(completionUri, completionAsset);
+        if (!update) return;
+        await new Promise((resolve, reject) => {{
+          const script = document.createElement("script");
+          const timer = setTimeout(() => done(false), 5000);
+          const done = (loaded) => {{
+            clearTimeout(timer);
+            script.remove();
+            if (loaded) resolve(); else reject(Error("Verification status unavailable"));
+          }};
+          script.onload = () => done(true);
+          script.onerror = () => done(false);
+          script.src = update.url;
+          document.head.append(script);
+        }});
+        completionAsset.version = update.version;
+      }} catch (_error) {{
+        // A later tick retries transient file and connection failures.
+      }} finally {{
+        completionAsset.pending = false;
+      }}
+    }}
+    window.receiveVerificationStatus = (status) => {{
+      if (!completionUri || verificationComplete || completionStatus !== null) return;
+      if (status === "FINALIZING") {{
+        document.getElementById("status").textContent = "FINALIZING";
+        return;
+      }}
+      if (status === "CANCELLED") {{
+        markComplete(status);
+        return;
+      }}
+      if (!["SAT", "UNSAT", "UNKNOWN"].includes(status)) return;
+      completionStatus = status;
+      refresh(true);
+    }};
+    function finishIfReady() {{
+      if (!completionUri || verificationComplete || completionStatus === null ||
+          inputBusy() || panels.some(panel => !panel.finalPublished)) return;
+      markComplete(completionStatus);
     }}
     function refreshPage(page, finalSnapshot = false) {{
+      if(inputBusy()){{inputRefreshQueued=true;inputFinalQueued=inputFinalQueued||finalSnapshot;page.inputQueued=true;return;}}
+      page.inputQueued=false;
       const frame = document.getElementById(page.id);
       if (!frame.dataset.loaded) {{
-        if (frame.dataset.loading) return;
+        if (frame.dataset.loading) {{ frame.dataset.refreshQueued = "true"; return; }}
         frame.dataset.loading = "true";
         frame.src = page.uri + "?t=" + Date.now();
       }} else {{
@@ -200,9 +305,9 @@ class UnifiedRealtimeDashboard:
       }}
     }}
     function refreshPages(finalSnapshot = false) {{
-      if (verificationComplete) return;
+      if (verificationComplete && !finalSnapshot) return;
       for (const page of pages) {{
-        if (document.getElementById(page.autoId).checked) {{
+        if (document.getElementById(page.autoId).checked || (finalSnapshot && page.inputQueued)) {{
           refreshPage(page, finalSnapshot);
         }}
       }}
@@ -213,14 +318,17 @@ class UnifiedRealtimeDashboard:
         if (!frame.dataset.loading) return;
         delete frame.dataset.loading;
         frame.dataset.loaded = "true";
-        if (document.getElementById(page.autoId).checked) refreshPage(page, verificationComplete);
+        frame.contentWindow.postMessage({{type:'visualization-input-activity',active:inputBusy()}},'*');
+        const refreshQueued = frame.dataset.refreshQueued === "true";
+        delete frame.dataset.refreshQueued;
+        if (refreshQueued || document.getElementById(page.autoId).checked) refreshPage(page, verificationComplete);
       }});
       document.getElementById(page.autoId).addEventListener("change", (event) => {{
         if (event.target.checked) refreshPage(page, verificationComplete);
       }});
     }}
     window.addEventListener("message", (event) => {{
-      if (verificationComplete) return;
+      if (verificationComplete || completionUri) return;
       const message = event.data || {{}};
       if (message.type !== "relu-search-tree-status" || message.status === "RUNNING") return;
       const knownPage = pages.some((page) =>
@@ -228,27 +336,42 @@ class UnifiedRealtimeDashboard:
       );
       if (!knownPage) return;
       // Let the independent report consume its final snapshot before polling stops.
-      refreshPages(true);
       refresh(true);
+      markComplete(message.status);
+    }});
+    function markComplete(result) {{
       verificationComplete = true;
       clearInterval(imageTimer);
       clearInterval(pageTimer);
       for (const page of pages) document.getElementById(page.autoId).checked = false;
       const status = document.getElementById("status");
-      status.textContent = "DONE · " + message.status;
-      status.style.color = message.status === "SAT" ? "#22c55e" :
-        message.status === "UNSAT" ? "#ef4444" : "#94a3b8";
+      status.textContent = "DONE · " + result;
+      status.style.color = result === "SAT" ? "#22c55e" :
+        result === "UNSAT" ? "#ef4444" : "#94a3b8";
+    }}
+    window.addEventListener("log-analysis-disconnected", () => {{
+      verificationComplete = true;
+      clearInterval(imageTimer);
+      clearInterval(pageTimer);
+      for (const page of pages) document.getElementById(page.autoId).checked = false;
+      document.getElementById("status").textContent = "OFFLINE";
+      document.getElementById("status").style.color = "#94a3b8";
+    }});
+    window.addEventListener('log-analysis-input-activity',event=>{{
+      if(event.detail.active||!inputRefreshQueued)return;
+      const finalSnapshot=inputFinalQueued;inputRefreshQueued=false;inputFinalQueued=false;
+      refresh(finalSnapshot);
     }});
     refresh();
     imageTimer = setInterval(refresh, {self.refresh_interval_ms});
-    refreshPages();
-    pageTimer = setInterval(refreshPages, {max(1000, self.refresh_interval_ms * 4)});
   </script>
 </body>
 </html>
 """
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        self.output_path.write_text(html, encoding="utf-8")
+        if self.managed_completion:
+            publish_dashboard_status(self.output_path, "RUNNING")
+        write_atomic_text(self.output_path, html)
         if open_browser:
             webbrowser.open(self.output_path.resolve().as_uri())
         return self.output_path

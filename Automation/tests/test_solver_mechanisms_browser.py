@@ -162,8 +162,10 @@ class MechanismBrowserTests(unittest.TestCase):
     assert(doc.querySelector('#boundStep').value==='1','new snapshots do not skip queued changes');
     assert(doc.querySelector('#boundPending').textContent==='+3개 재생 대기','new snapshots grow pending count without skipping');
     const preservedEvent=doc.querySelector('#events .event');
+    const preservedCharts=[...doc.querySelectorAll('.chart')].slice(1).map(chart=>chart.querySelector('svg'));
     doc.querySelector('#boundSearchMode').click();
     assert(doc.querySelector('#events .event')===preservedEvent,'button redraw does not rebuild occurrence records');
+    assert([...doc.querySelectorAll('.chart')].slice(1).every((chart,index)=>chart.querySelector('svg')===preservedCharts[index]),'bound search does not rebuild unrelated charts');
     const layerQuery=doc.querySelector('#boundLayerSearch'),query=doc.querySelector('#boundNeuronSearch');
     layerQuery.value='1';layerQuery.dispatchEvent(new frame.contentWindow.Event('input'));
     query.value='0 (z)';query.dispatchEvent(new frame.contentWindow.Event('input'));

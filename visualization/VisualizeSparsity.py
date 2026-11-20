@@ -32,7 +32,6 @@ from __future__ import annotations
 import math
 import os
 import sys
-import platform
 
 import numpy as np
 import matplotlib
@@ -42,6 +41,7 @@ import matplotlib.patches as patches
 from matplotlib.colors import to_rgb
 
 from CustomBinary import read_custom
+from visualization.Fonts import configure_matplotlib_fonts
 
 GREEN = "#2ca02c"
 RED = "#d62728"
@@ -49,13 +49,7 @@ OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 
 
 def _setup_font():
-    if platform.system() == "Windows":
-        plt.rcParams["font.family"] = "Malgun Gothic"
-    elif platform.system() == "Darwin":
-        plt.rcParams["font.family"] = "AppleGothic"
-    else:
-        plt.rcParams["font.family"] = "NanumGothic"
-    plt.rcParams["axes.unicode_minus"] = False
+    configure_matplotlib_fonts()
 
 
 def _layer_status(W: np.ndarray, b: np.ndarray, zero_tol: float):

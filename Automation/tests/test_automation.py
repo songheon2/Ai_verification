@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from threading import Thread
 import unittest
 from unittest.mock import patch
 
@@ -1111,13 +1112,39 @@ def _importable(module: str) -> bool:
 
 
 class LpEngineTests(unittest.TestCase):
+    @unittest.skipUnless(_importable("swiglpk"), "swiglpk 없음")
+    def test_glpk_close_requires_owner_and_deletes_only_once(self):
+        import swiglpk
+        from LpEngines import GlpkCore, GlpkEngine
+
+        for engine_type in (GlpkCore, GlpkEngine):
+            with self.subTest(engine=engine_type.__name__):
+                engine = engine_type()
+                errors = []
+
+                def close_elsewhere():
+                    try:
+                        engine.close()
+                    except RuntimeError as exc:
+                        errors.append(str(exc))
+
+                with patch.object(swiglpk, "glp_delete_prob", wraps=swiglpk.glp_delete_prob) as delete:
+                    thread = Thread(target=close_elsewhere)
+                    thread.start()
+                    thread.join()
+                    delete.assert_not_called()
+                    self.assertEqual(len(errors), 1)
+                    engine.close()
+                    engine.close()
+                    delete.assert_called_once()
+
     """노드 LP를 바깥 엔진(자체 simplex 통제군 / GLPK / Z3)에 맡기는 경로."""
 
     def _engines(self):
         from LpEngines import ENGINES
 
         available = {"simplex": True, "glpk": _importable("swiglpk"), "z3": _importable("z3")}
-        return [name for name in ENGINES if available[name]]
+        return [name for name in ENGINES if available.get(name, False)]
 
     def test_engine_merges_equalities_and_frees_absent_rows(self):
         from LpEngines import make_engine

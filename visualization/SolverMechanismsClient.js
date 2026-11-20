@@ -16,10 +16,18 @@
     content.className='card-content';inner.className='card-content-inner';
     inner.append(...card.childNodes);content.append(inner);card.append(content);
   });
+  let fitTask=null;
   const fitCards=()=>{
-    document.documentElement.style.setProperty('--report-header-height',`${$('header').getBoundingClientRect().height}px`);
-    const heights=[...document.querySelectorAll('.card:not([hidden]) .card-content-inner')].map(inner=>inner.getBoundingClientRect().height);
-    document.documentElement.style.setProperty('--mechanism-controls-height',`${innerWidth>850?Math.ceil(Math.max(0,...heights)):0}px`);
+    if(fitTask!==null)return;
+    fitTask=setTimeout(()=>{
+      fitTask=null;
+      const headerHeight=`${$('header').getBoundingClientRect().height}px`;
+      const heights=[...document.querySelectorAll('.card:not([hidden]) .card-content-inner')].map(inner=>inner.getBoundingClientRect().height);
+      const controlsHeight=`${innerWidth>850?Math.ceil(Math.max(0,...heights)):0}px`;
+      const style=document.documentElement.style;
+      if(style.getPropertyValue('--report-header-height')!==headerHeight)style.setProperty('--report-header-height',headerHeight);
+      if(style.getPropertyValue('--mechanism-controls-height')!==controlsHeight)style.setProperty('--mechanism-controls-height',controlsHeight);
+    },0);
   };
   new ResizeObserver(fitCards).observe($('header'));
   new ResizeObserver(fitCards).observe($('.cards'));
@@ -57,12 +65,20 @@
   const searchPickers=[];
   if (['stable','all'].includes(saved.boundScope)) $('#boundScope').value=saved.boundScope;
   let data = INITIAL_DATA, loader = null, pending = false, timer = null, finalQueued = false;
+  let inputBusy=false,queuedData=null,queuedRefresh=false,resumeRecords=null;
+  const snapshotAsset = {};
+  let requestedSnapshotVersion = null;
   let recordsReport = null, recordsFilter = null, recordsGeneration = 0;
   const BOUND_INTERVAL_MS = 3000;
   let boundIndex = Number.isInteger(saved.boundIndex) ? saved.boundIndex : -1;
   let boundPlaying = saved.boundPlaying !== false, boundFollow = saved.boundFollow !== false, boundTimer = null;
   const searchSteps = Object.assign(Object.create(null), saved.searchSteps && typeof saved.searchSteps==='object' ? saved.searchSteps : {});
-  const text = (selector, value) => { $(selector).textContent = value; };
+  const text = (selector, value) => { const element=$(selector);if(element.textContent!==String(value))element.textContent=value; };
+  const reportCaches=new WeakMap();
+  function reportCache(report){
+    if(!reportCaches.has(report))reportCaches.set(report,{});
+    return reportCaches.get(report);
+  }
   const finite = value => typeof value === 'number' && Number.isFinite(value);
   const number = value => finite(value) ? Number(value.toPrecision(6)).toString() : '?';
   const limit = (value, lower) => value == null ? (lower ? '−∞' : '+∞') : number(value);
@@ -82,6 +98,26 @@
     if (content != null) element.textContent = content;
     return element;
   };
+  function selectForAnalysis(mechanism, record, label, detail='') {
+    if(window.parent===window)return;
+    const scope={topic:'mechanisms',mechanism};
+    if(Number.isInteger(record?.round_index))scope.round=record.round_index;
+    if(mechanism==='bounds' && record){
+      const match=String(record.variable||record.neuron||'').match(/^[zh](\d+)_(\d+)(?:_|$)/);
+      const layer=match?Number(match[1]):record.layer,neuron=match?Number(match[2]):record.index??record.neuron;
+      if(Number.isInteger(layer)&&Number.isInteger(neuron)){scope.layer=layer;scope.neuron=neuron;}
+    }
+    const context=[label,record?.sequence!=null?'기록 #'+record.sequence:'',record?.id!=null?'변경 #'+record.id:'',
+      record?.round_index!=null?'DPLL Round: '+record.round_index:'',record?.depth!=null?'탐색 깊이: '+record.depth:'',detail].filter(Boolean).join('\n');
+    window.parent.postMessage({type:'log-analysis-select',scope,text:context.slice(0,1800)},'*');
+  }
+  function selectable(element, mechanism, record, label, detail) {
+    element.style.cursor='pointer';element.setAttribute('tabindex','0');element.setAttribute('role','button');
+    element.setAttribute('aria-label',label+' · 질문에 선택 정보 넣기');
+    const select=event=>{event.stopPropagation();selectForAnalysis(mechanism,record,label,detail);};
+    element.addEventListener('click',select);
+    element.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();select(event);}});
+  }
   function chart(index, title) {
     const card = document.querySelectorAll('.card')[index];
     let host = card.querySelector('.chart');
@@ -90,7 +126,10 @@
     const heading = document.createElement('div'); heading.className='chart-title'; heading.textContent=title;
     const svg=svgElement('svg',{viewBox:'0 0 560 230',role:'img','aria-label':title});
     host.append(heading,svg);
-    return {host,svg};
+    const view={host,svg};
+    host.style.cursor='pointer';
+    host.onclick=()=>selectForAnalysis(['bounds','backjump','numeric','underapprox'][index],view.record,title,view.detail||card.querySelector('.value').textContent);
+    return view;
   }
   function emptyChart(view, message) {
     view.svg.remove();
@@ -107,13 +146,15 @@
     element.disabled=!entries.length;
   }
   function boundRounds(report) {
+    const cache=reportCache(report);if(cache.rounds)return cache.rounds;
     const rounds=[...(report.boundRounds || [])], known=new Set(rounds.map(item=>item.round_index));
     for(const item of [...(report.boundHistory || []),...(report.eventsByKind?.bounds || [])])if(!known.has(item.round_index)){known.add(item.round_index);rounds.push({round_index:item.round_index,ranges:[]});}
-    return rounds;
+    return cache.rounds=rounds;
   }
   function displayBoundHistory(report) {
     if ($('#boundScope').value==='all') return report.boundHistory || [];
-    return (report.eventsByKind?.bounds || []).filter(record=>record.kind==='stable').map(record=>({
+    const cache=reportCache(report);if(cache.stableHistory)return cache.stableHistory;
+    return cache.stableHistory=(report.eventsByKind?.bounds || []).filter(record=>record.kind==='stable').map(record=>({
       ...record,id:record.sequence,role:'z',neuron:record.variable,
     }));
   }
@@ -122,16 +163,26 @@
     options('#boundRound',rounds.map((item,index)=>[String(index),`R${item.round_index ?? '?'}`]),saved.round);
     const change=history[Math.max(0,Math.min(boundIndex,history.length-1))];
     if(boundFollow && change){const index=rounds.findIndex(item=>item.round_index===change.round_index);if(index>=0)$('#boundRound').value=String(index);}
-    const ranges=rounds[Number($('#boundRound').value)]?.ranges || [];
+    const cache=reportCache(report);
+    const ranges=rounds[Number($('#boundRound').value)]?.ranges || (cache.emptyRanges ||= []);
     const round=rounds[Number($('#boundRound').value)]?.round_index;
-    const variables=new Map($('#boundScope').value==='all'?ranges.map(item=>[item.variable,item]):[]);
-    for(const item of history)if(item.round_index===round)variables.set(item.variable,item);
+    const catalogKey=JSON.stringify([$('#boundScope').value,round??null]);
+    cache.catalogs ||= new Map();
     const parts=item=>{
+      cache.neuronParts ||= new Map();
+      if(cache.neuronParts.has(item.variable))return cache.neuronParts.get(item.variable);
       const match=String(item.variable).match(/^([zh])(\d+)_(\d+)(?:_|$)/);
-      return match?{layer:Number(match[2]),index:Number(match[3]),role:match[1]}:null;
+      const value=match?{layer:Number(match[2]),index:Number(match[3]),role:match[1]}:null;
+      cache.neuronParts.set(item.variable,value);return value;
     };
-    const records=[...variables.values()].filter(item=>parts(item));
-    const layers=[...new Set(records.map(item=>parts(item).layer))].sort((a,b)=>a-b);
+    if(!cache.catalogs.has(catalogKey)){
+      const variables=new Map($('#boundScope').value==='all'?ranges.map(item=>[item.variable,item]):[]);
+      for(const item of history)if(item.round_index===round)variables.set(item.variable,item);
+      const records=[...variables.values()].filter(item=>parts(item)),byLayer=new Map();
+      for(const item of records){const layer=parts(item).layer;if(!byLayer.has(layer))byLayer.set(layer,[]);byLayer.get(layer).push(item);}
+      cache.catalogs.set(catalogKey,{records,byLayer,layers:[...byLayer.keys()].sort((a,b)=>a-b)});
+    }
+    const {records,byLayer,layers}=cache.catalogs.get(catalogKey);
     boundLayerChoices=layers.map(layer=>[String(layer),`Layer ${layer}`]);
     if(boundFollow && change){
       const current=parts(change);
@@ -139,7 +190,7 @@
     }
     if(!$('#boundLayerSearch').value && layers.length)$('#boundLayerSearch').value=String(layers[0]);
     const layerText=$('#boundLayerSearch').value.trim();
-    const candidates=records.filter(item=>layerText!=='' && parts(item).layer===Number(layerText));
+    const candidates=layerText!==''?byLayer.get(Number(layerText))||[]:[];
     boundNeuronChoices=candidates.map(item=>[`${parts(item).index} (${parts(item).role})`,`N${parts(item).index} (${parts(item).role})`]);
     boundNeuronChoices=[...new Map(boundNeuronChoices.map(entry=>[entry[0],entry])).values()].sort((a,b)=>parseInt(a[0])-parseInt(b[0])||a[0].localeCompare(b[0]));
     const entries=(boundFollow?records:candidates).map(item=>[item.variable,neuronLabel(item)]);
@@ -194,6 +245,7 @@
     if (change) {
       text('#boundsValue',`R${change.round_index ?? '?'} · 깊이 ${change.depth} · ${change.role || 'z'} (${roleExplanation(change)}) · 변경 #${change.id}`);
       const view=chart(0,`${neuronLabel(change)} · ${change.kind==='stable'?'STABLE · ':''}${sourceLabel(change.source)}`);
+      view.record=change;view.detail=`경계 유도 · ${neuronLabel(change)}\n변경 전: ${interval(change.before)}\n변경 후: ${interval(change.after)}`;
       rangePlot(view,[{label:'변경 전',values:change.before,color:'#94a3b8'},{label:'변경 후',values:change.after,color:'#0284c7'}]);
       return;
     }
@@ -209,6 +261,7 @@
       if(selectedChange){
         text('#boundsValue',`R${selectedChange.round_index ?? '?'} · ${neuronLabel(selectedChange)} (${roleExplanation(selectedChange)}) · 깊이 ${selectedChange.depth} · 변경 #${selectedChange.id}`);
         const view=chart(0,`${neuronLabel(selectedChange)} · ${selectedChange.kind==='stable'?'STABLE · ':''}${sourceLabel(selectedChange.source)}`);
+        view.record=selectedChange;view.detail=`경계 유도 · ${neuronLabel(selectedChange)}\n변경 전: ${interval(selectedChange.before)}\n변경 후: ${interval(selectedChange.after)}`;
         rangePlot(view,[{label:'변경 전',values:selectedChange.before,color:'#94a3b8'},{label:'변경 후',values:selectedChange.after,color:'#0284c7'}]);return;
       }
     }
@@ -216,11 +269,22 @@
     const selected=ranges.find(item=>item.variable===$('#boundNeuron').value);
     const view=chart(0,selected ? `${neuronLabel(selected)} · ${{active:'활성 확정',inactive:'비활성 확정',unstable:'분기 가능'}[selected.state] || selected.state}` : '뉴런별 최솟값 · 최댓값');
     if (!selected) { emptyChart(view,!boundFollow && $('#boundNeuronSearch').value.trim()?'일치하는 뉴런 없음':'탐색 전 경계 유도 기록 없음'); return; }
+    view.record=selected;view.detail=`경계 유도 · ${neuronLabel(selected)}\n유도 전: ${interval(selected.before)}\n유도 후: ${interval(selected.after)}`;
     rangePlot(view,[{label:'유도 전',values:selected.before,color:'#94a3b8'},{label:'유도 후',values:selected.after,color:'#0284c7'}]);
   }
   function searchBoundHistory(report) {
     const round=boundRounds(report)[Number($('#boundRound').value)]?.round_index, variable=$('#boundNeuron').value;
-    return {key:JSON.stringify([$('#boundScope').value,round ?? null,variable]),records:displayBoundHistory(report).filter(record=>record.round_index===round && record.variable===variable)};
+    const mode=$('#boundScope').value,cache=reportCache(report);
+    cache.searchHistories ||= {};
+    if(!cache.searchHistories[mode]){
+      const histories=new Map();
+      for(const record of displayBoundHistory(report)){
+        const key=JSON.stringify([record.round_index??null,record.variable]);
+        if(!histories.has(key))histories.set(key,[]);histories.get(key).push(record);
+      }
+      cache.searchHistories[mode]=histories;
+    }
+    return {key:JSON.stringify([mode,round ?? null,variable]),records:cache.searchHistories[mode].get(JSON.stringify([round??null,variable]))||[]};
   }
   function seekSearchBound(index) {
     const {key,records}=searchBoundHistory(data.report || {});
@@ -228,13 +292,13 @@
     searchSteps[key]=Math.max(0,Math.min(index,records.length-1));render();save();
   }
   function scheduleBoundPlayback() {
-    if (boundTimer!==null || !boundPlaying || !boundFollow || !enabled.has('bounds')) return;
+    if (inputBusy || boundTimer!==null || !boundPlaying || !boundFollow || !enabled.has('bounds')) return;
     const history=displayBoundHistory(data.report || {});
     if (!history.length || (boundIndex>=history.length-1 && data.status!=='RUNNING')) return;
     boundTimer=setTimeout(()=>{
       boundTimer=null;
       const latest=displayBoundHistory(data.report || {});
-      if (boundPlaying && boundFollow && boundIndex<latest.length-1) {boundIndex++;render();save();}
+      if (!inputBusy && boundPlaying && boundFollow && boundIndex<latest.length-1) {boundIndex++;render();save();}
       else scheduleBoundPlayback();
     },BOUND_INTERVAL_MS);
   }
@@ -252,7 +316,7 @@
       const counts=[['LP (선형 제약 문제)',totals.conflict_LP || 0],['경계 유도',totals.conflict_DERIVE || 0],['변수 경계',totals.conflict_BOUNDS || 0]];
       if (!counts.some(item=>item[1])) {emptyChart(view,'충돌·백점프 발생 기록 없음');return;}
       const max=Math.max(...counts.map(item=>item[1]));
-      counts.forEach(([label,count],index)=>{const y=24+index*62;view.svg.append(svgElement('text',{x:0,y:y+22,'font-size':14},label),svgElement('rect',{x:140,y,width:330*count/max,height:30,rx:4,fill:'#7c3aed'}),svgElement('text',{x:550,y:y+22,'text-anchor':'end'},count));});
+      counts.forEach(([label,count],index)=>{const y=24+index*62,group=svgElement('g');group.append(svgElement('text',{x:0,y:y+22,'font-size':14},label),svgElement('rect',{x:140,y,width:330*count/max,height:30,rx:4,fill:'#7c3aed'}),svgElement('text',{x:550,y:y+22,'text-anchor':'end'},count));selectable(group,'backjump',null,'모순 발생 원인',`${label}: ${count}건`);view.svg.append(group);});
       return;
     }
     const max=Math.max(1,...jumps.flatMap(item=>[item.from_depth,item.target_depth]));
@@ -262,8 +326,9 @@
     jumps.forEach((item,index)=>{
       const x=jumps.length===1?300:75+index*440/(jumps.length-1), from=y(item.from_depth), to=y(item.target_depth);
       const group=svgElement('g');
+      selectable(group,'backjump',item,'충돌 분석·백점프',`출발 깊이: ${item.from_depth}\n복귀 깊이: ${item.target_depth}\n원인 깊이: ${(item.cause_depths||[]).join(', ')}`);
       group.append(svgElement('title',{},`D${item.round_index ?? '?'} · #${item.sequence}: 깊이 ${item.from_depth} → ${item.target_depth} · 원인 [${(item.cause_depths || []).join(', ')}]`),svgElement('line',{x1:x,x2:x,y1:from,y2:to,stroke:'#7c3aed','stroke-width':4}),svgElement('circle',{cx:x,cy:from,r:6,fill:'#dc2626'}),svgElement('path',{d:`M ${x} ${to-8} l 7 8 l -7 8 l -7 -8 Z`,fill:'#7c3aed'}));
-      view.svg.append(group,svgElement('text',{x,y:218,'text-anchor':'middle',fill:'#475569'},'#'+item.sequence));
+      group.append(svgElement('text',{x,y:218,'text-anchor':'middle',fill:'#475569'},'#'+item.sequence));view.svg.append(group);
     });
   }
   function logPlot(view, records, series, threshold) {
@@ -291,14 +356,19 @@
           if (record[item.key+'_nonfinite']) {
             const cx=x(index), marker=svgElement('path',{d:`M ${cx} 28 l 7 12 l -14 0 Z`,fill:'#dc2626'});
             marker.append(svgElement('title',{},`#${record.sequence} · 비유한 ${item.label}`));view.svg.append(marker);
+            selectable(marker,'numeric',record,'부동소수점 연산',`${item.label}: 비유한 값`);
           }
           return;
         }
         const cx=x(index),cy=y(record[item.key]);
         const point=svgElement('circle',{cx,cy,r:4,fill:record.outcome==='restored'?'#16a34a':item.color});
         point.append(svgElement('title',{},`#${record.sequence} · ${item.label}: ${number(record[item.key])}${record.outcome==='restored'?' · 타블로 복원':''}`));view.svg.append(point);
+        selectable(point,'numeric',record,'부동소수점 연산',`${item.label}: ${number(record[item.key])}\n${describe(record)}`);
         const after=record['after_'+item.key];
-        if (record.outcome==='restored' && seriesIndex===0 && finite(after)) view.svg.append(svgElement('line',{x1:cx,x2:cx,y1:cy,y2:y(after),stroke:'#16a34a','stroke-width':3}),svgElement('path',{d:`M ${cx} ${y(after)-6} l 6 6 l -6 6 l -6 -6 Z`,fill:'#16a34a'}));
+        if (record.outcome==='restored' && seriesIndex===0 && finite(after)) {
+          const restored=svgElement('g');restored.append(svgElement('line',{x1:cx,x2:cx,y1:cy,y2:y(after),stroke:'#16a34a','stroke-width':3}),svgElement('path',{d:`M ${cx} ${y(after)-6} l 6 6 l -6 6 l -6 -6 Z`,fill:'#16a34a'}));
+          selectable(restored,'numeric',record,'부동소수점 연산 · 타블로 복원',`${item.label}: ${number(record[item.key])} → ${number(after)}\n${describe(record)}`);view.svg.append(restored);
+        }
       });
       view.svg.append(svgElement('text',{x:85+seriesIndex*225,y:18,fill:item.color},item.label));
     });
@@ -315,6 +385,7 @@
     const selected=ranges.find(item=>item.variable===$('#underNeuron').value);
     const view=chart(3,`${selected?neuronLabel(selected)+' · ':''}[l, u] → [l + ε, u − ε]`);
     const epsilon=Number($('#epsilon').value);
+    view.record=selected;view.detail=`과소근사 구간 미리보기 (실제 솔버 적용 결과가 아닙니다.)\n${selected?neuronLabel(selected)+'\n원래 구간: '+interval(selected.after):'선택한 뉴런 없음'}\nε: ${epsilon}`;
     if (!Number.isFinite(epsilon) || epsilon<0 || $('#epsilon').value==='') {emptyChart(view,'ε은 0 이상의 유한한 값이어야 합니다.');return;}
     if (!selected) {emptyChart(view,'비교할 뉴런 경계 없음 · 솔버 미적용');return;}
     const [lo,hi]=selected.after;
@@ -350,12 +421,15 @@
     let offset=0,restoringScroll=true,lastRestoredScroll=0,restoringPage=true,lastPageY=window.scrollY;
     function appendBatch() {
       if(generation!==recordsGeneration)return;
+      if(inputBusy){resumeRecords=appendBatch;return;}
       const fragment=document.createDocumentFragment(),end=Math.min(offset+100,records.length);
       for(;offset<end;offset++) {
         const record=records[offset],row=document.createElement('div');row.className='event';
         const position=document.createElement('strong');
         position.textContent=`기록 #${record.sequence} · D${record.round_index ?? '?'} · ${record.nodeId!=null?'노드 #'+record.nodeId:'루트 처리'} · 깊이 ${record.depth}`;
         const content=document.createElement('div');content.textContent=describe(record);row.append(position,content);fragment.append(row);
+        const mechanism=['stable','bounds','bound_updates','simplex'].includes(record.kind)?'bounds':['conflict','backjump'].includes(record.kind)?'backjump':record.kind==='underapprox'?'underapprox':'numeric';
+        selectable(row,mechanism,record,'Mechanisms · 발생 기록',describe(record));
       }
       container.append(fragment);
       if(restoringScroll && container.scrollTop!==lastRestoredScroll)restoringScroll=false;
@@ -368,6 +442,7 @@
     if(!records.length)container.textContent=filter==='underapprox'?'과소근사는 솔버에 적용되어 있지 않습니다.':'해당 발생 기록이 없습니다.';
     text('#eventCount',`표시 ${records.length}건`);
   }
+  let conflictReport=null,numericReport=null,numericMetric=null,underRanges=null,underNeuron=null,underEpsilon=null;
   function render() {
     document.body.setAttribute('aria-busy',String(Boolean(data.deferredData)));
     const report=data.report || {}, totals=report.totals || {}, ranges=selectedRanges(report);
@@ -378,24 +453,50 @@
     text('#numericalValue',report.available?`오차 검사 ${totals.drift_checks || 0}회 · 복원 ${totals.restores || 0}회${totals.restore_failures?' · 복원 실패 '+totals.restore_failures+'회':''}`:'측정 기록 대기');
     const underapproxEnabled=(report.settings || []).some(item=>item.underapprox_enabled);
     text('#underapproxValue',underapproxEnabled?'솔버 과소근사 활성 · 아래 그림은 구간 미리보기':'솔버 미적용 · 구간 미리보기');
-    boundChart(report,ranges);conflictChart(report,totals);numericalChart(report);underChart(ranges);
+    boundChart(report,ranges);
+    if(conflictReport!==report){conflictChart(report,totals);conflictReport=report;}
+    const metric=$('#numericalMetric').value;
+    if(numericReport!==report||numericMetric!==metric){numericalChart(report);numericReport=report;numericMetric=metric;}
+    const neuron=$('#underNeuron').value,epsilon=$('#epsilon').value;
+    if(underRanges!==ranges||underNeuron!==neuron||underEpsilon!==epsilon){underChart(ranges);underRanges=ranges;underNeuron=neuron;underEpsilon=epsilon;}
     fitCards();
     renderRecords(report);
     if(data.status!=='RUNNING' && timer!==null){clearInterval(timer);timer=null;}
     scheduleBoundPlayback();
     if(window.parent!==window)window.parent.postMessage({type:'relu-search-tree-status',status:data.status},'*');
   }
-  function refresh(force=false) {
+  async function refresh(force=false) {
+    if(inputBusy){queuedRefresh=true;finalQueued=finalQueued||force;return;}
     if(pending){finalQueued=finalQueued || force;return;}if(data.status!=='RUNNING' && !force)return;
+    pending=true;
+    let update;
+    try{update=await visualizationAssetUpdate(data.snapshotFile || location.href,snapshotAsset,force);}
+    catch(_error){pending=false;if(finalQueued){finalQueued=false;refresh(true);}return;}
+    if(!update){pending=false;if(finalQueued){finalQueued=false;refresh(true);}return;}
     if(!loader){loader=document.createElement('iframe');loader.id='snapshotLoader';loader.hidden=true;
       loader.onload=()=>{pending=false;if(finalQueued){finalQueued=false;refresh(true);}};document.body.append(loader);}
-    pending=true;const url=new URL(data.snapshotFile || location.href,location.href);url.searchParams.set('mechanism-snapshot','1');url.searchParams.set('t',Date.now());loader.src=url.href;
+    const url=new URL(update.url);url.searchParams.set('mechanism-snapshot','1');requestedSnapshotVersion=update.version;loader.src=url.href;
+  }
+  function applySnapshot(payload){
+    if(inputBusy){queuedData=payload;return;}
+    if(payload.snapshotVersion!=null && payload.snapshotVersion===data.snapshotVersion)return;
+    const pageY=window.scrollY;data=payload;render();window.scrollTo(window.scrollX,pageY);save();
   }
   window.addEventListener('message',event=>{
+    if(event.source===window.parent&&event.data?.type==='visualization-input-activity'){
+      inputBusy=event.data.active===true;
+      if(!inputBusy){
+        if(queuedData){const latest=queuedData;queuedData=null;applySnapshot(latest);}
+        if(resumeRecords){const append=resumeRecords;resumeRecords=null;setTimeout(append,0);}
+        scheduleBoundPlayback();
+        if(queuedRefresh){queuedRefresh=false;const force=finalQueued;finalQueued=false;refresh(force);}
+      }
+      return;
+    }
     if(loader && event.source===loader.contentWindow && event.data?.type===SNAPSHOT){
       pending=false;if(!event.data.data || typeof event.data.data.report!=='object')return;
-      if(event.data.data.snapshotVersion!=null && event.data.data.snapshotVersion===data.snapshotVersion)return;
-      const pageY=window.scrollY;data=event.data.data;render();window.scrollTo(window.scrollX,pageY);save();
+      snapshotAsset.version=requestedSnapshotVersion;
+      applySnapshot(event.data.data);
     }else if(event.source===window.parent && event.data?.type==='relu-search-tree-refresh')refresh(event.data.final===true);
   });
   $('#mechanismFilter').onchange=()=>{$('#events').scrollTop=0;render();save();};
@@ -463,5 +564,5 @@
   document.addEventListener('click',event=>{for(const picker of searchPickers)if(!picker.wrapper.contains(event.target))picker.close();});
   render();fitCards();$('#events').scrollTop=saved.scroll || 0;window.scrollTo(0,saved.pageY || 0);
   if(window.parent===window && data.status==='RUNNING')timer=setInterval(refresh,3000);
-  if(data.snapshotFile)requestAnimationFrame(()=>setTimeout(()=>refresh(true),0));
+  if(data.snapshotFile)setTimeout(()=>refresh(true),0);
 })();

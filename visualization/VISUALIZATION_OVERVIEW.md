@@ -1,6 +1,8 @@
 # Visualization 요소 요약
 
-현재 AutoVerify 시각화는 **DPLL·Theory, Simplex, ReLU** 세 부분으로 구성된다.
+현재 AutoVerify 시각화는 **DPLL·Theory, Simplex, ReLU, 탐색 트리, 4가지 기법**을 하나의 대시보드에서 보여준다. 표시할 패널은 `--panels`로 선택하며, LLM 분석은 화면에서 선택한 항목에 대해 수동으로 요청한다.
+
+화면·툴팁·LLM 분석과 PNG 그래프의 글꼴은 동봉한 **Noto Sans KR**로 통일한다. 일반체·굵은체를 로컬에서 사용하며 인터넷 연결이나 OS 글꼴 설치가 필요 없다. HTML 옆 `_fonts` 폴더는 보고서와 함께 보관한다. 기존에 저장된 PNG/HTML은 다시 생성하기 전까지 이전 글꼴을 유지한다.
 
 ## 주요 화면
 
@@ -170,13 +172,7 @@ stable이라는 뜻은 아니며, 동일 뉴런이 다른 가지나 이론 라�
 - Simplex의 **경계 위반**은 해당 변수값이 현재 하한·상한을 벗어난다는 뜻이다. `h = max(0, z)` 관계 위반은 별도의 ReLU 검사다.
 - 반복 위반 그래프는 기록된 이벤트에서 선택된 변수의 빈도다. 상세 이벤트가 샘플링되므로 모든 위반의 정확한 총횟수는 아니다. 호출·피벗 총계는 종료 이벤트의 집계값을 사용한다.
 - 개별 Simplex 호출의 SAT/UNSAT는 그 선형 문제의 결과다. 전체 신경망 검증의 최종 결과는 `result.json`에서 확인한다.
-- `NUMERICAL_FAILURE`, `TIMEOUT` 등은 확정 UNSAT가 아닌 UNKNOWN 사유다. 최근 추가했던 정확 유리수 검증과 수치 복구는 제거되었다.
-
-그래프 하단의 수치 일관성 허용오차는 다음과 같다. 이는 기존 tableau 일관성 검사의 기준이며, 현재 최종 유리수 인증은 수행하지 않는다.
-
-```text
-|actual - expected| <= 1e-9 × max(1, |actual|, |expected|)
-```
+- `TIMEOUT` 등 미확정 종료 사유는 확정 UNSAT와 구분한다. 수치 안전장치의 설정·발생 여부는 해당 실행의 기법 로그를 기준으로 읽으며, LLM 분석이 최종 판정이나 증명을 대신하지 않는다.
 
 ## 모드와 저장 파일
 
@@ -187,16 +183,31 @@ stable이라는 뜻은 아니며, 동일 뉴런이 다른 가지나 이론 라�
 | `feedback` | 실행 후 전체 기록을 요약한다. |
 | `both` | 두 기능을 함께 사용한다. DPLL·Theory와 Simplex PNG는 공유하며 중복 저장하지 않는다. |
 
-기본 실행 폴더에는 모델·VNNLIB 사본과 `result.json`이 함께 저장된다. 아래 파일은 선택한 모드·패널에 따라 생성된다.
+기본 실행 폴더는 화면, 기록, 입력을 다음과 같이 묶는다. 생성된 파일이 있는 폴더만 만든다.
+
+- `realtime/`에는 실시간 대시보드, 그래프, 트리, 기법 화면과 화면용 파일을 저장한다.
+- `feedback/`에는 피드백 그래프와 요약을 저장한다. 피드백만 실행하면 트리와 기법 화면도 이곳에 저장한다.
+- `logs/`에는 DPLL·Simplex·ReLU 이벤트와 로그 메타데이터를 저장한다.
+- `inputs/`에는 모델과 VNNLIB 사본을 저장한다.
+- 실행별 `run_info.json`과 `result.json`은 실행 폴더 바로 아래에 둔다.
+
+아래 파일은 선택한 모드·패널에 따라 생성된다.
 
 - `solver_*_dpll_theory.png`, `solver_*_simplex.png`: DPLL·Theory 및 Simplex 패널.
 - `relu_realtime.png`: 실시간 ReLU 화면.
 - `relu_feedback_heatmap.png`, `relu_feedback_history.png`: ReLU 사후 분석.
 - `solver_progress.jsonl`, `solver_feedback.json`: 솔버 이벤트와 요약 데이터.
 - `relu_events.jsonl`: ReLU 실시간 이벤트 기록. feedback-only는 메모리 기록을 사용하므로 생략될 수 있다.
-- `*.html`: 선택한 실시간 패널을 한 화면에 표시하는 대시보드.
+- `relu_events_branches.jsonl`: 탐색 가지·STABLE 확정·기법 발생 기록.
+- `run_info.json`: 실행 시작부터 제공되는 실행 ID·모델·속성·설정.
+- `*.html`: 통합 대시보드와 그 안에 포함되는 탐색 트리·기법 보고서.
+
+기본 출력은 `visualization/outputs/<벤치마크>/<속성>/<신경망>/<엔진 구분>/<실행시간>/` 아래에 모은다. 예를 들어 ACAS Xu의 `prop3`와 `prop_3.vnnlib.gz`는 `acasxu_2023/prop_3/` 아래에 모인다. 로컬 모델은 `local/`에 저장한다. 엔진 구분은 `simplex-original`(네이티브), `glpk-core`, `glpk-oracle`, `z3-core`, `z3-oracle`, `simplex-oracle`이다. GLPK의 비기본 tableau 추출·오차 설정도 이름에 붙인다. 실시간 화면을 연 실행은 연결 주소가 바뀌지 않도록 실행 중 같은 폴더를 유지한다. `--visualization-output-dir`를 지정하면 해당 경로를 사용한다. `run_info.json`과 `result.json`에도 엔진 구분을 저장한다.
+
+`GEMINI_API_KEY`를 설정하고 기존 `--visualization-mode realtime` 또는 `both` 명령을 실행하면 LLM 분석이 자동 연결된다. 버튼을 누른 시점의 완전한 기록만 고정하며, 분석 중에도 검증은 계속된다. 파일을 직접 연 경우에는 LLM API를 호출하지 않는다. 분석 결과는 원본 로그와 별도로 `Automation/Results/llm_analysis`에 저장한다.
 
 ## 보조 도구
+
 
 - `NetworkLayout.py`: 신경망의 레이어·뉴런 연결 구조를 그린다.
 - `VisualizeSparsity.py`: 가중치·바이어스가 0인지 시각화해 희소성을 확인한다.

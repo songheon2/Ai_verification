@@ -80,6 +80,9 @@ import matplotlib.colors as mcolors
 import matplotlib.patches as patches
 
 from GenericNNEncoding import NNModel
+from visualization.Fonts import configure_matplotlib_fonts
+
+configure_matplotlib_fonts()
 
 _NEURON_VAR_RE = re.compile(r"^[zh](\d+)_(\d+)(?:_.*)?$")
 

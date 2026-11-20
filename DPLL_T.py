@@ -283,6 +283,7 @@ def dpll_t_detailed(
     model_layer_sizes: Optional[Iterable[int]] = None,
     progress=None,
     reluplex_options: Optional[Dict[str, Any]] = None,
+    result_callback: Optional[Callable[[SolverResult], None]] = None,
 ) -> SolverResult:
     """Run DPLL(T), distinguishing SAT, UNSAT, and UNKNOWN.
 
@@ -411,6 +412,8 @@ def dpll_t_detailed(
             progress.solver_end(
                 result.status.value, result.reason, result.rounds, model=result.model,
             )
+        if result_callback is not None:
+            result_callback(result)
         return result
     finally:
         if visualizer is not None:

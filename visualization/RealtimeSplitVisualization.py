@@ -19,6 +19,7 @@ from time import sleep, time_ns
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from visualization.RenderLock import serialized_render
+from visualization.Fonts import font_style
 from visualization.ReluNeuronHover import HOVER_SCRIPT, write_relu_hover_map
 from visualization.AtomicFile import write_atomic_text
 from visualization.ReluSearchTree import branch_log_path
@@ -429,6 +430,9 @@ def _draw_realtime_split_history(
         fontweight="bold",
         color=line_color,
     )
+    from visualization.AnalysisSelection import split_selection
+    visible = [event for event in events if window_start_ns <= event.time_ns <= now_ns]
+    split_selection(ax, visible, [(event.time_ns - now_ns) / 1_000_000_000 for event in visible], round_starts or ())
     return ax
 
 
@@ -494,6 +498,8 @@ def _draw_full_split_history(
     )
     ax.set_title(title or "Full active split history")
     _draw_round_boundaries(ax, round_starts, first_ns, unit_seconds)
+    from visualization.AnalysisSelection import split_selection
+    split_selection(ax, ordered, [(event.time_ns - first_ns) / 1_000_000_000 / unit_seconds for event in ordered], round_starts or ())
     ax.text(
         0.985,
         0.93,
@@ -579,7 +585,7 @@ def draw_realtime_split_dashboard(
             title="Active split history",
             window_seconds=window_seconds,
             current_time_ns=current_time_ns,
-            round_starts=round_starts,
+            round_starts=hover_round_starts,
         )
 
     observed = sorted(total_counts)
@@ -749,11 +755,12 @@ class RealtimeSplitVisualizer:
         html = f"""<!doctype html>
 <html lang="ko">
 <head>
+{font_style(self.live_view_path)}
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Realtime ReLU splits</title>
   <style>
-    body {{ margin: 0; background: #111827; color: #f9fafb; font-family: sans-serif; }}
+    body {{ margin: 0; background: #111827; color: #f9fafb; font-family: var(--visualization-font); }}
     main {{ max-width: 1100px; margin: 0 auto; padding: 20px; }}
     h1 {{ margin: 0 0 6px; font-size: 22px; }}
     p {{ margin: 0 0 14px; color: #9ca3af; }}
@@ -815,6 +822,8 @@ class RealtimeSplitVisualizer:
             # 낮은 DPI와 고정 canvas를 사용해 tight-bbox 재계산 비용도 피한다.
             fig.savefig(temporary_output, dpi=100)
             write_relu_hover_map(fig, self.output_path)
+            from visualization.AnalysisSelection import write_selection_map
+            write_selection_map(fig, self.output_path)
             os.replace(temporary_output, self.output_path)
         finally:
             plt.close(fig)

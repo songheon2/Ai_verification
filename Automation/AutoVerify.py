@@ -98,7 +98,8 @@
 
 verify-vnnlib 전용 플래그
 --------------------------
-  --visualization-mode MODE       off, realtime, feedback, both 중 선택
+  --visualization-mode MODE       realtime, feedback, both 중 선택 (생략하면 시각화하지 않음)
+  --panels LIST                   표시할 패널 선택 (realtime·feedback 공통)
   --realtime-log-output PATH      실시간 +/- JSONL 로그 경로
   --realtime-split-output PATH    실시간 활성 split 점 PNG 경로
   --split-heatmap-output PATH     사후 feedback 히트맵 경로 (--feedback-heatmap-output 별칭)
@@ -152,9 +153,10 @@ from datetime import datetime
 import json
 import shutil
 import time
+import uuid
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 AI_VERIFICATION_DIR = Path(__file__).resolve().parent.parent
 if str(AI_VERIFICATION_DIR) not in sys.path:
@@ -191,6 +193,8 @@ from Automation.VnnlibParser import LinearExpression, parse_vnnlib_file
 from XOREncoding import FreshGen
 from Automation.SolverStatus import SolverStatus
 from visualization.SolveTrace import SolveTrace
+from visualization.AtomicFile import write_atomic_text
+from visualization.RunLabels import network_display_name, property_display_name
 from visualization.SplitHeatmap import split_counts_from_trace, draw_split_heatmap
 from visualization.RealtimeSplitVisualization import (
     RealtimeSplitVisualizer,
@@ -210,14 +214,17 @@ from visualization.SolverProgress import (
     solver_panel_paths,
     write_solver_feedback_panels,
 )
-from visualization.UnifiedRealtimeDashboard import UnifiedRealtimeDashboard
+from visualization.UnifiedRealtimeDashboard import UnifiedRealtimeDashboard, publish_dashboard_status
 from visualization.RenderProcess import REALTIME_RENDER_INTERVAL_SECONDS
 from visualization.VisualizationMode import (
+    INPUT_DIRECTORY,
+    VERIFICATION_PANELS,
     VisualizationMode,
     combined_mode,
     create_visualization_run_directory,
     default_visualization_paths,
     finalize_visualization_run_directory,
+    solver_variant_name,
 )
 
 
@@ -857,6 +864,9 @@ def run_vnnlib_verification(
     split_heatmap_cap: int = 20,
     profile_stages: bool = False,
     reluplex_options: Optional[Mapping[str, Any]] = None,
+    run_started_callback: Optional[Callable[[Path], None]] = None,
+    dashboard_ready_callback: Optional[Callable[[Path], None]] = None,
+    dashboard_opener: Optional[Callable[[str], bool]] = None,
 ) -> Dict[str, Any]:
     """VNNLIB이 정의한 unsafe 영역과 신경망의 교집합을 직접 탐색한다.
 
@@ -896,7 +906,7 @@ def run_vnnlib_verification(
         feedback=feedback_enabled,
     )
     mechanism_panel_names = {"bounds", "backjump", "numerical", "underapprox"}
-    allowed_realtime_panels = {"relu", "dpll-theory", "simplex", "mechanisms"}
+    allowed_realtime_panels = set(VERIFICATION_PANELS)
     selected_realtime_panels = set(realtime_panels or allowed_realtime_panels)
     selected_mechanisms = sorted(mechanism_panel_names) if "mechanisms" in selected_realtime_panels else []
     unknown_realtime_panels = selected_realtime_panels - allowed_realtime_panels
@@ -935,13 +945,19 @@ def run_vnnlib_verification(
         else:
             run_output_directory = create_visualization_run_directory(
                 model_path,
+                property_path=vnnlib_path,
                 started_at=visualization_started_at,
-                stable_path=realtime_enabled and open_realtime_view,
+                stable_path=realtime_enabled and (open_realtime_view or dashboard_ready_callback is not None),
+                solver_options=reluplex_options,
             )
+    if run_output_directory is not None and run_started_callback is not None:
+        run_started_callback(run_output_directory.resolve())
     default_paths = default_visualization_paths(
         model_path,
         vnnlib_path,
         output_dir=run_output_directory,
+        organized=not custom_visualization_output,
+        realtime=realtime_enabled,
     )
     if feedback_relu_enabled and split_heatmap_output is None:
         split_heatmap_output = str(default_paths.feedback_heatmap)
@@ -996,12 +1012,37 @@ def run_vnnlib_verification(
             "--allow-large-model only if the expected cost is acceptable."
         )
 
+    model_context = {"model_name": Path(model_path).name, "model_layer_sizes": list(info.layer_sizes),
+                     "lp_engine": (reluplex_options or {}).get("lp_engine", "native")}
+    property_name = property_display_name(vnnlib_path, model_path)
+    if property_name:
+        model_context["property_name"] = property_name
+    network_label = network_display_name(model_context)
+
+    # Publish context before the browser opens; result.json remains final-only.
+    run_id = uuid.uuid4().hex
+    run_manifest = None
+    if run_output_directory is not None:
+        run_manifest = {
+            "schema_version": 1, "run_id": run_id, "status": "RUNNING", "log_epoch_ns": time.time_ns(),
+            "solver_variant": solver_variant_name(reluplex_options),
+            "started_at": visualization_started_at.isoformat(),
+            "model": info.to_dict(), "vnnlib": {"path": str(vnnlib_path), "property_name": property_name},
+            "solver": {"max_rounds": max_rounds, "timeout_seconds": timeout_seconds,
+                       "max_recursion": max_recursion, "simplex_max_iter": simplex_max_iter,
+                       "reluplex_options": dict(reluplex_options or {})},
+            "sampling": {"simplex_detail_stride": 100 if realtime_solver_enabled else 1000,
+                         "compact_simplex_calls": feedback_solver_enabled and not realtime_solver_enabled},
+        }
+        write_atomic_text(run_output_directory / "run_info.json", json.dumps(run_manifest, ensure_ascii=False))
+
     # Build usable initial frames before opening the dashboard.  This keeps a
     # first-ever realtime run from showing empty/broken image slots while model
     # loading and encoding are still in progress. 같은 model/property 조합은 매번
     # 같은 출력 경로를 사용하므로, 실제 인코딩을 시작하기 전에 이전 실행의 마지막
     # 프레임을 빈 상태로 교체해둔다.
     realtime_dashboard_path = None
+    llm_connection = None
     realtime_panel_outputs = {}
     realtime_solver_panel_paths = {}
     if realtime_enabled and not dry_run:
@@ -1041,7 +1082,7 @@ def run_vnnlib_verification(
                 SolveTrace(),
                 relu_search_tree_output,
                 overall_status="RUNNING",
-                title="Realtime ReLU Search Tree",
+                title=f"Realtime ReLU Search Tree: {network_label}",
                 mechanism_panels=selected_mechanisms,
                 model_layer_sizes=info.layer_sizes,
             )
@@ -1058,8 +1099,7 @@ def run_vnnlib_verification(
                 reset_log=True,
                 enabled_panels=realtime_solver_panels,
                 simplex_detail_stride=100,
-                witness_context={"model_name": Path(model_path).name,
-                                 "model_layer_sizes": list(info.layer_sizes)},
+                witness_context=model_context,
             )
             initial_progress_logger.request_update()
             initial_progress_visualizer.flush()
@@ -1077,7 +1117,14 @@ def run_vnnlib_verification(
             realtime_dashboard_path,
             refresh_interval_ms=realtime_refresh_ms,
             embedded_pages=embedded_pages,
-        ).write(open_browser=open_realtime_view)
+            managed_completion=True,
+        ).write(open_browser=False)
+        if dashboard_ready_callback is not None:
+            dashboard_ready_callback(realtime_dashboard_path.resolve())
+        if open_realtime_view:
+            from Automation.LogAnalysisLauncher import open_dashboard_with_analysis
+            open_options = {"open_page": dashboard_opener} if dashboard_opener is not None else {}
+            llm_connection = open_dashboard_with_analysis(run_output_directory, realtime_dashboard_path, **open_options)
 
     input_vars = [f"x{index}" for index in range(info.input_size)]
     generator = FreshGen(prefix="vnnlib_")
@@ -1114,9 +1161,11 @@ def run_vnnlib_verification(
         )
 
     result: Dict[str, Any] = {
+        "run_id": run_id,
         "model": info.to_dict(),
         "vnnlib": {
             "path": document.source_path,
+            "property_name": property_name,
             "assertion_count": document.assertion_count,
             "input_variables": list(document.input_variables),
             "output_variables": list(document.output_variables),
@@ -1128,14 +1177,19 @@ def run_vnnlib_verification(
         result["status"] = "DRY_RUN"
         return result
 
+    run_manifest["vnnlib"] = dict(result["vnnlib"])
+    write_atomic_text(run_output_directory / "run_info.json", json.dumps(run_manifest, ensure_ascii=False))
+
     # Retain reproducible inputs alongside this run, without moving the user's
     # original model/property. Distinct names protect panel/result filenames.
+    input_directory = run_output_directory if custom_visualization_output else run_output_directory / INPUT_DIRECTORY
+    input_directory.mkdir(parents=True, exist_ok=True)
     for section, source_key, supplied, archive_name in (
         ("model", "source_path", model_path, "model"),
         ("vnnlib", "path", vnnlib_path, "property"),
     ):
         source = Path(supplied).resolve()
-        destination = run_output_directory / (archive_name + "".join(source.suffixes))
+        destination = input_directory / (archive_name + "".join(source.suffixes))
         if source != destination.resolve():
             if destination.exists():
                 # An explicitly reused output directory must not silently
@@ -1161,7 +1215,6 @@ def run_vnnlib_verification(
                 solver_progress_log_output,
                 solver_realtime_output,
                 enabled_panels=realtime_solver_panels,
-                refresh_interval_ms=realtime_refresh_ms,
             )
             progress_update_callback = progress_visualizer.request_update
         progress = SolverProgressLogger(
@@ -1180,8 +1233,7 @@ def run_vnnlib_verification(
                 feedback_solver_enabled and not realtime_solver_enabled
             ),
             witness_context={
-                "model_name": Path(model_path).name,
-                "model_layer_sizes": list(info.layer_sizes),
+                **model_context,
                 "kind": "vnnlib_unsafe",
                 "inputs": {
                     name: {"coeffs": dict(substitutions[name].coeffs),
@@ -1201,6 +1253,16 @@ def run_vnnlib_verification(
 
     # VNNLIB assertion은 unsafe 집합을 나타내므로 SAT이면 반례가 존재한다.
     query = AndProp(nn_property, document.formula)
+
+    def checkpoint_solver_result(verdict):
+        # Save the solver verdict even if feedback rendering is interrupted.
+        # For SAT, the VNNLIB counterexample is still validated below.
+        run_manifest["solver_result"] = verdict.to_dict()
+        run_manifest["phase"] = "FINALIZING"
+        write_atomic_text(run_output_directory / "run_info.json", json.dumps(run_manifest, ensure_ascii=False))
+        if realtime_dashboard_path is not None:
+            publish_dashboard_status(realtime_dashboard_path, "FINALIZING")
+
     try:
         solver_result = dpll_t_detailed(
             query,
@@ -1219,7 +1281,7 @@ def run_vnnlib_verification(
             realtime_tree_output_path=(
                 relu_search_tree_output if realtime_capture_enabled else None
             ),
-            realtime_tree_title=f"ReLU Search Tree: {Path(model_path).name}",
+            realtime_tree_title=f"ReLU Search Tree: {network_label}",
             mechanism_panels=selected_mechanisms,
             realtime_open_view=False,
             realtime_playback_ms=realtime_playback_ms,
@@ -1227,6 +1289,7 @@ def run_vnnlib_verification(
             model_layer_sizes=info.layer_sizes,
             progress=progress,
             reluplex_options=dict(reluplex_options) if reluplex_options else None,
+            result_callback=checkpoint_solver_result,
         )
     finally:
         if progress is not None:
@@ -1235,6 +1298,7 @@ def run_vnnlib_verification(
             progress.close()
     result["solver"] = {
         **solver_result.to_dict(),
+        "variant": solver_variant_name(reluplex_options),
         "max_rounds": max_rounds,
         "timeout_seconds": timeout_seconds,
         "simplex_max_iter": simplex_max_iter,
@@ -1255,6 +1319,8 @@ def run_vnnlib_verification(
             "playback_interval_ms": realtime_playback_ms,
             "window_seconds": realtime_window_seconds,
         }
+        if llm_connection is not None:
+            realtime_result["llm_analysis"] = llm_connection
         if realtime_relu_enabled:
             realtime_result.update({
                 "log_output": realtime_log_output,
@@ -1294,7 +1360,7 @@ def run_vnnlib_verification(
             fig, _ax = draw_split_heatmap(
                 model, split_counts,
                 threshold=split_heatmap_threshold, cap=split_heatmap_cap,
-                title=f"Split heatmap: {Path(model_path).name}",
+                title=f"Split heatmap: {network_label}",
             )
             Path(split_heatmap_output).parent.mkdir(parents=True, exist_ok=True)
             fig.savefig(split_heatmap_output, dpi=150, bbox_inches="tight")
@@ -1313,7 +1379,7 @@ def run_vnnlib_verification(
                 events=split_events,
                 full_history=True,
                 model_layer_sizes=info.layer_sizes,
-                title=f"Full ReLU split feedback: {Path(model_path).name}",
+                title=f"Full ReLU split feedback: {network_label}",
                 round_starts=(None if realtime_relu_enabled else [
                     {"round": event.meta["round_index"],
                      "time_ns": int(event.t_start * 1_000_000_000)}
@@ -1332,7 +1398,7 @@ def run_vnnlib_verification(
                 relu_search_tree_output,
                 overall_status=solver_result.status.value,
                 overall_reason=solver_result.reason,
-                title=f"ReLU Search Tree: {Path(model_path).name}",
+                title=f"ReLU Search Tree: {network_label}",
                 theory_stats=solver_result.theory_stats,
                 mechanism_panels=selected_mechanisms,
                 model_layer_sizes=info.layer_sizes,
@@ -1490,7 +1556,7 @@ def run_vnnlib_verification(
         if custom_visualization_output:
             final_output_directory = run_output_directory
             result["visualization"]["output_directory_is_custom"] = True
-        elif realtime_enabled and open_realtime_view:
+        elif realtime_enabled and (open_realtime_view or dashboard_ready_callback is not None):
             # The browser has already loaded this local HTML URL.  Renaming its
             # parent directory at solver completion invalidates both the page
             # URL and every periodically refreshed image, leaving broken-image
@@ -1520,6 +1586,18 @@ def run_vnnlib_verification(
         result["visualization"]["finished_at"] = visualization_finished_at.isoformat()
         result["result_path"] = str((final_output_directory / "result.json").resolve())
         _write_json_result(result, result["result_path"])
+        run_manifest.update(status=result["status"], phase="COMPLETE", finished_at=visualization_finished_at.isoformat())
+        write_atomic_text(final_output_directory / "run_info.json", json.dumps(run_manifest, ensure_ascii=False))
+        if realtime_dashboard_path is not None:
+            # The browser may have seen the final tree before these plots and
+            # their selection maps were published. Mark completion last.
+            try:
+                relative_dashboard = realtime_dashboard_path.resolve().relative_to(run_output_directory.resolve())
+            except ValueError:
+                final_dashboard = realtime_dashboard_path  # Explicit external output.
+            else:
+                final_dashboard = final_output_directory / relative_dashboard
+            publish_dashboard_status(final_dashboard, solver_result.status.value)
     return result
 
 
@@ -1640,11 +1718,7 @@ def _print_vnnlib_verification(result: Mapping[str, Any]) -> None:
 
 
 def _write_json_result(result: Mapping[str, Any], output_path: str) -> None:
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(result, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    write_atomic_text(output_path, json.dumps(result, ensure_ascii=False, indent=2) + "\n")
 
 
 def _reluplex_options(args: argparse.Namespace) -> Dict[str, Any]:
@@ -1797,7 +1871,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--panels",
         dest="realtime_panels",
         nargs="+",
-        choices=("relu", "dpll-theory", "simplex", "mechanisms"),
+        choices=VERIFICATION_PANELS,
         help="시각화 패널 선택 (realtime/feedback 공통, 기본: 모두). mechanisms: 네 검증 기법 통합 프레임",
     )
     vnnlib_parser.add_argument(

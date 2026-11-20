@@ -1,0 +1,38 @@
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-button,.llm-topic-button{display:inline-flex;align-items:center;justify-content:center;gap:7px;box-sizing:border-box;min-height:38px;border:1px solid #bed1ed;border-radius:999px;padding:8px 16px;font:600 13px/1.35 "Noto Sans KR",sans-serif;white-space:nowrap;text-decoration:none;background:#fff;color:#215aa8;box-shadow:0 2px 5px #091d3b16;transition:background .15s,border-color .15s,box-shadow .15s,transform .15s;cursor:pointer}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-button:hover:not(:disabled),.llm-topic-button:hover{background:#edf5ff;border-color:#86ade5;box-shadow:0 3px 9px #0b3b7b25;transform:translateY(-1px)}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-button:active:not(:disabled),.llm-topic-button:active{transform:translateY(0);box-shadow:0 1px 3px #091d3b18}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-button:focus-visible,.llm-topic-button:focus-visible{outline:3px solid #93c5fd;outline-offset:3px}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-primary{background:linear-gradient(180deg,#2878e9,#1559bd);border-color:#2464c4;color:#fff;box-shadow:0 3px 9px #1263ca35}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-primary:hover:not(:disabled){background:#1558bb;border-color:#104a9d;box-shadow:0 4px 12px #1263ca45}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-button:disabled{opacity:1;background:#e2e8f0;border-color:#cbd5e1;color:#7b8ca4;box-shadow:none;transform:none;cursor:not-allowed}
+.llm-button-icon{width:16px;height:16px;flex:none;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-usage-row{display:flex;align-items:center;flex-wrap:wrap;gap:10px 14px;margin:0 0 12px;font-size:12px;color:#b8c8df}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-quota-link{min-height:30px;padding:5px 10px;font-size:12px;background:#eaf3ff;color:#225cae;border-color:#bad1f1;box-shadow:none}
+.llm-usage-row [data-quota-status]:empty{display:none}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-action-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin:14px 0 10px}
+#llm-analysis-panel .llm-controls.llm-action-row{align-items:center;gap:12px;margin:14px 0 10px}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-buttons{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-report{margin-top:14px;background:#fff;color:#172033;border:1px solid #dbe3ed;border-radius:12px;overflow:hidden;box-shadow:0 8px 24px #0002}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-report-header{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:14px 22px;background:#f8fafc;border-bottom:1px solid #e2e8f0}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-report-title{font-size:15px;font-weight:700;color:#334155}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-result-tag{font-size:12px;font-weight:650;padding:3px 9px;border-radius:20px;background:#e2e8f0;color:#475569}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-result-tag[data-status="complete"]{background:#dcfce7;color:#166534}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-result-tag[data-status="api_error"],:is(#llm-analysis-panel,#verify-batch-analysis) .llm-result-tag[data-status="error"]{background:#fee2e2;color:#991b1b}
+#llm-analysis-panel #llm-copy,#verify-batch-analysis .llm-copy{margin-left:auto;min-height:30px;font-size:12px;padding:5px 11px}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-result{padding:24px 28px;white-space:normal;overflow-wrap:anywhere;font:15px/1.8 "Noto Sans KR",sans-serif;min-height:100px;line-height:1.8}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-result>:first-child{margin-top:0}:is(#llm-analysis-panel,#verify-batch-analysis) .llm-result>:last-child{margin-bottom:0}
+.llm-result h1,.llm-result h2,.llm-result h3,.llm-result h4,.llm-result h5,.llm-result h6{color:#0f172a;line-height:1.45;font-weight:750;margin:26px 0 12px;letter-spacing:-.02em}
+.llm-result h1{font-size:23px}.llm-result h2{font-size:20px;padding-bottom:8px;border-bottom:1px solid #e2e8f0}.llm-result h3{font-size:17px}.llm-result h4,.llm-result h5,.llm-result h6{font-size:15px}
+.llm-result p{margin:10px 0 14px}.llm-result strong{font-weight:750;color:#0f172a}
+.llm-result ul,.llm-result ol{padding-left:25px;margin:10px 0 16px}.llm-result li{padding-left:3px;margin:6px 0}.llm-result li::marker{color:#475569}.llm-result li>ul,.llm-result li>ol{margin:6px 0}
+.llm-result code{font:13px/1.6 "Noto Sans KR",sans-serif;background:#eff4fa;color:#164e63;border:1px solid #e2e8f0;border-radius:4px;padding:2px 5px;white-space:break-spaces}
+.llm-result .llm-code-block{margin:16px 0;border:1px solid #cbd5e1;border-radius:8px;overflow:hidden;background:#f8fafc}
+.llm-result .llm-code-language{font:11px/1.5 "Noto Sans KR",sans-serif;color:#64748b;padding:6px 13px;background:#eef2f6;border-bottom:1px solid #e2e8f0}
+.llm-result pre{margin:0;padding:14px 16px;overflow-x:auto;white-space:pre;background:transparent;color:#1e293b}.llm-result pre code{border:0;padding:0;background:none;color:inherit;white-space:pre}
+.llm-result .llm-table-wrap{margin:16px 0;max-width:100%;overflow-x:auto;border:1px solid #dbe3ed;border-radius:8px}
+.llm-result table{width:100%;border-collapse:collapse;font-size:14px;line-height:1.65}.llm-result th,.llm-result td{padding:10px 14px;border-bottom:1px solid #e2e8f0;vertical-align:top;min-width:90px}
+.llm-result th{background:#f1f5f9;color:#334155;font-weight:700}.llm-result tbody tr:nth-child(even){background:#f8fafc}.llm-result tbody tr:last-child td{border-bottom:0}
+.llm-result blockquote{margin:16px 0;padding:10px 16px;border-left:4px solid #38bdf8;background:#f0f9ff;color:#334155;border-radius:0 6px 6px 0}.llm-result blockquote p{margin:4px 0}
+.llm-result hr{height:0;border:0;border-top:1px solid #e2e8f0;margin:24px 0}.llm-result a{color:#0369a1;text-decoration:underline;text-underline-offset:3px}
+.llm-result .llm-citation{display:inline-block;max-width:100%;font:11px/1.65 "Noto Sans KR",sans-serif;color:#0369a1;background:#e0f2fe;border-radius:4px;padding:1px 5px;vertical-align:baseline;overflow-wrap:anywhere}
+@media(max-width:650px){:is(#llm-analysis-panel,#verify-batch-analysis) .llm-result{padding:18px 16px;font-size:14px}:is(#llm-analysis-panel,#verify-batch-analysis) .llm-report-header{padding:12px 16px}.llm-result th,.llm-result td{padding:8px 10px}}

@@ -5,6 +5,12 @@ import argparse
 from pathlib import Path
 
 from visualization.RealtimeSplitVisualization import replay_split_log
+from visualization.VisualizationMode import (
+    DEFAULT_OUTPUT_ROOT,
+    LOG_DIRECTORY,
+    REALTIME_DIRECTORY,
+    resolve_visualization_output,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,12 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    log_path = Path(args.log)
-    output_path = (
-        Path(args.output)
-        if args.output
-        else log_path.with_name(f"{log_path.stem}_replay.png")
-    )
+    log_path = resolve_visualization_output(Path(args.log))
+    image_directory = log_path.parent
+    if image_directory.name == LOG_DIRECTORY and log_path.resolve().is_relative_to(DEFAULT_OUTPUT_ROOT.resolve()):
+        image_directory = image_directory.parent / REALTIME_DIRECTORY
+    output_path = Path(args.output) if args.output else image_directory / f"{log_path.stem}_replay.png"
     image_path, live_view_path = replay_split_log(
         log_path,
         output_path,

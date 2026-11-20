@@ -16,12 +16,14 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from visualization.NetworkLayout import parse_neuron_var
 from visualization.AtomicFile import write_atomic_text
+from visualization.Fonts import apply_web_font
 from visualization.LiveSnapshot import initial_page_data
 from visualization.SolveTrace import SolveTrace, TraceEvent
 from visualization.SolverMechanisms import mechanism_report_path, write_solver_mechanisms_html
 
 
-_TREE_SCRIPT = Path(__file__).with_name("ReluSearchTreeClient.js").read_text(encoding="utf-8")
+_TREE_SCRIPT = (Path(__file__).with_name("AssetRefresh.js").read_text(encoding="utf-8") + "\n" +
+                Path(__file__).with_name("ReluSearchTreeClient.js").read_text(encoding="utf-8"))
 _TREE_STYLES = Path(__file__).with_name("ReluSearchTree.css").read_text(encoding="utf-8")
 
 
@@ -440,7 +442,7 @@ def write_relu_search_tree_html(
     data = data.replace("</", "<\\/")
     script = _TREE_SCRIPT.replace("__DATA__", data)
     document = _HTML.replace("__SCRIPT__", script).replace("__STYLES__", _TREE_STYLES).replace("__TITLE__", escape(title))
-    return write_atomic_text(output_path, document)
+    return write_atomic_text(output_path, apply_web_font(document, output_path))
 
 
 def branch_log_path(split_log_path: str | Path) -> Path:

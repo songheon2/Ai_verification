@@ -3,6 +3,10 @@ from contextlib import contextmanager
 from functools import wraps
 from threading import Condition
 
+from visualization.Fonts import configure_matplotlib_fonts
+
+configure_matplotlib_fonts()
+
 
 _condition = Condition()
 _next_ticket = 0

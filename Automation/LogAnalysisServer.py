@@ -190,13 +190,10 @@ class AnalysisApp:
         try:
             selected = ScopedIndex(index, scope)
             summary = selected.summary()
-            focus = ("선택 목록의 항목들을 함께 분석·비교하되 선택하지 않은 항목으로 논점을 바꾸지 마세요. " if "selections" in scope
-                     else "이 항목에 답하고 다른 항목으로 논점을 바꾸지 마세요. ")
-            prompt = (f"사용자 질문: {question.strip() or '선택 항목의 병목 원인과 그 근거를 분석해 주세요.'}\n"
-                      f"분석 범위: {json.dumps(scope, ensure_ascii=False)}. {focus}"
-                      "기록은 snapshot 시점에 고정되어 있습니다. 실행 중이면 최종 판정이나 완료 시간을 추측하지 마세요. "
-                      "관련 기록이 없어도 저장 설정과 제공된 구현 참고 설명으로 답할 수 있는 부분은 답하세요. "
-                      "원인 질문에는 수치 나열을 넘어 비교 지표와 구현 기전으로 설명하고 확인 사실과 가설을 구분하세요.")
+            prompt = (f"{question.strip() or '선택 항목의 병목 원인과 근거를 분석해 주세요.'}\n"
+                      f"분석 범위 {json.dumps(scope, ensure_ascii=False)}")
+            if "selections" in scope:
+                prompt += "\n선택한 항목을 함께 분석해 주세요."
             client = self._job_client(model, progress, thinking_level)
             client.request_progress = request_progress
             result = analyze({"run": selected}, client, prompt, self.max_calls, selected_items=selected_items,
@@ -301,6 +298,8 @@ def make_server(app, port=0):
                 elif path == "api/verify-saved-analyses" and app.verification is not None:
                     self.send(app.verification.saved_analyses(query.get("id", [None])[0],
                                                               query.get("run_id", [None])[0]))
+                elif path == "api/verify-saved-runs" and app.verification is not None:
+                    self.send(app.verification.saved_verifications())
                 elif path == "api/verify-catalog" and app.verification is not None:
                     self.send({**app.verification.catalog(query.get("group", [None])[0]), "csrf": app.csrf,
                                "batch_analysis_available": app.batch_analysis_available})

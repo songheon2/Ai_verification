@@ -84,8 +84,8 @@ def picker_markup(*, standalone=False):
 #verify-picker .verify-history th{background:#1e3049;font-weight:650}
 #verify-picker .verify-history tr:last-child td{border-bottom:0}
 #verify-picker .verify-history td:last-child{text-align:right;font-variant-numeric:tabular-nums}
-#verify-picker .verify-history td[data-verdict="VERIFIED"]{color:#86efac}
-#verify-picker .verify-history td[data-verdict="COUNTEREXAMPLE"],#verify-picker .verify-history td[data-verdict="오류"]{color:#fca5a5}
+#verify-picker .verify-history td:is([data-verdict="VERIFIED"],[data-verdict="UNSAT"]){color:#86efac}
+#verify-picker .verify-history td:is([data-verdict="COUNTEREXAMPLE"],[data-verdict="SAT"],[data-verdict="오류"]){color:#fca5a5}
 #verify-picker .verify-history td[data-verdict="TIMEOUT"],#verify-picker .verify-history td[data-verdict="UNKNOWN"]{color:#fcd34d}
 @media(max-width:420px){#verify-picker .verify-settings-grid{grid-template-columns:minmax(0,1fr)}}
 #verify-batch-analysis{grid-column:1/-1;min-width:0;border-top:1px solid #475569;margin-top:8px;padding-top:12px}
@@ -116,14 +116,14 @@ def picker_markup(*, standalone=False):
 </style>
 <form>
 ''' + _catalog_combobox("group", "벤치마크") + _catalog_combobox("model", "신경망") + _catalog_combobox("property", "VNNLIB 속성") + r'''
-  <label>검증 엔진<select name="engine" required></select></label>
-  <label>제한 시간(초)<input name="timeout" type="number" min="1" max="43200" step="1" value="670" required></label>
+  <label>검증 엔진<select name="engine" required></select><small id="verify-engine-status" hidden></small></label>
+  <label>제한 시간(초)<input name="timeout" type="number" min="1" max="43200" step="1" value="600" required></label>
   <details class="verify-settings" open>
     <summary>시각화 설정</summary>
     <div class="verify-settings-grid">
       <label class="verify-wide">모드<select name="visualization_mode">
-        <option value="both" selected>실시간 + 피드백</option>
-        <option value="realtime">실시간</option>
+        <option value="both">실시간 + 피드백</option>
+        <option value="realtime" selected>실시간</option>
         <option value="feedback">피드백</option>
         <option value="off">시각화 없음</option>
       </select></label>
@@ -146,6 +146,7 @@ def picker_markup(*, standalone=False):
       <label>최대 DPLL 라운드<input type="number" name="max_rounds" min="1" max="2147483647" step="1" value="10000" required></label>
       <label>최대 ReLU 재귀 깊이<input type="number" name="max_recursion" min="1" max="2147483647" step="1" value="500" required></label>
       <label>외부 엔진 LP 모드<select name="lp_mode"><option value="core" selected>Core</option><option value="oracle">Oracle</option></select></label>
+      <label class="verify-check verify-wide"><input type="checkbox" name="fix_python_hash_seed" checked>Python 해시 시드 고정 (0)</label>
       <fieldset class="verify-wide">
         <legend>Reluplex 기법</legend>
         <div class="verify-checks">
@@ -188,6 +189,11 @@ def picker_markup(*, standalone=False):
           ''' + analysis_usage_markup("llm-batch") + r'''
         </details>
         <p class="llm-state" data-followup-source hidden></p>
+        <details class="llm-status-details" data-saved-runs-picker>
+          <summary>저장된 검증 실행</summary>
+          <select aria-label="분석할 저장 실행" data-saved-runs multiple size="4" style="width:100%"></select>
+          <div class="llm-state" data-saved-runs-status aria-live="polite"></div>
+        </details>
         <label class="llm-question-field">질문<textarea maxlength="2000" placeholder="예: 이 검증기의 구조와 검증 흐름을 설명해 주세요."></textarea></label>
         <div class="llm-action-row">
           <label class="llm-consent"><input type="checkbox">질문·답변과 분석에 필요한 자료를 Google에 전송하는 데 동의합니다</label>
@@ -257,6 +263,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
   const fields = form.elements;
   const button = form.querySelector('[type="submit"]');
   const status = form.querySelector('[role="status"]');
+  const engineStatus = form.querySelector('#verify-engine-status');
   const queueButton = form.querySelector('[data-queue]');
   const stopButton = form.querySelector('[data-stop]');
   const shutdownButton = form.querySelector('[data-shutdown]');
@@ -281,6 +288,9 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
   const savedTitle = analysis.querySelector('[data-saved-title]');
   const analyzeButton = analysis.querySelector('[data-analyze]');
   const analysisQuestion = analysis.querySelector('textarea');
+  const savedRunsPicker = analysis.querySelector('[data-saved-runs-picker]');
+  const savedRuns = savedRunsPicker.querySelector('[data-saved-runs]');
+  const savedRunsStatus = savedRunsPicker.querySelector('[data-saved-runs-status]');
   const defaultQuestionPlaceholder = analysisQuestion.placeholder;
   const runQuestionPlaceholder = '비워두면 전체 실행의 공통 패턴과 성능 차이를 분석합니다.';
   const consent = analysis.querySelector('input');
@@ -295,6 +305,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
   const readSettings = () => ({
     visualization_mode:fields.visualization_mode.value, panels:checkedValues(panelChecks),
     lp_mode:fields.lp_mode.value,
+    fix_python_hash_seed:fields.fix_python_hash_seed.checked,
     features:checkedValues(featureChecks),
     under_approx_eps:fields.under_approx_eps.valueAsNumber > 0 ? fields.under_approx_eps.valueAsNumber : 0.1,
     ...Object.fromEntries(numberSettings.map(name => [name, fields[name].valueAsNumber])),
@@ -314,6 +325,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
   let followupPending = false;
   let activeAnalysisTab = 0, currentAnalysis = {status:'idle'}, savedAnalysis = null;
   let savedGroups = new Map();
+  let selectedSavedRuns = [];
   let singleId = null;
   let activeRunId = null, stopPending = false, stopping = false;
   let launcherClosed = false;
@@ -334,6 +346,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     form.querySelector('[data-visualization-panels]').disabled = settings.visualization_mode === 'off';
     form.querySelector('[data-panels-required]').hidden = settings.visualization_mode === 'off' || settings.panels.length > 0;
     fields.lp_mode.disabled = fields.engine.value === 'native';
+    engineStatus.hidden = fields.engine.value !== 'glpk' || !engineStatus.textContent;
     fields.under_approx_eps.disabled = !settings.features.includes('underapprox');
     const valid = Boolean(fields.model.value && fields.property.value && fields.engine.value
       && fields.timeout.validity.valid && validSettings(settings));
@@ -343,7 +356,9 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     stopButton.disabled = !activeRunId || !running || stopping || stopPending;
     batchModel.disabled = !analysisAvailable || analysisRunning;
     batchEffort.disabled = batchModel.disabled || !batchModel.value;
-    analyzeButton.disabled = !analysisAvailable || (!overviewMode && !analysisReady) || (overviewMode && running)
+    const usingSavedRuns = savedRunsPicker.open && selectedSavedRuns.length > 0;
+    analyzeButton.disabled = !analysisAvailable || (!usingSavedRuns && !overviewMode && !analysisReady)
+      || ((overviewMode || usingSavedRuns) && running)
       || analysisRunning || analysisSubmitting || followupPending
       || !consent.checked || !batchModel.value;
     analyzeButton.textContent = !followupSource.hidden ? '이어서 질문하기' : overviewMode ? '질문하기'
@@ -352,6 +367,36 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     if (followupButton) followupButton.disabled = !csrf || !savedSelect.value || running || analysisRunning || followupPending;
     copyButton.disabled = !reportSource || activeAnalysisTab === 0 && analysisRunning;
   };
+  function clearSavedRuns() {
+    selectedSavedRuns = [];
+    savedRuns.selectedIndex = -1;
+  }
+  savedRuns.addEventListener('change', () => {
+    if (savedRunsPicker.open) {
+      selectedSavedRuns = Array.from(savedRuns.selectedOptions, option => option.value);
+      enabled();
+    }
+  });
+  savedRunsPicker.addEventListener('toggle', async () => {
+    if (!savedRunsPicker.open) {
+      clearSavedRuns();
+      enabled();
+      return;
+    }
+    if (!csrf) return;
+    try {
+      const {runs} = await api('verify-saved-runs');
+      if (!savedRunsPicker.open) return;
+      const selected = new Set(selectedSavedRuns);
+      options(savedRuns, runs);
+      for (const option of savedRuns.options) option.selected = selected.has(option.value);
+      selectedSavedRuns = Array.from(savedRuns.selectedOptions, option => option.value);
+      savedRunsStatus.textContent = runs.length ? '' : '저장된 검증 실행이 없습니다.';
+      enabled();
+    } catch (error) {
+      savedRunsStatus.textContent = error.message;
+    }
+  });
   function setAnalysisTag(state) {
     const labels = {idle:'대기', running:'분석 중', complete:'완료', incomplete:'일부 답변', error:'오류'};
     analysisTag.dataset.status = state;
@@ -562,12 +607,14 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
         if (!row) {
           row = runHistory.insertRow();
           for (let i = 0; i < 5; i++) row.insertCell();
-          row.cells[0].textContent = historyDate.format(new Date(run.started_at));
           row.cells[1].textContent = run.model;
           row.cells[2].textContent = run.property;
           historyRows.set(run.number, row);
         }
-        const result = run.result || ({running:'실행 중', cancelled:'중단', error:'오류'}[run.status] || '—');
+        row.cells[0].textContent = historyDate.format(new Date(run.decided_at || run.started_at));
+        row.cells[0].title = run.decided_at ? '판정 시각' : '실행 시작 시각';
+        const result = run.result || (run.finalizing ? '판정 정리 중' :
+          ({running:'실행 중', cancelled:'중단', error:'오류'}[run.status] || '—'));
         row.cells[3].textContent = result;
         row.cells[3].dataset.verdict = result;
         row.cells[4].textContent = run.elapsed_seconds.toFixed(1) + '초';
@@ -715,6 +762,8 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
       if (launcherClosed) return;
       clearTimeout(batchPollTimer);
       batchId = activeRunId = id;
+      clearSavedRuns();
+      savedRunsPicker.open = false;
       analysisRevision++;
       analysisReady = false;
       currentAnalysis = {status:'idle'};
@@ -785,6 +834,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
       setCatalog('group', data.groups, data.preferences?.group);
       const labels = {glpk:'GLPK',native:'자체 Simplex',z3:'Z3'};
       options(fields.engine, data.engines.map(id => ({id,label:labels[id]})));
+      engineStatus.textContent = data.glpk_error ? 'GLPK를 불러올 수 없습니다. ' + data.glpk_error : '';
       status.textContent = '';
       const previous = data.preferences || {};
       restore(fields.engine, previous.engine);
@@ -792,6 +842,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
       const settings = previous.settings || {};
       restore(fields.visualization_mode, settings.visualization_mode);
       restore(fields.lp_mode, settings.lp_mode);
+      if (typeof settings.fix_python_hash_seed === 'boolean') fields.fix_python_hash_seed.checked = settings.fix_python_hash_seed;
       if (Array.isArray(settings.panels)) panelChecks.forEach(input => {input.checked = settings.panels.includes(input.value);});
       if (Array.isArray(settings.features)) featureChecks.forEach(input => {input.checked = settings.features.includes(input.value);});
       [...numberSettings, 'under_approx_eps'].forEach(name => {
@@ -890,11 +941,13 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
       stopping = state.status === 'stopping';
       running = state.status === 'running' || stopping;
       batchComplete = state.status === 'complete' || state.status === 'cancelled';
+      overviewMode = Boolean(state.overview);
       analysisReady = state.analysis_ready;
       status.textContent = stopping ? '검증을 중단하고 있습니다.' : running
         ? '대기열 순서대로 검증 중입니다.'
         : !state.runs.length && (overviewMode || state.followup_source) ? ''
-        : (state.status === 'cancelled' ? '연속 검증 중단' : '연속 검증 종료')
+        : (state.saved_run_analysis ? '저장된 검증 실행' : state.session ? '이번 세션 검증'
+          : state.status === 'cancelled' ? '연속 검증 중단' : '연속 검증 종료')
           + ' · ' + state.runs.length + '건' + (state.save_error ? ' · ' + state.save_error : '');
       if (analysisReady && !overviewMode) loadModels();
       if (updatingAnalysis && !analysisSubmitting && revisionAtRequest === analysisRevision) {
@@ -938,7 +991,8 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     const model = batchModel.value;
     try {
       const job = await api('verify-batch-analysis', {id:batchId, consent:consent.checked,
-        question:analysisQuestion.value, model, thinking_level:batchEffort.value});
+        question:analysisQuestion.value, model, thinking_level:batchEffort.value,
+        saved_runs:savedRunsPicker.open ? selectedSavedRuns : []});
       batchId = job.id;
     } catch (error) {
       currentAnalysis = {status:'error'};
@@ -969,9 +1023,10 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
       stopping = state.status === 'stopping';
       running = state.status === 'running' || stopping;
       status.textContent = running ? (stopping ? '검증을 중단하고 있습니다.'
+        : state.phase === 'finalizing' ? '판정을 정리하고 있습니다.'
         : state.phase === 'running' ? '검증 실행 중입니다.' : '검증을 준비하고 있습니다.') + note
         : state.status === 'cancelled' ? '검증 중단됨'
-        : state.status === 'complete' ? '검증 종료 · ' + state.verdict : (state.error || '검증 실행 실패');
+        : state.status === 'complete' ? '검증 종료 · ' + (state.verification_status || state.verdict) : (state.error || '검증 실행 실패');
     } catch (error) {
       if (launcherClosed) return;
       status.textContent = '상태 조회 실패 · ' + error.message;
@@ -993,6 +1048,8 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
       const data = selection();
       await saving;
       if (launcherClosed) return;
+      clearSavedRuns();
+      savedRunsPicker.open = false;
       if (draft.length) {
         const job = await api('verify-batch', {runs:draft.map(entry => entry.choice)});
         batchId = job.id;
@@ -1009,6 +1066,10 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
         return;
       }
       const job = await api('verify-start', data);
+      clearTimeout(batchPollTimer);
+      batchId = null;
+      overviewMode = true;
+      followupSource.hidden = true;
       singleId = job.id;
       activeRunId = singleId;
       enabled();

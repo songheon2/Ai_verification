@@ -26,6 +26,7 @@ class SolverResult:
     # 이론 솔버가 남긴 부가 정보 (예: recursion_limit_hits).
     # UNKNOWN 사유가 TIMEOUT으로 뭉뚱그려질 때 진짜 병목을 구분하는 용도.
     theory_stats: Dict[str, Any] = field(default_factory=dict)
+    round_details: list[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -34,6 +35,7 @@ class SolverResult:
             "rounds": self.rounds,
             "elapsed_seconds": self.elapsed_seconds,
             "theory_stats": dict(self.theory_stats),
+            "round_details": list(self.round_details),
         }
 
 

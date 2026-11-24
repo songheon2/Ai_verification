@@ -8,12 +8,38 @@ from unittest.mock import patch
 from Automation.SolverStatus import SolverLimitReached
 from Reluplex import reluplex
 from visualization.SolverProgress import (
-    SolverProgressLogger, SolverProgressPanelVisualizer,
+    SolverProgressLogger, SolverProgressPanelVisualizer, SolverProgressReader,
     build_solver_feedback, draw_simplex_panel, read_solver_progress,
 )
 
 
 class ExternalLpProgressTests(unittest.TestCase):
+    def test_realtime_progress_reader_matches_full_replay_across_updates_and_reset(self):
+        with tempfile.TemporaryDirectory() as directory, patch("visualization.SolverProgress.time_ns") as now:
+            path = Path(directory) / "progress.jsonl"
+            reader = SolverProgressReader(path)
+            now.return_value = 2_000_000_000
+            self.assertEqual(reader.read(), build_solver_feedback([]))
+            path.write_bytes(b'{"event":"round_start","round":1,"time_ns":1000000000}\n'
+                             b'{"event":"simplex_start","round":1,"call_id":"c1","time_ns":1500000000}\n')
+            running = reader.read()
+            self.assertEqual(running, build_solver_feedback(read_solver_progress(path)))
+            with path.open("ab") as stream:
+                stream.write(b'{"event":"simplex_end","call_id":"c1",')
+            now.return_value = 3_000_000_000
+            self.assertEqual(reader.read()["simplex_calls"][0]["duration_seconds"], 1.5)
+            with path.open("ab") as stream:
+                stream.write(b'"duration_seconds":1.2,"result":"SAT","iterations":3}\n'
+                             b'{"event":"round_end","round":1,"result":"THEORY_SAT","simplex_calls":1}\n')
+            self.assertEqual(reader.read(), build_solver_feedback(read_solver_progress(path)))
+            self.assertEqual(running["simplex_calls"][0]["result"], "RUNNING")
+            path.write_bytes(b'{"event":"round_start","round":2,"time_ns":2500000000}\n' + b'\n' * 512)
+            self.assertEqual(reader.read(), build_solver_feedback(read_solver_progress(path)))
+            replacement = path.with_name("next.jsonl")
+            replacement.write_bytes(b'{"event":"round_start","round":3,"time_ns":2500000000}\n')
+            replacement.replace(path)
+            self.assertEqual(reader.read(), build_solver_feedback(read_solver_progress(path)))
+
     def test_simplex_panel_labels_follow_the_reported_engine_and_metric(self):
         from matplotlib import pyplot as plt
 

@@ -225,7 +225,7 @@ class LiveRunIndex(RunIndex):
             self.identity = self.fingerprint + ":" + str(self.generation)
             self.state = {"identity": self.identity, "time_ns": stamp, "context_source": context_source,
                           "captured_at": datetime.fromtimestamp(stamp / 1e9, timezone.utc).isoformat(),
-                          "finished": bool(result) or manifest.get("status") == "CANCELLED",
+                          "finished": bool(result) or manifest.get("status") in {"CANCELLED", "ERROR"},
                           "status": self.result.get("status") or "RUNNING",
                           "indexed_records": self.records, "source_bytes": sum(n for n, _ in limits.values()),
                           "indexed_bytes": sum(s["offset"] for s in self.states.values()),

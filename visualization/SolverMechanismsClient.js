@@ -162,10 +162,7 @@
     const heading = document.createElement('div'); heading.className='chart-title'; heading.textContent=title;
     const svg=svgElement('svg',{viewBox:'0 0 560 230',role:'img','aria-label':title});
     host.append(heading,svg);
-    const view={host,svg};
-    host.style.cursor='pointer';
-    host.onclick=()=>selectForAnalysis(['bounds','backjump','numeric','underapprox'][index],view.record,title,view.detail||card.querySelector('.value').textContent);
-    return view;
+    return {host,svg,title,mechanism:panelNames[index]};
   }
   function emptyChart(view, message) {
     view.svg.remove();
@@ -256,12 +253,15 @@
     rows.forEach((row,index)=>{
       const y=45+index*86, [lo,hi]=row.values;
       view.svg.append(svgElement('text',{x:0,y:y+5,fill:'#334155'},row.label));
+      const marks=svgElement('g');
       const line=svgElement('line',{x1:lo==null?145:x(lo),x2:hi==null?535:x(hi),y1:y,y2:y,stroke:row.color,'stroke-width':10,'stroke-linecap':'round'});
-      line.append(svgElement('title',{},`${row.label} ${interval(row.values)}`));view.svg.append(line);
+      marks.append(svgElement('title',{},`${row.label} ${interval(row.values)}`),line);
       for (const [value,isLower] of [[lo,true],[hi,false]]) {
         const cx=value==null?(isLower?145:535):x(value);
-        view.svg.append(svgElement('circle',{cx,cy:y,r:6,fill:row.color}));
+        marks.append(svgElement('circle',{cx,cy:y,r:6,fill:row.color}));
       }
+      selectable(marks,view.mechanism,view.record,view.title,view.detail);
+      view.svg.append(marks);
       view.svg.append(svgElement('text',{x:340,y:y+34,'text-anchor':'middle',fill:'#475569'},interval(row.values)));
     });
   }
@@ -354,7 +354,16 @@
       const counts=[['LP (선형 제약 문제)',totals.conflict_LP || 0],['경계 유도',totals.conflict_DERIVE || 0],['변수 경계',totals.conflict_BOUNDS || 0]];
       if (!counts.some(item=>item[1])) {emptyChart(view,'충돌·백점프 발생 기록 없음');return;}
       const max=Math.max(...counts.map(item=>item[1]));
-      counts.forEach(([label,count],index)=>{const y=24+index*62,group=svgElement('g');group.append(svgElement('text',{x:0,y:y+22,'font-size':14},label),svgElement('rect',{x:140,y,width:330*count/max,height:30,rx:4,fill:'#7c3aed'}),svgElement('text',{x:550,y:y+22,'text-anchor':'end'},count));selectable(group,'backjump',null,'모순 발생 원인',`${label}: ${count}건`);view.svg.append(group);});
+      counts.forEach(([label,count],index)=>{
+        const y=24+index*62;
+        view.svg.append(svgElement('text',{x:0,y:y+22,'font-size':14},label));
+        if(count){
+          const bar=svgElement('rect',{x:140,y,width:330*count/max,height:30,rx:4,fill:'#7c3aed'});
+          selectable(bar,'backjump',null,'모순 발생 원인',`${label}: ${count}건`);
+          view.svg.append(bar);
+        }
+        view.svg.append(svgElement('text',{x:550,y:y+22,'text-anchor':'end'},count));
+      });
       return;
     }
     const max=Math.max(1,...jumps.flatMap(item=>[item.from_depth,item.target_depth]));
@@ -366,7 +375,7 @@
       const group=svgElement('g');
       selectable(group,'backjump',item,'충돌 분석·백점프',`출발 깊이: ${item.from_depth}\n복귀 깊이: ${item.target_depth}\n원인 깊이: ${(item.cause_depths||[]).join(', ')}`);
       group.append(svgElement('title',{},`D${item.round_index ?? '?'} · #${item.sequence}: 깊이 ${item.from_depth} → ${item.target_depth} · 원인 [${(item.cause_depths || []).join(', ')}]`),svgElement('line',{x1:x,x2:x,y1:from,y2:to,stroke:'#7c3aed','stroke-width':4}),svgElement('circle',{cx:x,cy:from,r:6,fill:'#dc2626'}),svgElement('path',{d:`M ${x} ${to-8} l 7 8 l -7 8 l -7 -8 Z`,fill:'#7c3aed'}));
-      group.append(svgElement('text',{x,y:218,'text-anchor':'middle',fill:'#475569'},'#'+item.sequence));view.svg.append(group);
+      view.svg.append(group,svgElement('text',{x,y:218,'text-anchor':'middle',fill:'#475569'},'#'+item.sequence));
     });
   }
   function logPlot(view, records, series, threshold) {
@@ -385,10 +394,29 @@
     }
     if (finite(threshold)) view.svg.append(svgElement('line',{x1:80,x2:540,y1:y(threshold),y2:y(threshold),stroke:'#dc2626','stroke-dasharray':'6 4'}),svgElement('text',{x:535,y:y(threshold)-8,'text-anchor':'end',fill:'#dc2626'},'M='+number(threshold)));
     series.forEach((item,seriesIndex)=>{
-      const points=records.map((record,index)=>finite(record[item.key])?`${x(index)},${y(record[item.key])}`:null);
       let run=[];
-      const flush=()=>{if(run.length)view.svg.append(svgElement('polyline',{points:run.join(' '),fill:'none',stroke:item.color,'stroke-width':2}));run=[];};
-      points.forEach(point=>{if(point)run.push(point);else flush();});flush();
+      const flush=()=>{
+        if(run.length>1){
+          const samples=run;
+          const line=svgElement('polyline',{
+            points:samples.map(index=>`${x(index)},${y(records[index][item.key])}`).join(' '),
+            fill:'none',stroke:item.color,'stroke-width':2,
+          });
+          line.style.cursor='pointer';
+          line.addEventListener('click',event=>{
+            const matrix=view.svg.getScreenCTM();
+            if(!matrix)return;
+            const local=new DOMPoint(event.clientX,event.clientY).matrixTransform(matrix.inverse());
+            const first=samples[0],last=samples.at(-1);
+            const index=Math.round(first+(last-first)*(local.x-x(first))/(x(last)-x(first)));
+            const record=records[Math.max(first,Math.min(last,index))];
+            selectForAnalysis('numeric',record,'부동소수점 연산',describe(record));
+          });
+          view.svg.append(line);
+        }
+        run=[];
+      };
+      records.forEach((record,index)=>{if(finite(record[item.key]))run.push(index);else flush();});flush();
       records.forEach((record,index)=>{
         if (!finite(record[item.key])) {
           if (record[item.key+'_nonfinite']) {

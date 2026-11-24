@@ -23,6 +23,7 @@ class SimplexDiagnosticTests(unittest.TestCase):
             ("simplex-119", 120, 18, 300, 1), ("other-round", 121, 100, 100, 2)):
             rows.extend([
                 {"event": "simplex_start", "call_id": identifier, "call_number": number,
+                 "time_ns": number * 1_000_000_000,
                  "round": round_id, "depth": 7, "origin": "repair", "row_count": 600, "variable_count": 1292},
                 {"event": "simplex_end", "call_id": identifier, "call_number": number,
                  "result": "SAT", "duration_seconds": seconds, "pivots": pivots,
@@ -34,6 +35,9 @@ class SimplexDiagnosticTests(unittest.TestCase):
             {"event": "simplex_cycle", "call_id": "simplex-119", "iteration": 201},
         ])
         (self.root / "solver_progress.jsonl").write_text("".join(json.dumps(v) + "\n" for v in rows), encoding="utf-8")
+        event = {"event": "relu_mechanism", "kind": "bound_updates", "round_index": 1,
+                 "time_ns": 119_900_000_000, "depth": 7, "source": "search", "changes": [{"variable": "private"}]}
+        (self.root / "relu_events_branches.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
 
     def index(self):
         index = RunIndex(self.root, "run")
@@ -49,6 +53,11 @@ class SimplexDiagnosticTests(unittest.TestCase):
         ratios = diagnostic["comparison"]["target_to_peer_median_ratio"]
         self.assertEqual(ratios["seconds"], 6)
         self.assertEqual(ratios["pivots"], 2)
+        self.assertEqual(diagnostic["comparison"]["distribution"]["iterations"]["median"], 151)
+        self.assertEqual(diagnostic["target"]["prior_mechanisms"], [
+            {"kind": "bound_updates", "seconds_before": 0.1, "source": "search", "depth": 7, "changes": 1},
+        ])
+        self.assertNotIn("private", json.dumps(selected.summary()))
         self.assertEqual(ratios["call_average_seconds_per_pivot"], 3)
         self.assertEqual(ratios["variable_count"], 1)
         self.assertEqual(diagnostic["sampled_bound_selections"], [{"variable": "z1_2", "sampled_selections": 2}])

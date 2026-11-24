@@ -89,6 +89,27 @@ class VisualizationRefreshTests(unittest.TestCase):
         self.assertEqual(self.request('../outside.html', 'HEAD')[0], 403)
 
     @unittest.skipUnless(chromium_path(), 'Chromium is not installed')
+    def test_worker_error_appears_even_when_no_image_was_published(self):
+        dashboard = self.root / 'relu_realtime.html'
+        UnifiedRealtimeDashboard({'simplex': self.root / 'missing.png'}, dashboard,
+                                 managed_completion=True).write()
+        self.advance = lambda: publish_dashboard_status(dashboard, 'ERROR', message='GLPK DLL blocked')
+        self.browser(r'''<script>(async()=>{
+const out=document.createElement('pre');out.id='refresh-test';
+try{
+ await fetch('__test_advance');
+ refresh();
+ for(let i=0;i<200&&!verificationComplete;i++){
+   await fetch('__test_counts');
+   await new Promise(resolve=>setTimeout(resolve,20));
+ }
+ if(!verificationComplete || document.getElementById('status').textContent!=='DONE · ERROR · GLPK DLL blocked')
+   throw Error('the worker error and reason should end refresh');
+ out.textContent='PASS';
+}catch(error){out.textContent='FAIL '+error.message;}document.body.append(out);
+})();</script>''')
+
+    @unittest.skipUnless(chromium_path(), 'Chromium is not installed')
     def test_unchanged_image_skips_download_and_keeps_clicks_through_failed_map_update(self):
         image = self.root / 'plot.svg'
         sidecar = image.with_suffix('.selection.js')
@@ -166,7 +187,8 @@ try{
             if stage[0] == 1:
                 write_frame(1200)
                 sidecar.unlink()
-                publish_dashboard_status(dashboard, 'UNSAT')
+                publish_dashboard_status(dashboard, 'UNSAT', decided_at='2026-11-23T09:04:12+09:00',
+                                         elapsed_seconds=38.42)
             else:
                 write_map()
 
@@ -187,7 +209,10 @@ try{
  assert(!verificationComplete&&image.naturalWidth===1050,'temporarily missing selection map keeps final refresh pending');
  await advance();
  await wait(()=>verificationComplete,'final frame publication');
- assert(image.naturalWidth===1200&&$('status').textContent==='DONE · UNSAT','terminal status follows final frame');
+ assert(image.naturalWidth===1200&&$('status').textContent==='DONE · UNSAT · 38.4초','terminal status follows final frame');
+ const expectedDate=new Intl.DateTimeFormat('sv-SE',{dateStyle:'short',timeStyle:'medium'})
+   .format(new Date('2026-11-23T09:04:12+09:00'));
+ assert($('status').title===expectedDate,'terminal status shows the recorded decision timestamp');
  out.textContent='PASS';
 }catch(error){out.textContent='FAIL '+error.message;}document.body.append(out);
 })();</script>''')

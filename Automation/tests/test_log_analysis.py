@@ -62,32 +62,60 @@ class LogAnalysisTests(unittest.TestCase):
         client = GeminiClient("offline-test-key", "gemini-3.5-flash-lite")
         with patch.object(client, "_post_generation", return_value=answer([{"text": "관찰"}])) as send:
             client.generate([{"role": "user", "parts": [{"text": "분석"}]}])
-        instruction = send.call_args[0][0]["systemInstruction"]["parts"][0]["text"]
-        self.assertIn("시각화 용어에 맞춰", instruction)
-        self.assertIn("Theory Solver Result", instruction)
-        self.assertIn("Repeated bound violations", instruction)
-        self.assertIn("STABLE 확정 뉴런", instruction)
-        self.assertIn("내부 식별자는 본문에 노출하지", instruction)
-        self.assertIn("근거 없이 동일시하지", instruction)
-        self.assertNotIn("반드시 [run_id:파일명:행번호]", instruction)
-        self.assertIn("첫 문장부터 사용자 질문에 대한 결론을 직접 말하세요", instruction)
-        self.assertIn("기록이 부족해 결론을 내릴 수 없으면 그 사실을 첫 문장에 명시", instruction)
-        self.assertIn("지침을 따른다는 선언은 답변에 넣지 마세요", instruction)
-        self.assertIn("한 문장당 한 문단", instruction)
-        self.assertIn("문장이 끝날 때마다 빈 줄을 하나", instruction)
-        self.assertIn("소수점·과학적 표기·파일명·URL의 점", instruction)
-        self.assertNotIn("관찰 사실 / 근거 / 원인 가설 / 한계 및 추가 확인 순으로 작성", instruction)
+            client.summarize_verification_batch([{"status": "complete"}], "비교")
+            client.summarize_verification_batch([], "구조", snapshot={"overview": True})
+        individual, batch, overview = [
+            call.args[0]["systemInstruction"]["parts"][0]["text"] for call in send.call_args_list
+        ]
+        for instruction in (individual, batch, overview):
+            self.assertIn("첫 문장에 질문의 결론", instruction)
+            self.assertIn("문장마다 한 문단", instruction)
+            self.assertIn("소수점, 수식, 표 구조", instruction)
+            self.assertIn("내부 식별자", instruction)
+            for term in ("selected atoms", "BOOLEAN_UNSAT", "GLPK 내부 반복", "ReLUplex", "수정 예산", "과소근사"):
+                self.assertIn(term, instruction)
+        for instruction in (individual, batch):
+            self.assertIn("GLPK", instruction)
+            self.assertIn("누락 항목은 미확인", instruction)
+        for name in ("Theory Solver Result", "Repeated bound violations", "STABLE 확정 뉴런"):
+            self.assertIn(name, individual)
+        self.assertIn("기록된 순번", individual)
+        self.assertIn("시각화 켬·끔", batch)
+        self.assertIn("구조와 흐름", overview)
 
-    def test_last_api_call_also_requests_answer_first_without_reporting_rules(self):
+    def test_last_api_call_asks_for_final_answer_without_repeating_format_rules(self):
         client = FakeClient(answer([{"text": "현재 기록만으로는 원인을 확정할 수 없습니다."}]))
         result = analyze({"run": self.index()}, client, "왜 첫 호출이 오래 걸리나요?", 1)
         self.assertEqual(result["status"], "complete")
         contents, final = client.requests[0]
         self.assertTrue(final)
         instruction = contents[-1]["parts"][0]["text"]
-        self.assertIn("사용자 질문에 대한 결론부터 바로 답하고", instruction)
-        self.assertIn("작성 규칙이나 분석 절차를 소개하지 마세요", instruction)
-        self.assertIn("문장 사이에 빈 줄을 하나", instruction)
+        self.assertEqual(instruction, "확보한 근거로 최종 답변을 작성하세요.")
+
+    def test_batch_retries_token_cutoff_and_preserves_the_configured_thinking_level(self):
+        client = GeminiClient("offline-test-key", thinking_level="medium")
+        client.max_requests = 2
+        cutoff = answer([{"text": "internal", "thought": True}], "MAX_TOKENS")
+        with patch.object(client, "_post_generation", side_effect=[cutoff, answer([{"text": "비교 결과"}])]) as send:
+            self.assertEqual(client.summarize_verification_batch([{"status": "complete"}] * 10, "비교"), "비교 결과")
+        configs = [call.args[0]["generationConfig"] for call in send.call_args_list]
+        self.assertEqual([config["maxOutputTokens"] for config in configs], [16384, 32768])
+        self.assertEqual(configs[0]["thinkingConfig"], configs[1]["thinkingConfig"])
+
+    def test_batch_explains_missing_answer_and_respects_request_budget(self):
+        client = GeminiClient("offline-test-key")
+        client.max_requests = 1
+        for response, reason in (({"promptFeedback": {"blockReason": "SAFETY"}}, "SAFETY"),
+                                 (answer([{"text": "미완성"}], "MAX_TOKENS"), "MAX_TOKENS")):
+            def send_once(_request):
+                client.requests_made += 1
+                return response
+
+            client.requests_made = 0
+            with self.subTest(reason=reason), patch.object(client, "_post_generation", side_effect=send_once) as send:
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    client.summarize_verification_batch([], "질문")
+                send.assert_called_once()
 
     def test_sentence_paragraphs_and_decimal_values_are_preserved_in_results(self):
         text = "현재 기록만으로 누적 오차를 확정할 수 없습니다.\n\n계수는 2.06이고 임계치는 2.71×10⁻¹²입니다."

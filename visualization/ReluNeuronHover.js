@@ -33,18 +33,25 @@
     maps.set(event.data.image, event.data.points);
     if(hovered)showHover(hovered.image,hovered.x,hovered.y);
   });
-  function showHover(image,clientX,clientY) {
-      hovered={image,x:clientX,y:clientY};
-      const box = image.getBoundingClientRect();
+  function pickNeuron(image,clientX,clientY,padding=0) {
+      const box = window.visualizationImageBox?.(image) ?? image.getBoundingClientRect();
       if (!box.width || !box.height) return;
       const x = (clientX - box.left) / box.width, y = (clientY - box.top) / box.height;
       let selected = null, best = Infinity;
-      for (const point of maps.get(image.dataset.reluHoverImage) || []) {
+      const points = maps.get(image.dataset.reluHoverImage) || [];
+      for (let i=points.length-1;i>=0;i--) {
+        const point=points[i];
         const dx = Math.abs(x-point.x), dy = Math.abs(y-point.y);
-        if (dx > Math.max(point.rx, 4/box.width) || dy > Math.max(point.ry, 4/box.height)) continue;
+        if (dx > Math.max(point.rx, padding/box.width) || dy > Math.max(point.ry, padding/box.height)) continue;
+        if(!padding)return point;
         const distance = (dx*box.width)**2+(dy*box.height)**2;
         if (distance < best) {best=distance;selected=point;}
       }
+      return selected;
+  }
+  function showHover(image,clientX,clientY) {
+      hovered={image,x:clientX,y:clientY};
+      const selected=pickNeuron(image,clientX,clientY,4);
       image.removeAttribute('title');
       const label = selected ? `Layer ${selected.layer} · Neuron ${selected.neuron}\n`+
         (selected.roundSplits || []).filter(item=>item.count>0).map(item=>`${item.round==null?'Round 미기록':'R'+item.round} split: ${item.count}회`).join('\n') : '';
@@ -66,13 +73,17 @@
       image.addEventListener('mousemove',event=>queueHover(image,event.clientX,event.clientY),{passive:true});
       image.addEventListener('mouseleave',()=>{if(hovered?.image===image||queuedHover?.image===image)cancelHover();});
       image.addEventListener('pointerdown',event=>{
-        if(event.button===0)presses.set(image,{point:showHover(image,event.clientX,event.clientY),x:event.clientX,y:event.clientY,time:performance.now()});
+        if(event.button===0)presses.set(image,{point:pickNeuron(image,event.clientX,event.clientY),x:event.clientX,y:event.clientY,time:performance.now(),
+          points:maps.get(image.dataset.reluHoverImage)});
       });
       image.addEventListener('pointercancel',()=>presses.delete(image));
       image.addEventListener('click',event=>{
         const press=presses.get(image);presses.delete(image);
         if(press && performance.now()-press.time<2000 && Math.hypot(event.clientX-press.x,event.clientY-press.y)>8)return;
-        const point=press && performance.now()-press.time<2000?press.point:showHover(image,event.clientX,event.clientY);if(!point)return;
+        const clicked=pickNeuron(image,event.clientX,event.clientY);
+        const point=press && performance.now()-press.time<2000
+          ? (press.points!==maps.get(image.dataset.reluHoverImage)||clicked ? press.point : null) : clicked;
+        if(!point)return;
         const text=`ReLU 분기 이력 · Layer ${point.layer} · Neuron ${point.neuron}\n`+
           (point.roundSplits||[]).filter(item=>item.count>0).map(item=>`${item.round==null?'Round 미기록':'R'+item.round} split: ${item.count}회`).join('\n');
         window.dispatchEvent(new CustomEvent('log-analysis-select',{detail:{scope:{topic:'relu',layer:point.layer,neuron:point.neuron},text}}));

@@ -8,6 +8,28 @@ from Automation.LpTelemetry import metric_available
 
 
 PROFILE_LIMIT = 20000
+MECHANISM_KINDS = ("bound_updates", "bounds", "conflict", "backjump", "repair")
+
+
+def attach_prior_mechanisms(profiles, events):
+    """Attach only timing and counts, with no raw events from outside the selection."""
+    events = iter(events)
+    event = next(events, None)
+    latest = {}
+    for profile in sorted(profiles, key=lambda p: p.get("start_ns") or 0):
+        start = profile.get("start_ns")
+        if start is None or profile.get("round") is None:
+            continue
+        while event is not None and event["time_ns"] <= start:
+            latest.setdefault(event.get("round_index", event.get("round")), {})[event["kind"]] = event
+            event = next(events, None)
+        nearby = latest.get(profile["round"], {})
+        profile["prior_mechanisms"] = [
+            {"kind": kind, "seconds_before": round((start - item["time_ns"]) / 1e9, 6),
+             "source": item.get("source"), "depth": item.get("depth"),
+             "changes": len(item.get("changes", [])) if kind == "bound_updates" else item.get("changed")}
+            for kind, item in nearby.items() if start - item["time_ns"] <= 10_000_000_000
+        ]
 
 
 def _number(value):
@@ -17,7 +39,7 @@ def _number(value):
         return None
 
 
-def call_profiles(index, args=None, limit=PROFILE_LIMIT):
+def call_profiles(index, args=None, limit=PROFILE_LIMIT, *, include_prior=False):
     args = args or {}
     where, parameters = [], []
     if "call_id" in args:
@@ -47,7 +69,8 @@ def call_profiles(index, args=None, limit=PROFILE_LIMIT):
     profiles = []
     for file, line, call, rnd, depth, duration, pivots, raw, start in rows:
         end = json.loads(raw)
-        metadata = {**(json.loads(start) if start else {}), **end}
+        start_event = json.loads(start) if start else {}
+        metadata = {**start_event, **end}
         profile = {"call_id": call, "round": rnd, "depth": depth,
                    "call_number": metadata.get("call_number") if type(metadata.get("call_number")) is int and metadata["call_number"] > 0 else None,
                    "origin": metadata.get("origin") if isinstance(metadata.get("origin"), str) else None,
@@ -59,13 +82,22 @@ def call_profiles(index, args=None, limit=PROFILE_LIMIT):
                    "metrics_source": metadata.get("metrics_source"),
                    "bound_violation_scope": metadata.get("bound_violation_scope"),
                    "model_validation": metadata.get("model_validation"),
+                   "glpk_profile": metadata.get("glpk_profile"),
+                   "start_ns": start_event.get("time_ns", end.get("start_ns")),
                    "row_count": _number(metadata.get("row_count")),
                    "variable_count": _number(metadata.get("variable_count")),
                    "cycles": _number(metadata.get("cycles")) if metric_available(metadata, "cycles") else None,
                    "result": end.get("result"), "evidence": f"{index.run_id}:{file}:{line}"}
         profile["call_average_seconds_per_pivot"] = (
             profile["seconds"] / profile["pivots"] if profile["seconds"] is not None and profile["pivots"] else None)
+        profile["call_average_seconds_per_iteration"] = (
+            profile["seconds"] / profile["iterations"] if profile["seconds"] is not None and profile["iterations"] else None)
         profiles.append(profile)
+    if include_prior and profiles:
+        marks = ','.join('?' for _ in MECHANISM_KINDS)
+        rows = index.db.execute("SELECT raw FROM events WHERE event='relu_mechanism' AND time_ns IS NOT NULL "
+                                f"AND kind IN ({marks}) ORDER BY time_ns,line", MECHANISM_KINDS)
+        attach_prior_mechanisms(profiles, (json.loads(raw) for raw, in rows))
     return {"profiles": profiles[:limit], "limited": len(profiles) > limit}
 
 
@@ -80,7 +112,8 @@ def diagnose_simplex(index, args=None, reference=None):
     if set(args) - {"run_id", "call_id", "call_number", "round"}:
         raise ValueError("Only Simplex call ID/number and round filters are supported")
     targets = call_profiles(index, args)
-    reference = reference if reference is not None else call_profiles(index)
+    reference = reference if reference is not None else call_profiles(index, include_prior=True)
+    history = {p["evidence"]: p.get("prior_mechanisms") for p in reference["profiles"]}
     selected = sorted(targets["profiles"], key=lambda p: p["seconds"] or 0, reverse=True)[:3]
     comparisons = []
     for target in selected:
@@ -92,8 +125,14 @@ def diagnose_simplex(index, args=None, reference=None):
         group, basis = next(((p, name) for p, name in (
             (matched, "same_round_and_origin"), (same_round, "same_round"),
             (same_origin, "same_origin_across_rounds"), (peers, "indexed_run_completed_calls")) if p), ([], "no_peers"))
-        fields = ("seconds", "pivots", "call_average_seconds_per_pivot", "row_count", "variable_count")
+        target["prior_mechanisms"] = history.get(target["evidence"])
+        fields = ("seconds", "iterations", "pivots", "call_average_seconds_per_iteration",
+                  "call_average_seconds_per_pivot", "row_count", "variable_count")
         distributions = {field: _distribution(group, field) for field in fields}
+        ordered = sorted((p for p in group if p["seconds"] is not None), key=lambda p: p["seconds"])
+        middle = len(ordered) // 2
+        median_peers = [{key: p[key] for key in ("call_number", "seconds", "iterations", "depth")}
+                        for p in ordered[max(0, middle-1):middle+2]]
         ratios = {field: target[field] / distributions[field]["median"]
                   for field in fields if target[field] is not None and distributions[field]["median"]}
         samples = []
@@ -106,7 +145,8 @@ def diagnose_simplex(index, args=None, reference=None):
                                             (target["call_id"],)).fetchone()[0]
         comparisons.append({"target": target,
             "comparison": {"basis": basis, "calls": len(group), "distribution": distributions,
-                           "target_to_peer_median_ratio": ratios, "reference_limited": reference["limited"]},
+                           "target_to_peer_median_ratio": ratios, "median_duration_calls": median_peers,
+                           "reference_limited": reference["limited"]},
             "sampled_bound_selections": samples, "recorded_cycle_events": cycle_events})
     return {"comparisons": comparisons, "selected_call_list_limited": targets["limited"] or len(targets["profiles"]) > 3,
             "interpretation": [

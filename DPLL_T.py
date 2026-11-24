@@ -1,3 +1,4 @@
+from collections import deque
 from time import monotonic
 from typing import Any, Callable, Iterable, List, Dict, Tuple, Optional
 from DPLL import parse_prop, tseitin_cnf, dpll, neg
@@ -91,7 +92,7 @@ def _dpll_t_run(
     profile_stages: bool = False,
     split_logger=None,
     progress=None,
-    round_state: Optional[Dict[str, int]] = None,
+    round_details: Optional[deque] = None,
     reluplex_options: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, float]], SolverStatus, str, int]:
     """
@@ -119,21 +120,26 @@ def _dpll_t_run(
         {"calls": 0, "start": monotonic(), "print_every": 1000} if profile_stages else None
     )
 
+    def finish_round(number, result):
+        if round_details is not None:
+            round_details[-1]["result"] = result
+        if progress is not None:
+            progress.round_end(number, result)
+
     for round_idx in range(max_rounds):
         round_number = round_idx + 1
         with span(trace, "dpll_round_start", round_index=round_number):
             pass
         if split_logger is not None:
             split_logger.round_start(round_number)
-        if round_state is not None:
-            round_state["current"] = round_number
+        if round_details is not None:
+            round_details.append({"round": round_number})
         if progress is not None:
             progress.round_start(round_number)
         check_deadline(deadline)
         model = dpll(cnf, deadline=deadline, trace=trace, profile_state=profile_state)
         if model is None:
-            if progress is not None:
-                progress.round_end(round_number, "BOOLEAN_UNSAT")
+            finish_round(round_number, "BOOLEAN_UNSAT")
             return None, SolverStatus.UNSAT, "BOOLEAN_UNSAT", round_number
 
         active_ineqs = []
@@ -195,11 +201,13 @@ def _dpll_t_run(
 
         if progress is not None:
             progress.theory_selection(round_number, selected_theory_atoms)
+        if round_details is not None:
+            round_details[-1].update(selected_inequalities=len(active_ineqs), selected_relus=len(active_relus))
 
         if not active_ineqs and not active_relus:
             if progress is not None:
                 progress.theory_result(round_number, "THEORY_TRIVIAL")
-                progress.round_end(round_number, "THEORY_TRIVIAL")
+            finish_round(round_number, "THEORY_TRIVIAL")
             return {}, SolverStatus.SAT, "THEORY_TRIVIAL", round_number
 
         row_defs, bounds = inequ_list_to_reluplex(active_ineqs)
@@ -239,13 +247,13 @@ def _dpll_t_run(
                                   for item in active_ineqs],
                     relu_count=len(active_relus),
                 )
-                progress.round_end(round_number, "THEORY_SAT")
+            finish_round(round_number, "THEORY_SAT")
             return th_model, SolverStatus.SAT, "THEORY_SAT", round_number
 
         if not active_theory_literals:
             if progress is not None:
                 progress.theory_result(round_number, "THEORY_UNSAT")
-                progress.round_end(round_number, "THEORY_UNSAT")
+            finish_round(round_number, "THEORY_UNSAT")
             return None, SolverStatus.UNSAT, "THEORY_UNSAT", round_number
 
         blocking_clause = [neg(lit) for lit in active_theory_literals]
@@ -256,7 +264,7 @@ def _dpll_t_run(
                 "THEORY_CONFLICT",
                 blocking_clause_size=len(blocking_clause),
             )
-            progress.round_end(round_number, "THEORY_CONFLICT")
+        finish_round(round_number, "THEORY_CONFLICT")
 
     return None, SolverStatus.UNKNOWN, "DPLL_T_ROUND_LIMIT", max_rounds
 
@@ -308,7 +316,7 @@ def dpll_t_detailed(
     # 실시간 모드는 append-only 로그와 update callback을 명시적으로 요청한
     # 실행에서만 켠다. 사후 피드백 visualization은 기존 SolveTrace와
     # SplitHeatmap이 담당하므로 solver 실행 모드로 취급하지 않는다.
-    theory_stats: Dict[str, int] = {}
+    theory_stats: Dict[str, Any] = {"RELU_SPLITS": 0}
     split_logger = None
     visualizer = None
     tree_visualizer = None
@@ -377,7 +385,7 @@ def dpll_t_detailed(
         split_logger.request_update()
 
     started_at = monotonic()
-    round_state = {"current": 0}
+    round_details = deque(maxlen=8)
     deadline = (
         started_at + float(timeout_seconds)
         if timeout_seconds is not None
@@ -397,7 +405,7 @@ def dpll_t_detailed(
                 profile_stages=profile_stages,
                 split_logger=split_logger,
                 progress=progress,
-                round_state=round_state,
+                round_details=round_details,
                 reluplex_options=reluplex_options,
             )
         except SolverLimitReached as exc:
@@ -409,7 +417,9 @@ def dpll_t_detailed(
             # 이론 솔버 안에서 한도에 걸렸어도 그 작업은 현재 활성 DPLL(T)
             # 라운드에서 일어난 것이다. 0을 보고하면 몇 시간짜리 진행이
             # 결과에서 사라진다.
-            rounds = int(round_state["current"])
+            rounds = round_details[-1]["round"] if round_details else 0
+            if round_details:
+                round_details[-1].update(result="UNKNOWN", reason=reason)
         result = SolverResult(
             status=status,
             model=model,
@@ -417,6 +427,7 @@ def dpll_t_detailed(
             rounds=rounds,
             elapsed_seconds=monotonic() - started_at,
             theory_stats=theory_stats,
+            round_details=list(round_details),
         )
         if progress is not None:
             progress.solver_end(

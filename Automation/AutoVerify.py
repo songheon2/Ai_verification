@@ -151,6 +151,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import os
 import shutil
 import time
 import uuid
@@ -865,6 +866,7 @@ def run_vnnlib_verification(
     profile_stages: bool = False,
     reluplex_options: Optional[Mapping[str, Any]] = None,
     run_started_callback: Optional[Callable[[Path], None]] = None,
+    solver_finished_callback: Optional[Callable[[float], None]] = None,
     dashboard_ready_callback: Optional[Callable[[Path], None]] = None,
     dashboard_opener: Optional[Callable[[str], bool]] = None,
 ) -> Dict[str, Any]:
@@ -1026,6 +1028,8 @@ def run_vnnlib_verification(
         run_manifest = {
             "schema_version": 1, "run_id": run_id, "status": "RUNNING", "log_epoch_ns": time.time_ns(),
             "solver_variant": solver_variant_name(reluplex_options),
+            "visualization_mode": effective_visualization.value,
+            "python_hash_seed": os.environ.get("PYTHONHASHSEED"),
             "started_at": visualization_started_at.isoformat(),
             "model": info.to_dict(), "vnnlib": {"path": str(vnnlib_path), "property_name": property_name},
             "solver": {"max_rounds": max_rounds, "timeout_seconds": timeout_seconds,
@@ -1173,6 +1177,7 @@ def run_vnnlib_verification(
         },
         "dry_run": dry_run,
         "visualization": {"mode": effective_visualization.value},
+        "python_hash_seed": os.environ.get("PYTHONHASHSEED"),
     }
     if dry_run:
         result["status"] = "DRY_RUN"
@@ -1260,6 +1265,8 @@ def run_vnnlib_verification(
         # For SAT, the VNNLIB counterexample is still validated below.
         run_manifest["solver_result"] = verdict.to_dict()
         run_manifest["phase"] = "FINALIZING"
+        if solver_finished_callback is not None:
+            solver_finished_callback(verdict.elapsed_seconds)
         write_atomic_text(run_output_directory / "run_info.json", json.dumps(run_manifest, ensure_ascii=False))
         if realtime_dashboard_path is not None:
             publish_dashboard_status(realtime_dashboard_path, "FINALIZING")
@@ -1556,8 +1563,14 @@ def run_vnnlib_verification(
             "자원 한도 때문에 SAT/UNSAT을 확정하지 못했습니다: "
             f"{solver_result.reason}"
         )
+    decided_at = datetime.now().astimezone()
+    result["decided_at"] = decided_at.isoformat()
+    result["verification_status"] = (
+        "TIMEOUT" if result["solver"]["reason"] == "TIMEOUT"
+        else {"COUNTEREXAMPLE": "SAT", "VERIFIED": "UNSAT"}.get(result["status"], result["status"])
+    )
     if run_output_directory is not None:
-        visualization_finished_at = datetime.now().astimezone()
+        visualization_finished_at = decided_at
         if custom_visualization_output:
             final_output_directory = run_output_directory
             result["visualization"]["output_directory_is_custom"] = True
@@ -1602,7 +1615,8 @@ def run_vnnlib_verification(
                 final_dashboard = realtime_dashboard_path  # Explicit external output.
             else:
                 final_dashboard = final_output_directory / relative_dashboard
-            publish_dashboard_status(final_dashboard, solver_result.status.value)
+            publish_dashboard_status(final_dashboard, result["verification_status"],
+                                     decided_at=result["decided_at"], elapsed_seconds=solver_result.elapsed_seconds)
     return result
 
 

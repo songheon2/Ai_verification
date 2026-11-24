@@ -368,7 +368,7 @@ try{
         self.assertEqual(match[1], "PASS")
         self.assertEqual(used, ["gemini-3.8-flash"])
         self.app.verification.start.assert_called_once_with(
-            {"group": "acas", "model": "net", "property": "prop", "engine": "glpk", "timeout": 670})
+            {"group": "acas", "model": "net", "property": "prop", "engine": "glpk", "timeout": 600})
 
     def test_selected_gemini_model_is_frozen_for_the_analysis_job(self):
         chosen = "gemini-3.8-flash"

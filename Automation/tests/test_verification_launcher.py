@@ -15,7 +15,7 @@ from Automation.LogAnalysisServer import make_server
 from Automation.LogAnalysisIndex import live_run_fingerprint
 from Automation.BatchLogSnapshot import summarize_logs
 from Automation.tests.test_reactive_tree_browser import chromium_path
-from Automation.VerificationLauncher import LauncherPage, VerificationLauncher, _worker
+from Automation.VerificationLauncher import LauncherPage, VerificationLauncher, _batch_metrics, _worker
 
 
 class VerificationLauncherTests(unittest.TestCase):
@@ -60,7 +60,15 @@ class VerificationLauncherTests(unittest.TestCase):
 
         self.app.batch_client = Mock(key="test-key", model=DEFAULT_MODEL)
         client = GeminiClient("test-key")
-        result = {"candidates": [{"content": {"parts": [{"text": "DPLL과 ReLUplex로 검증합니다."}]}}]}
+        saved_run = self.workspace / "visualization" / "outputs" / "old-xor" / "result.json"
+        saved_run.parent.mkdir(parents=True)
+        saved_run.write_text(json.dumps({"status": "COUNTEREXAMPLE", "model": {"name": "xor_network.bin"},
+                                         "solver": {"status": "SAT"}}), encoding="utf-8")
+
+        def answer(request):
+            data = json.loads(request["contents"][0]["parts"][0]["text"])
+            return {"candidates": [{"content": {"parts": [{"text": "답변 " + data["question"]}]}}]}
+
         harness = r'''<script>(async()=>{
 const out=document.createElement('pre');out.id='overview-test';
 async function wait(test){for(let i=0;i<200;i++){if(test())return;await new Promise(r=>setTimeout(r,40));}throw Error('timeout');}
@@ -68,16 +76,25 @@ try{
  const panel=document.getElementById('verify-batch-analysis');
  const model=panel.querySelector('[data-batch-model]'), analyze=panel.querySelector('[data-analyze]');
  const report=panel.querySelector('[data-report]'), question=panel.querySelector('textarea');
+ const picker=panel.querySelector('[data-saved-runs-picker]'), savedRuns=picker.querySelector('select');
  await wait(()=>!panel.hidden&&!model.disabled);
  if(analyze.textContent!=='질문하기'||!analyze.disabled)throw Error('label or consent gate');
  await wait(()=>model.value);
  const consent=panel.querySelector('input[type=checkbox]');
  consent.checked=true;consent.dispatchEvent(new Event('change',{bubbles:true}));
- for(const text of ['현재 검증기의 구조는?', '그럼 GLPK의 역할은?']){
+ async function ask(text){
   await wait(()=>!analyze.disabled);
   question.value=text;analyze.click();
-  await wait(()=>report.textContent.includes('DPLL과 ReLUplex로 검증합니다.'));
+  await wait(()=>report.textContent.includes('답변 '+text));
  }
+ picker.open=true;
+ await wait(()=>savedRuns.options.length===1);
+ savedRuns.selectedIndex=0;
+ await ask('현재 검증기의 구조는?');
+ savedRuns.dispatchEvent(new Event('change',{bubbles:true}));
+ await ask('이 저장 실행을 설명해 주세요.');
+ picker.open=false;
+ await ask('그럼 GLPK의 역할은?');
  if(!document.querySelector('[data-runs]').hidden)throw Error('fake run appeared');
  out.textContent='PASS';
 }catch(error){out.textContent='FAIL '+error.message;}document.body.append(out);
@@ -86,7 +103,7 @@ try{
         self.app.dashboard = lambda: page.replace("</body>", harness + "</body>").encode("utf-8")
         with patch("Automation.AnalyzeLogs.GeminiClient", return_value=client), \
                 patch.object(client, "list_models", return_value={"analysis_models": [DEFAULT_MODEL]}), \
-                patch.object(client, "_post_generation", return_value=result) as generate, \
+                patch.object(client, "_post_generation", side_effect=answer) as generate, \
                 patch.object(self.app.verification, "_launch") as launch:
             browser = subprocess.run([
                 chromium_path(), "--headless", "--no-sandbox", "--disable-gpu", "--no-first-run",
@@ -99,9 +116,13 @@ try{
         self.assertIsNotNone(match, dom[-1000:])
         self.assertEqual(match[1], "PASS")
         sent = [json.loads(call.args[0]["contents"][0]["parts"][0]["text"]) for call in generate.call_args_list]
-        self.assertEqual([request["runs"] for request in sent], [[], []])
+        self.assertEqual(sent[0]["runs"], [])
+        self.assertEqual(sent[1]["runs"][0]["model"], "xor_network.bin")
+        self.assertEqual(sent[1]["snapshot"]["run_source"], "saved_runs")
+        self.assertNotIn("session_conversation", sent[1])
+        self.assertEqual(sent[2]["runs"], [])
         self.assertTrue(sent[0]["project_structure"]["verification_flow"])
-        self.assertEqual(sent[1]["session_conversation"][0]["question"], "현재 검증기의 구조는?")
+        self.assertEqual([turn["question"] for turn in sent[2]["session_conversation"]], ["현재 검증기의 구조는?"])
 
     def test_catalog_choice_is_local_and_starts_one_validated_process(self):
         status, page = self.request("")
@@ -130,18 +151,21 @@ try{
             argv = launch.call_args.args[0]
             self.assertEqual(argv[-4:], [str(self.group / "network.onnx"), str(self.group / "prop_3.vnnlib.gz"),
                                          "glpk", "670"])
+            self.assertEqual(launch.call_args.kwargs["env"]["PYTHONHASHSEED"], "0")
             launch.assert_called_once()
 
     def test_launcher_forwards_worker_settings(self):
         choices = self.app.verification.catalog("acas")
-        settings = {"visualization_mode": "off", "panels": [], "max_rounds": 10}
+        settings = {"visualization_mode": "off", "panels": [], "max_rounds": 10, "fix_python_hash_seed": False}
         selection = {"group": "acas", "model": choices["models"][0]["id"],
                      "property": choices["properties"][0]["id"], "engine": "glpk",
                      "timeout": 30, "settings": settings}
-        with patch("Automation.VerificationLauncher.subprocess.Popen") as launch:
+        with patch.dict("os.environ", {"PYTHONHASHSEED": "17"}), \
+                patch("Automation.VerificationLauncher.subprocess.Popen") as launch:
             self.app.verification.start(selection)
         command = launch.call_args.args[0]
         self.assertEqual(json.loads(command[command.index("--worker-settings") + 1]), settings)
+        self.assertNotIn("PYTHONHASHSEED", launch.call_args.kwargs["env"])
 
     def test_session_history_tracks_single_and_batch_without_visualization(self):
         files = self.app.verification.catalog("acas")
@@ -152,8 +176,14 @@ try{
         single.poll.return_value = None
         batch = Mock()
         batch.wait.return_value = 0
+        decided_at = "2026-11-23T14:39:00+09:00"
+        single_log = BytesIO(("VERIFICATION_RESULT " + json.dumps({
+            "verdict": "VERIFIED", "verification_status": "UNSAT", "decided_at": decided_at,
+            "metrics": {"solver": {"elapsed_seconds": 3.24}},
+        })).encode())
+        single_log.state_directory = TemporaryDirectory()
         launch_results = [
-            (single, BytesIO(b'VERIFICATION_RESULT {"verdict":"VERIFIED"}')),
+            (single, single_log),
             (batch, BytesIO(b'VERIFICATION_RESULT {"verdict":"UNKNOWN","metrics":{"solver":{"reason":"TIMEOUT"}}}')),
         ]
 
@@ -169,15 +199,112 @@ try{
             self.assertEqual(first["status"], "running")
             self.assertEqual((first["model"], first["property"]), ("network.onnx", "prop_3.vnnlib.gz"))
             self.assertGreater(history()[0]["elapsed_seconds"], first["elapsed_seconds"])
+            Path(single_log.state_directory.name, "state.json").write_text(json.dumps({
+                "phase": "finalizing", "verification_seconds": 3.24,
+            }), encoding="utf-8")
+            pending = history()[0]
+            self.assertTrue(pending["finalizing"])
+            self.assertEqual(pending["elapsed_seconds"], 3.24)
             single.poll.return_value = 0
             complete = history()[0]
-            self.assertEqual(complete["result"], "VERIFIED")
+            self.assertEqual(complete["result"], "UNSAT")
+            self.assertEqual(complete["decided_at"], decided_at)
+            self.assertEqual(complete["elapsed_seconds"], pending["elapsed_seconds"])
             self.assertEqual(history()[0]["elapsed_seconds"], complete["elapsed_seconds"])
             self.assertEqual(self.request("api/verify-batch", {"runs": [selection]}, self.app.csrf)[0], 202)
             self.app.verification.batch_thread.join(5)
-        self.assertEqual([(run["number"], run["result"]) for run in history()], [(1, "VERIFIED"), (2, "TIMEOUT")])
+        self.assertEqual([(run["number"], run["result"]) for run in history()], [(1, "UNSAT"), (2, "TIMEOUT")])
         reopened = VerificationLauncher(self.workspace, self.root, restore_preferences=False)
         self.assertEqual(reopened.session_history(), {"runs": []})
+
+    def test_analysis_compares_single_session_and_saved_runs_with_or_without_panels(self):
+        verification = self.app.verification
+        files = verification.catalog("acas")
+        selection = {"group": "acas", "model": files["models"][0]["id"],
+                     "property": files["properties"][0]["id"], "engine": "glpk", "timeout": 30}
+        launches = []
+        for mode in ("off", "realtime"):
+            directory = self.workspace / "visualization" / "outputs" / mode
+            directory.mkdir(parents=True)
+            result_path = directory / "result.json"
+            result = {"status": "COUNTEREXAMPLE", "model": {"name": "network.onnx"},
+                      "vnnlib": {"property_name": "prop_3"}, "visualization": {"mode": mode},
+                      "solver": {"status": "SAT", "rounds": 1, "round_details": [{"round": 1, "result": "THEORY_SAT"}],
+                                 "theory_stats": {"LP_CALLS": 3, "RELU_SPLITS": 1, "GLPK_PIVOTS": 6}}}
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            if mode == "realtime":
+                (directory / "solver_progress.jsonl").write_text(
+                    '{"event":"round_end","round":1,"result":"THEORY_SAT"}\n', encoding="utf-8")
+            outcome = {"verdict": result["status"], "result_path": str(result_path), "metrics": _batch_metrics(result)}
+            process = Mock()
+            process.poll.return_value = 0
+            launches.append((process, BytesIO(("VERIFICATION_RESULT " + json.dumps(outcome)).encode())))
+
+        with patch.object(verification, "_launch", side_effect=launches):
+            for mode in ("off", "realtime"):
+                verification.start({**selection, "settings": {"visualization_mode": mode}})
+
+        def compare(launcher, body):
+            client = Mock(model="gemini-3.5-flash-lite", requests_made=1)
+            client.summarize_verification_batch.return_value = "두 실행을 비교했습니다."
+            launched = launcher.start_batch_analysis({**body, "consent": True}, lambda: client)
+            deadline = monotonic() + 4
+            while monotonic() < deadline:
+                state = launcher.batch_status(launched["id"])
+                if state["analysis"]["status"] != "running":
+                    break
+                sleep(0.02)
+            self.assertEqual(state["analysis"]["status"], "complete")
+            self.assertFalse(client.summarize_verification_batch.call_args.kwargs["snapshot"].get("overview"))
+            runs = {run["metrics"]["configuration"]["visualization_mode"]: run
+                    for run in client.summarize_verification_batch.call_args.args[0]}
+            self.assertEqual(set(runs), {"off", "realtime"})
+            self.assertEqual(runs["off"]["metrics"]["recent_dpll_rounds"][0]["result"], "THEORY_SAT")
+            self.assertEqual(runs["off"]["metrics"]["relu_splits"]["total_split_events"], 1)
+            self.assertEqual(runs["off"]["metrics"]["reluplex"]["LP_CALLS"], 3)
+            self.assertEqual(runs["realtime"]["recorded_logs"][0]["recorded_events"], {"round_end": 1})
+            self.assertNotIn("result_path", runs["realtime"])
+
+        compare(verification, {})
+        code, raw = self.request("api/verify-saved-runs")
+        self.assertEqual(code, 200)
+        saved = [item["id"] for item in json.loads(raw)["runs"]]
+        self.assertCountEqual(saved, ["off/result.json", "realtime/result.json"])
+        reopened = VerificationLauncher(self.workspace, self.root, restore_preferences=False)
+        self.assertEqual(reopened.session_history(), {"runs": []})
+        compare(reopened, {"saved_runs": saved})
+        with self.assertRaises(ValueError):
+            reopened.start_batch_analysis({"consent": True, "saved_runs": ["../../result.json"]}, Mock())
+
+    def test_catalog_keeps_glpk_selected_when_import_is_blocked(self):
+        with patch("Automation.VerificationLauncher._glpk_import_error", return_value="DLL blocked"):
+            code, raw = self.request("api/verify-catalog")
+        self.assertEqual(code, 200)
+        data = json.loads(raw)
+        self.assertEqual(data["engines"], ["glpk", "native", "z3"])
+        self.assertEqual(data["glpk_error"], "DLL blocked")
+        with patch("Automation.VerificationLauncher._glpk_import_error", return_value=None):
+            self.assertEqual(json.loads(self.request("api/verify-catalog")[1])["engines"][0], "glpk")
+
+    def test_worker_load_error_finishes_dashboard_and_run_manifest(self):
+        run = self.workspace / "visualization" / "outputs" / "failed-run"
+        run.mkdir(parents=True)
+        dashboard = run / "relu_realtime.html"
+        dashboard.touch()
+        manifest = run / "run_info.json"
+        manifest.write_text('{"status":"RUNNING"}', encoding="utf-8")
+        log = BytesIO((
+            "VERIFICATION_OUTPUT " + json.dumps(str(run)) + "\n"
+            "ImportError: DLL load failed while importing _swiglpk: DLL blocked\n"
+        ).encode())
+        launcher = self.app.verification
+        with patch.object(launcher, "_worker_state", return_value={"dashboard": dashboard}):
+            outcome = launcher._finish_worker(1, log, stopped=False)
+        self.assertEqual(outcome["diagnostic"]["code"], "GLPK_LOAD_ERROR")
+        self.assertEqual(json.loads(manifest.read_text(encoding="utf-8"))["status"], "ERROR")
+        status_script = dashboard.with_suffix(".status.js").read_text(encoding="utf-8")
+        self.assertIn('"ERROR"', status_script)
+        self.assertIn("DLL blocked", status_script)
 
     def test_dashboard_can_be_reopened_during_verification(self):
         files = self.app.verification.catalog("acas")
@@ -355,9 +482,9 @@ try{
             fake_client.summarize_verification_batch.assert_not_called()
             code, accepted = self.request("api/verify-batch-analysis", question, token)
             self.assertEqual(code, 202)
-            self.assertEqual(json.loads(accepted)["request_budget"], {"used": 0, "limit": 1, "remaining": 1})
+            self.assertEqual(json.loads(accepted)["request_budget"], {"used": 0, "limit": 2, "remaining": 2})
             state = wait_for(route, ["analysis", "status"])
-            self.assertEqual(state["analysis"]["request_budget"], {"used": 1, "limit": 1, "remaining": 0})
+            self.assertEqual(state["analysis"]["request_budget"], {"used": 1, "limit": 2, "remaining": 1})
             sent, asked = fake_client.summarize_verification_batch.call_args.args
             self.assertEqual(asked, question["question"])
             self.assertEqual([item["number"] for item in sent], [1, 2])
@@ -580,6 +707,8 @@ try{
  const questionTab=panel.querySelector('#verify-question-tab'), savedTab=panel.querySelector('#verify-saved-tab');
  if(panel.querySelector('#verify-question-panel').hidden||questionTab.getAttribute('aria-selected')!=='true'
    ||!panel.querySelector('#verify-saved-panel').hidden)throw Error('Question tab is not the default');
+ if(f.timeout.value!=='600'||f.visualization_mode.value!=='realtime'||!f.fix_python_hash_seed.checked)
+   throw Error('Verification defaults were not applied');
  const benchmarkSearch=search('group','AC_AS');
  if(matches(benchmarkSearch).length!==1||matches(benchmarkSearch)[0].textContent!=='acas')throw Error('Benchmark search did not filter');
  enter(benchmarkSearch);
@@ -605,6 +734,7 @@ try{
  if(f.model.selectedOptions[0].text!=='network_2.onnx')throw Error('Model search did not select the result');
  select(f.visualization_mode,'off');
  select(f.max_rounds,'50');
+ f.fix_python_hash_seed.click();
  add.click();
  if(form.querySelector('[data-draft]').children.length!==2)throw Error('Draft is missing entries');
  select(f.group,'');
@@ -712,6 +842,7 @@ try{
         settings = [call.args[4] for call in launch.call_args_list]
         self.assertEqual([item["visualization_mode"] for item in settings], ["feedback", "off"])
         self.assertEqual([item["max_rounds"] for item in settings], [25, 50])
+        self.assertEqual([item.get("fix_python_hash_seed", True) for item in settings], [True, False])
         self.assertNotIn("simplex", settings[0]["panels"])
         calls = client.summarize_verification_batch.call_args_list
         self.assertEqual([call.args[1] for call in calls], ["두 실행을 비교해 주세요.", "그때의 병목을 더 설명해 주세요."])
@@ -784,7 +915,7 @@ try{
         args, options = run.call_args
         self.assertEqual(Path(args[0]).name, "network.onnx")
         self.assertEqual(args[1], str(prop))
-        self.assertEqual(options["visualization_mode"], "both")
+        self.assertEqual(options["visualization_mode"], "realtime")
         # 기본값 = 전남대_reluplex 최고 설정의 기법 ①②③ (엔진 쪽은 Reluplex 기본값 glpk-core-basis)
         from Reluplex import feature_options
         self.assertEqual(options["reluplex_options"],

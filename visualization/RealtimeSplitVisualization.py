@@ -11,7 +11,8 @@ import threading
 import uuid
 import warnings
 import webbrowser
-from collections import Counter
+from bisect import bisect_left, bisect_right
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from visualization.RenderLock import serialized_render
 from visualization.Fonts import font_style
-from visualization.ReluNeuronHover import HOVER_SCRIPT, write_relu_hover_map
+from visualization.AppendLogReader import AppendLogReader
+from visualization.ReluNeuronHover import HOVER_SCRIPT, count_round_splits, split_round_boundaries, write_relu_hover_map
 from visualization.AtomicFile import write_atomic_text
 from visualization.ReluSearchTree import branch_log_path
 from visualization.RenderProcess import (
@@ -83,14 +85,90 @@ def read_split_events(path: str | Path) -> List[SplitLogEvent]:
     events: List[SplitLogEvent] = []
     with log_path.open("r", encoding="utf-8") as stream:
         for line_no, line in enumerate(stream, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                events.append(SplitLogEvent.from_dict(json.loads(line)))
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                warnings.warn(f"{log_path}:{line_no}의 잘못된 split 로그를 건너뜁니다")
+            if (event := _parse_split_line(log_path, line_no, line)) is not None:
+                events.append(event)
     return events
+
+
+def _parse_split_line(path, number, line):
+    if not line.strip():
+        return None
+    try:
+        return SplitLogEvent.from_dict(json.loads(line))
+    except (KeyError, TypeError, ValueError):
+        warnings.warn(f"{path}:{number}의 잘못된 split 로그를 건너뜁니다")
+        return None
+
+
+class RealtimeSplitLog:
+    """Keep the complete split counts while plotting a moving time window."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self._reader = AppendLogReader(path)
+        self._reset()
+
+    def _reset(self):
+        self.events = []
+        self.stamps = []
+        self.ordered = True
+        self._open_counts = [0]
+        self._active = {}
+        self._by_neuron = Counter()
+        self._totals = Counter()
+        self.started = 0
+        self._hover_index = 0
+        self._boundaries = ()
+        self._round_counts = defaultdict(Counter)
+
+    def read(self):
+        with self._reader.read() as (reset, lines):
+            if reset:
+                self._reset()
+            for number, line in lines:
+                event = _parse_split_line(self.path, number, line)
+                if event is not None:
+                    self._add(event)
+
+    def _add(self, event):
+        if self.stamps and event.time_ns < self.stamps[-1]:
+            self.ordered = False
+        self.stamps.append(event.time_ns)
+        self.events.append(event)
+        previous = self._active.pop(event.split_id, None)
+        if previous is not None:
+            key = (previous.layer, previous.index)
+            self._by_neuron[key] -= 1
+            if not self._by_neuron[key]:
+                del self._by_neuron[key]
+        opening = event.event == "+"
+        self._open_counts.append(max(0, self._open_counts[-1] + (1 if opening else -1)))
+        if opening:
+            self.started += 1
+            self._active[event.split_id] = event
+            key = (event.layer, event.index)
+            self._by_neuron[key] += 1
+            if None not in key:
+                self._totals[key] += 1
+
+    def neuron_counts(self):
+        active = {key: value for key, value in self._by_neuron.items() if None not in key}
+        return active, self._totals, len(self._active) - sum(active.values())
+
+    def window(self, start, stop):
+        first = bisect_left(self.stamps, start)
+        last = bisect_right(self.stamps, stop)
+        return self._open_counts[first], self.events[first:last]
+
+    def hover_counts(self, round_starts):
+        boundaries = split_round_boundaries(round_starts)
+        if boundaries != self._boundaries:
+            self._boundaries = boundaries
+            self._hover_index = 0
+            self._round_counts = defaultdict(Counter)
+        count_round_splits(self.events[self._hover_index:], boundaries, self._round_counts)
+        self._hover_index = len(self.events)
+        return self._round_counts
 
 
 def split_events_from_trace(trace) -> List[SplitLogEvent]:
@@ -372,29 +450,41 @@ def _draw_realtime_split_history(
     window_seconds: float = 300.0,
     current_time_ns: Optional[int] = None,
     round_starts=(),
+    split_log=None,
 ):
     if window_seconds <= 0:
         raise ValueError("window_seconds는 양수여야 합니다")
     from matplotlib.ticker import MaxNLocator
 
-    active = active_split_events(events)
-    started_count = sum(event.event == "+" for event in events)
-    completed_count = sum(event.event == "-" for event in events)
+    if split_log is None:
+        active_count = len(active_split_events(events))
+        started_count = sum(event.event == "+" for event in events)
+    else:
+        active, _, unknown = split_log.neuron_counts()
+        active_count = sum(active.values()) + unknown
+        started_count = split_log.started
+    completed_count = len(events) - started_count
     ax.clear()
 
     now_ns = time_ns() if current_time_ns is None else int(current_time_ns)
     window_ns = int(window_seconds * 1_000_000_000)
     window_start_ns = now_ns - window_ns
-    count = 0
-    for event in events:
-        if event.time_ns >= window_start_ns:
-            break
-        if event.time_ns <= now_ns:
-            count = count + 1 if event.event == "+" else max(0, count - 1)
+    if split_log is not None and split_log.ordered:
+        count, visible = split_log.window(window_start_ns, now_ns)
+        window_events = visible
+    else:
+        count = 0
+        for event in events:
+            if event.time_ns >= window_start_ns:
+                break
+            if event.time_ns <= now_ns:
+                count = count + 1 if event.event == "+" else max(0, count - 1)
+        window_events = events
+        visible = [event for event in events if window_start_ns <= event.time_ns <= now_ns]
 
     xs = [-window_seconds]
     ys = [count]
-    for event in events:
+    for event in window_events:
         if event.time_ns < window_start_ns:
             continue
         if event.time_ns > now_ns:
@@ -429,7 +519,7 @@ def _draw_realtime_split_history(
     ax.text(
         0.985,
         0.93,
-        f"ACTIVE  {len(active)}",
+        f"ACTIVE  {active_count}",
         transform=ax.transAxes,
         ha="right",
         va="top",
@@ -438,8 +528,7 @@ def _draw_realtime_split_history(
         color=line_color,
     )
     from visualization.AnalysisSelection import split_selection
-    visible = [event for event in events if window_start_ns <= event.time_ns <= now_ns]
-    split_selection(ax, visible, [(event.time_ns - now_ns) / 1_000_000_000 for event in visible], round_starts or ())
+    split_selection(ax, visible, xs, ys, round_starts or ())
     return ax
 
 
@@ -506,7 +595,7 @@ def _draw_full_split_history(
     ax.set_title(title or "Full active split history")
     _draw_round_boundaries(ax, round_starts, first_ns, unit_seconds)
     from visualization.AnalysisSelection import split_selection
-    split_selection(ax, ordered, [(event.time_ns - first_ns) / 1_000_000_000 / unit_seconds for event in ordered], round_starts or ())
+    split_selection(ax, ordered, xs, ys, round_starts or ())
     ax.text(
         0.985,
         0.93,
@@ -559,6 +648,7 @@ def draw_realtime_split_dashboard(
     current_time_ns: Optional[int] = None,
     model_layer_sizes: Optional[Sequence[int]] = None,
     round_starts=None,
+    split_log=None,
 ):
     """시간 이력과 ``(layer, index)``별 활성/누적 split을 함께 그린다."""
     import matplotlib.pyplot as plt
@@ -566,14 +656,16 @@ def draw_realtime_split_dashboard(
     from matplotlib.ticker import MaxNLocator
 
     if events is None:
-        events = read_split_events(path)
+        events = split_log.events if split_log is not None else read_split_events(path)
     if round_starts is None:
         hover_round_starts = read_split_metadata(path).get("round_starts", [])
         if full_history:
             round_starts = hover_round_starts
     else:
         hover_round_starts = round_starts
-    active_counts, total_counts, unknown_active = split_neuron_counts(events)
+    active_counts, total_counts, unknown_active = (
+        split_log.neuron_counts() if split_log is not None else split_neuron_counts(events)
+    )
     fig = plt.figure(figsize=(10.5, 7.2))
     grid = fig.add_gridspec(2, 1, height_ratios=(1.0, 1.65), hspace=0.42)
     history_ax = fig.add_subplot(grid[0, 0])
@@ -593,6 +685,7 @@ def draw_realtime_split_dashboard(
             window_seconds=window_seconds,
             current_time_ns=current_time_ns,
             round_starts=hover_round_starts,
+            split_log=split_log,
         )
 
     observed = sorted(total_counts)
@@ -702,7 +795,9 @@ def draw_realtime_split_dashboard(
         top=0.92,
         bottom=0.12 if model_layer_sizes else 0.09,
     )
-    fig._relu_hover_geometry = (neuron_ax, observed, marker_sizes if observed else [], events, hover_round_starts)
+    fig._relu_hover_geometry = (neuron_ax, observed, points if observed else None, events, hover_round_starts)
+    if split_log is not None:
+        fig._relu_hover_counts = split_log.hover_counts(hover_round_starts)
     return fig, {"history": history_ax, "neurons": neuron_ax}
 
 

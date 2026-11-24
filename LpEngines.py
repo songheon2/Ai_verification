@@ -36,10 +36,11 @@ z3       Z3의 QF_LRA. 계수와 경계를 float 값 그대로의 정확한 유�
 점이 있는가"만 답한다. tableau를 들여다보는 기법(피벗마다 경계 강화, tableau row로
 경계 유도)은 이 방식에서는 쓰지 않는다.
 """
+from contextlib import contextmanager, nullcontext
 from fractions import Fraction
 from math import isfinite
 from threading import current_thread
-from time import monotonic
+from time import monotonic, thread_time
 from typing import Any, Dict, List, Optional, Tuple
 
 from Automation.SolverStatus import SolverLimitReached, check_deadline
@@ -375,6 +376,21 @@ def _set_glpk_row(glp, lp, i: int, terms: List[Tuple[int, float]]) -> None:
     glp.glp_set_mat_row(lp, i, n, ind, val)
 
 
+def _glpk_simplex(owner, parm) -> int:
+    profile = getattr(owner, "_call_profile", None)
+    if profile is None:
+        return owner.glp.glp_simplex(owner.lp, parm)
+    with owner._profile_phase("glpk_solve_seconds"):
+        code = owner.glp.glp_simplex(owner.lp, parm)
+    profile["glpk_invocations"] += 1
+    if code == owner.glp.GLP_EITLIM and parm.it_lim == 1:
+        profile["single_step_limit_returns"] += 1
+    elif code:
+        codes = profile["glpk_nonzero_return_codes"]
+        codes[str(code)] = codes.get(str(code), 0) + 1
+    return code
+
+
 def _glpk_run(owner, deadline: Optional[float], parm=None) -> Optional[int]:
     """glp_simplex를 한 번 부른다. 가능이면 상태, 불가능이면 None.
     기저가 특이해지는 등 실패하면 GLPK의 crash 기저에서 한 번 더 푼다."""
@@ -386,7 +402,7 @@ def _glpk_run(owner, deadline: Optional[float], parm=None) -> Optional[int]:
             if remaining <= 0:
                 raise SolverLimitReached("TIMEOUT")
             parm.tm_lim = max(1, int(remaining * 1000))
-        ret = glp.glp_simplex(lp, parm)
+        ret = _glpk_simplex(owner, parm)
         if ret == glp.GLP_ETMLIM:
             raise SolverLimitReached("TIMEOUT")
         if ret == 0:
@@ -396,7 +412,12 @@ def _glpk_run(owner, deadline: Optional[float], parm=None) -> Optional[int]:
             if status == glp.GLP_NOFEAS:
                 return None
         owner.failures += 1
-        glp.glp_adv_basis(lp, 0)
+        if getattr(owner, "_call_profile", None) is None:
+            glp.glp_adv_basis(lp, 0)
+        else:
+            owner._call_profile["basis_reset_count"] += 1
+            with owner._profile_phase("basis_reset_seconds"):
+                glp.glp_adv_basis(lp, 0)
     raise SolverLimitReached("LP_ENGINE_FAILURE")
 
 
@@ -651,6 +672,66 @@ class GlpkCore(_GlpkProblem):
         self.tightened = 0
         self.conflicts_found = 0
         self._buf_n = -1
+        self.simplex_metrics = {}
+        self._call_profile = None
+
+    def _profile_phase(self, key):
+        profile = self._call_profile
+        return self._timed_phase(profile, key) if profile is not None else nullcontext()
+
+    @staticmethod
+    @contextmanager
+    def _timed_phase(profile, key):
+        start = monotonic()
+        try:
+            yield
+        finally:
+            profile[key] += monotonic() - start
+
+    @contextmanager
+    def profile_call(self):
+        profile = {key: 0.0 for key in (
+            "sync_seconds", "glpk_solve_seconds", "basis_scan_seconds", "basis_extract_seconds",
+            "pivot_tighten_seconds", "full_tighten_seconds", "basis_reset_seconds",
+        )}
+        profile.update(glpk_invocations=0, single_step_limit_returns=0,
+                       glpk_nonzero_return_codes={}, full_tighten_count=0, basis_reset_count=0)
+        glp = self.glp
+        hook = getattr(glp, "glp_term_hook", None)
+        messages = []
+
+        def capture(message):
+            message = message.strip()
+            if len(messages) < 12 and message and not message.startswith((
+                "Constructing initial basis", "Size of triangular part",
+            )):
+                messages.append(message[:300])
+            return 1
+
+        self._call_profile = profile
+        installed = False
+        levels = (self.parm.msg_lev, self.dual_parm.msg_lev)
+        try:
+            if hook is not None:
+                try:
+                    hook(capture)
+                except (TypeError, RuntimeError):
+                    pass
+                else:
+                    installed = True
+                    self.parm.msg_lev = self.dual_parm.msg_lev = glp.GLP_MSG_ERR
+            start, cpu = monotonic(), thread_time()
+            try:
+                yield
+            finally:
+                profile.update(core_wall_seconds=monotonic() - start, thread_cpu_seconds=thread_time() - cpu,
+                               glpk_error_messages=messages if installed else None)
+                self.simplex_metrics["glpk_profile"] = profile
+        finally:
+            self._call_profile = None
+            if installed:
+                self.parm.msg_lev, self.dual_parm.msg_lev = levels
+                hook(None)
 
     # ── tableau → GLPK ──
     def _sync(self, tableau) -> None:
@@ -785,7 +866,8 @@ class GlpkCore(_GlpkProblem):
         glp, lp = self.glp, self.lp
         check_deadline(deadline)
         tableau.conflict = None
-        self._sync(tableau)
+        with self._profile_phase("sync_seconds"):
+            self._sync(tableau)
         m = glp.glp_get_num_rows(lp)
         full_every = full_tighten_every or 0
 
@@ -796,7 +878,8 @@ class GlpkCore(_GlpkProblem):
             saved = parm.it_lim
             parm.it_lim = 1
             try:
-                basis = self._basis(m) if glp.glp_bf_exists(lp) else None
+                with self._profile_phase("basis_scan_seconds"):
+                    basis = self._basis(m) if glp.glp_bf_exists(lp) else None
                 stalls = 0
                 while True:
                     if deadline is not None:
@@ -804,26 +887,31 @@ class GlpkCore(_GlpkProblem):
                         if remaining <= 0:
                             raise SolverLimitReached("TIMEOUT")
                         parm.tm_lim = max(1, int(remaining * 1000))
-                    ret = glp.glp_simplex(lp, parm)
+                    ret = _glpk_simplex(self, parm)
                     if ret == glp.GLP_ETMLIM:
                         raise SolverLimitReached("TIMEOUT")
                     if ret not in (0, glp.GLP_EITLIM):
                         break                    # 아래에서 강화 없이 한 번에 푼다
-                    new = self._basis(m)
+                    with self._profile_phase("basis_scan_seconds"):
+                        new = self._basis(m)
                     entering = (new - basis) if basis is not None else set()
                     basis = new
                     if entering:
                         stalls = 0
                         self.pivots += 1
-                        for k in entering:
-                            if self._tighten(tableau, k, m, stats) is None:
-                                return self._unsat_from_tighten(stats)
+                        with self._profile_phase("pivot_tighten_seconds"):
+                            for k in entering:
+                                if self._tighten(tableau, k, m, stats) is None:
+                                    return self._unsat_from_tighten(stats)
                         if full_every and self.pivots % full_every == 0:
                             if stats is not None:
                                 stats["SIMPLEX_FULL_TIGHTEN"] = stats.get("SIMPLEX_FULL_TIGHTEN", 0) + 1
-                            for k in new:
-                                if self._tighten(tableau, k, m, stats) is None:
-                                    return self._unsat_from_tighten(stats)
+                            if self._call_profile is not None:
+                                self._call_profile["full_tighten_count"] += 1
+                            with self._profile_phase("full_tighten_seconds"):
+                                for k in new:
+                                    if self._tighten(tableau, k, m, stats) is None:
+                                        return self._unsat_from_tighten(stats)
                     else:
                         stalls += 1
                     if ret == 0:
@@ -844,10 +932,11 @@ class GlpkCore(_GlpkProblem):
             if status is None:
                 return self._unsat(tableau, m, deadline)
         started = monotonic()
-        if self.extract == "basis":
-            self._adopt(tableau, m, stats)
-        else:
-            self._import(tableau, m)
+        with self._profile_phase("basis_extract_seconds"):
+            if self.extract == "basis":
+                self._adopt(tableau, m, stats)
+            else:
+                self._import(tableau, m)
         if stats is not None:
             stats["GLPK_EXTRACT_SECONDS"] = stats.get("GLPK_EXTRACT_SECONDS", 0.0) + monotonic() - started
         return dict(tableau.assign), True
@@ -874,7 +963,7 @@ class GlpkCore(_GlpkProblem):
         glp, lp = self.glp, self.lp
         if deadline is not None:
             self.dual_parm.tm_lim = max(1, int(max(0.0, deadline - monotonic()) * 1000))
-        glp.glp_simplex(lp, self.dual_parm)
+        _glpk_simplex(self, self.dual_parm)
         k = glp.glp_get_unbnd_ray(lp)
         if k <= 0 or glp.glp_get_status(lp) != glp.GLP_NOFEAS:
             return None, False

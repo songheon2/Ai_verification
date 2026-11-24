@@ -454,7 +454,17 @@ class AutomationIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "xor_unsafe.vnnlib"
             path.write_text(text, encoding="utf-8")
-            result = run_vnnlib_verification(str(self.model_path), str(path))
+            result = run_vnnlib_verification(str(self.model_path), str(path),
+                                             visualization_output_dir=str(Path(directory) / "output"),
+                                             reluplex_options={"lp_engine": "native"})
+            saved = json.loads(Path(result["result_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(saved["visualization"]["mode"], "off")
+            self.assertEqual(saved["verification_status"], "SAT")
+            self.assertEqual(saved["decided_at"], saved["visualization"]["finished_at"])
+            self.assertEqual(saved["solver"]["round_details"][-1]["result"], "THEORY_SAT")
+            self.assertIn("RELU_SPLITS", saved["solver"]["theory_stats"])
+            self.assertIn("SIMPLEX_PIVOTS", saved["solver"]["theory_stats"])
+            self.assertFalse(list(Path(result["result_path"]).parent.rglob("*.jsonl")))
         self.assertEqual(result["status"], "COUNTEREXAMPLE")
         self.assertEqual(
             result["counterexample"]["input_declared_space"], [0.0, 0.0]
@@ -604,9 +614,9 @@ class AutomationIntegrationTests(unittest.TestCase):
             solver_feedback = root / "solver_feedback.png"
             property_path.write_text(text, encoding="utf-8")
 
-            with patch(
-                "visualization.UnifiedRealtimeDashboard.webbrowser.open"
-            ) as open_browser:
+            with patch("Automation.LogAnalysisLauncher.start_analysis_bridge",
+                       return_value={"status": "unavailable", "reason": "missing_key"}), \
+                    patch("Automation.LogAnalysisLauncher.webbrowser.open") as open_browser:
                 result = run_vnnlib_verification(
                     str(self.model_path),
                     str(property_path),
@@ -660,7 +670,7 @@ class AutomationIntegrationTests(unittest.TestCase):
                 result["visualization"]["realtime"]["opened_panels"], ["relu"]
             )
             open_browser.assert_called_once_with(
-                realtime_image.with_suffix(".html").resolve().as_uri()
+                realtime_image.with_suffix(".html").resolve().as_uri(), new=2
             )
             self.assertIn("feedback", result["visualization"])
             self.assertIn("split_summary", result)

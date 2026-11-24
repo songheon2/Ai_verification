@@ -1,4 +1,11 @@
 (() => {
+  window.visualizationImageBox ??= image=>{
+    const box=image.getBoundingClientRect();
+    if(!image.naturalWidth||!image.naturalHeight)return box;
+    const scale=Math.min(box.width/image.naturalWidth,box.height/image.naturalHeight);
+    const width=image.naturalWidth*scale,height=image.naturalHeight*scale;
+    return {left:box.left+(box.width-width)/2,top:box.top+(box.height-height)/2,width,height};
+  };
   if(window.visualizationAssetUpdate)return;
   window.visualizationAssetUpdate=async(uri,state,force=false)=>{
     const url=new URL(uri,location.href);

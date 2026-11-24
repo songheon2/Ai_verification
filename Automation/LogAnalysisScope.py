@@ -194,7 +194,7 @@ class ScopedIndex:
             _link_legacy_branch_observations(db, branch_id)
         # Freeze comparison metrics before the destructive scope filter. Raw peer
         # records are still deleted; only bounded aggregate comparisons can leave.
-        self.simplex_reference = call_profiles(index) if self.has_simplex else None
+        self.simplex_reference = call_profiles(index, include_prior=True) if self.has_simplex else None
         self._simplex_summary = None
         self._tree_summary = None
         last = 0

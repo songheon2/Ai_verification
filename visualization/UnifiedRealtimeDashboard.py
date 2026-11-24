@@ -15,9 +15,14 @@ from visualization.Fonts import font_style
 import webbrowser
 
 _ASSET_REFRESH_SCRIPT = Path(__file__).with_name("AssetRefresh.js").read_text(encoding="utf-8")
-def publish_dashboard_status(dashboard_path: str | Path, status: str) -> Path:
+def publish_dashboard_status(dashboard_path: str | Path, status: str, *, message: str | None = None,
+                             decided_at: str | None = None, elapsed_seconds: float | None = None) -> Path:
     path = Path(dashboard_path).with_suffix(".status.js")
-    return write_atomic_text(path, f"window.receiveVerificationStatus?.({json.dumps(status, ensure_ascii=True)});\n")
+    args = (status,) if message is None else (status, message)
+    if decided_at is not None or elapsed_seconds is not None:
+        args = (status, message, {"decided_at": decided_at, "elapsed_seconds": elapsed_seconds})
+    values = ", ".join(json.dumps(value, ensure_ascii=True) for value in args)
+    return write_atomic_text(path, f"window.receiveVerificationStatus?.({values});\n")
 
 PANEL_SPECS = {
     "dpll-theory": (
@@ -178,6 +183,7 @@ class UnifiedRealtimeDashboard:
     const completionUri = {completion_uri};
     const completionAsset = {{}};
     let completionStatus = null;
+    let completionTiming = null;
     let verificationComplete = false;
     let imageTimer;
     let pageTimer;
@@ -273,24 +279,26 @@ class UnifiedRealtimeDashboard:
         completionAsset.pending = false;
       }}
     }}
-    window.receiveVerificationStatus = (status) => {{
+    window.receiveVerificationStatus = (status, message, timing) => {{
       if (!completionUri || verificationComplete || completionStatus !== null) return;
       if (status === "FINALIZING") {{
         document.getElementById("status").textContent = "FINALIZING";
         return;
       }}
-      if (status === "CANCELLED") {{
-        markComplete(status);
+      if (status === "CANCELLED" || status === "ERROR") {{
+        refreshPages(true);
+        markComplete(status, message);
         return;
       }}
-      if (!["SAT", "UNSAT", "UNKNOWN"].includes(status)) return;
+      if (!["SAT", "UNSAT", "UNKNOWN", "TIMEOUT"].includes(status)) return;
       completionStatus = status;
+      completionTiming = timing;
       refresh(true);
     }};
     function finishIfReady() {{
       if (!completionUri || verificationComplete || completionStatus === null ||
           inputBusy() || panels.some(panel => !panel.finalPublished)) return;
-      markComplete(completionStatus);
+      markComplete(completionStatus, null, completionTiming);
     }}
     function refreshPage(page, finalSnapshot = false) {{
       if(inputBusy()){{inputRefreshQueued=true;inputFinalQueued=inputFinalQueued||finalSnapshot;page.inputQueued=true;return;}}
@@ -339,15 +347,20 @@ class UnifiedRealtimeDashboard:
       refresh(true);
       markComplete(message.status);
     }});
-    function markComplete(result) {{
+    function markComplete(result, message, timing) {{
       verificationComplete = true;
       clearInterval(imageTimer);
       clearInterval(pageTimer);
       for (const page of pages) document.getElementById(page.autoId).checked = false;
       const status = document.getElementById("status");
-      status.textContent = "DONE · " + result;
+      const elapsed = Number.isFinite(timing?.elapsed_seconds) ? " · " + timing.elapsed_seconds.toFixed(1) + "초" : "";
+      status.textContent = "DONE · " + result + elapsed + (message ? " · " + message : "");
+      if (timing?.decided_at) {{
+        status.title = new Intl.DateTimeFormat('sv-SE', {{dateStyle:'short', timeStyle:'medium'}})
+          .format(new Date(timing.decided_at));
+      }}
       status.style.color = result === "SAT" ? "#22c55e" :
-        result === "UNSAT" ? "#ef4444" : "#94a3b8";
+        result === "UNSAT" || result === "ERROR" ? "#ef4444" : "#94a3b8";
     }}
     window.addEventListener("log-analysis-disconnected", () => {{
       verificationComplete = true;

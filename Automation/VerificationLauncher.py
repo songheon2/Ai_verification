@@ -1,6 +1,7 @@
 """Local ONNX/VNNLIB picker for the verification dashboard."""
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 import gzip
 import hashlib
 import json
@@ -31,15 +32,25 @@ PREFERENCE_FIELDS = {"group", "model", "property", "engine", "timeout"}
 MAX_BATCH_RUNS = 50
 RUN_OUTPUT_MARKER = "VERIFICATION_OUTPUT "
 DEFAULT_RUN_SETTINGS = {
-    "visualization_mode": "both",
+    "visualization_mode": "realtime",
     "panels": list(VERIFICATION_PANELS),
     "simplex_max_iter": 1_000_000,
     "max_rounds": 10_000,
     "max_recursion": 500,
     "lp_mode": "core",
+    "fix_python_hash_seed": True,
     "features": list(DEFAULT_FEATURES),
     "under_approx_eps": 0.1,
 }
+
+
+@lru_cache(maxsize=1)
+def _glpk_import_error():
+    try:
+        import swiglpk
+    except (ImportError, OSError) as exc:
+        return str(exc)
+    return None
 
 
 def _run_settings(custom):
@@ -58,6 +69,8 @@ def _run_settings(custom):
         raise ValueError("시각화 패널을 하나 이상 선택해 주세요.")
     if settings["lp_mode"] not in ("core", "oracle"):
         raise ValueError("LP 모드 설정을 확인해 주세요.")
+    if type(settings["fix_python_hash_seed"]) is not bool:
+        raise ValueError("Python 해시 시드 고정 상태를 확인해 주세요.")
     for key in ("simplex_max_iter", "max_rounds", "max_recursion"):
         value = settings[key]
         if type(value) is not int or not 1 <= value <= 2_147_483_647:
@@ -71,17 +84,35 @@ def _run_settings(custom):
 def _batch_metrics(result):
     solver = result.get("solver", {})
     theory = solver.get("theory_stats", {})
+    splits = result.get("split_summary")
+    if splits is None and "RELU_SPLITS" in theory:
+        splits = {"total_split_events": theory["RELU_SPLITS"]}
+    configuration = {key: solver[key] for key in (
+        "variant", "max_rounds", "timeout_seconds", "simplex_max_iter", "max_recursion", "reluplex_options",
+    ) if key in solver}
+    visualization = result.get("visualization", {})
+    if mode := visualization.get("mode"):
+        configuration["visualization_mode"] = mode
+    if panels := visualization.get("realtime", {}).get("opened_panels"):
+        configuration["realtime_panels"] = panels
+    if "python_hash_seed" in result:
+        configuration["python_hash_seed"] = result["python_hash_seed"]
     return {
         "network_layers": result.get("model", {}).get("layer_sizes"),
         "solver": {key: solver[key] for key in ("status", "reason", "elapsed_seconds", "rounds")
                    if key in solver},
+        "configuration": configuration,
+        "recent_dpll_rounds": solver.get("round_details"),
         "simplex": result.get("solver_progress_summary"),
-        "relu_splits": result.get("split_summary"),
+        "relu_splits": splits,
         "reluplex": {key: theory[key] for key in (
             "SEARCH_NODES", "UNSAT_LEAVES", "CONFLICT_LEAVES", "LP_CALLS", "LP_SECONDS", "REPAIR_STEPS",
             "DERIVE_FIXED_RELUS", "DERIVE_INFEASIBLE", "SEARCH_DERIVE_CALLS", "SEARCH_DERIVE_SECONDS",
             "SEARCH_DERIVE_FIXED", "BACKJUMPS", "SIMPLEX_CYCLES_DETECTED", "PIVOT_TIGHTENED",
             "SIMPLEX_FULL_TIGHTEN", "UA_FIXED", "UA_SECONDS", "UA_RESULT_SAT", "UA_RESULT_UNSAT",
+            "LP_ENGINE", "LP_REPAIR_CALLS", "LP_ENGINE_FAILURES", "GLPK_PIVOTS", "GLPK_EXTRACT_SECONDS",
+            "SIMPLEX_ITERATIONS", "SIMPLEX_PIVOTS", "SIMPLEX_DRIFT_CHECKS", "SIMPLEX_RESTORES",
+            "GLPK_DRIFT_CHECKS", "GLPK_ADOPT_RESTORES", "UA_NODES",
         ) if key in theory},
     }
 
@@ -124,6 +155,9 @@ class VerificationLauncher:
         self.batch = None
         self.session_runs = []
         self.analysis_conversation = AnalysisConversation()
+        self.archived_conversation = AnalysisConversation()
+        self.archived_conversation_scope = None
+        self.session_batch_sources = ()
         self.browser = None
         self.closing = False
         self.batch_thread = None
@@ -226,12 +260,15 @@ class VerificationLauncher:
     def catalog(self, group=None):
         groups = self._groups()
         if group is None:
+            glpk_error = _glpk_import_error()
             with self.lock:
                 batch_id = self.batch["id"] if self.batch is not None else None
                 single_id = (self.current["id"] if self.current is not None
                              and self.current["process"].poll() is None else None)
             return {"groups": [{"id": key, "label": "로컬 파일" if key == "local" else key}
-                               for key in groups], "engines": list(ENGINES),
+                               for key in groups],
+                    "engines": list(ENGINES),
+                    "glpk_error": glpk_error,
                     "preferences": self._read_preferences(groups), "max_batch_runs": MAX_BATCH_RUNS,
                     "batch_id": batch_id, "single_id": single_id}
         if group not in groups:
@@ -267,6 +304,7 @@ class VerificationLauncher:
                 self.batch["status"] in ("running", "stopping") or self.batch["analysis"]["status"] == "running")
 
     def _launch(self, model, prop, engine, timeout, settings):
+        fix_python_hash_seed = _run_settings(settings)["fix_python_hash_seed"]
         command = [sys.executable, "-m", "Automation.VerificationLauncher"]
         log = TemporaryFile()
         try:
@@ -282,6 +320,10 @@ class VerificationLauncher:
             command.extend(("--worker-settings", json.dumps(settings)))
         command.extend(("--worker", str(model.path), str(prop.path), engine, str(timeout)))
         config = dict(os.environ, PYTHONIOENCODING="utf-8")
+        if fix_python_hash_seed:
+            config["PYTHONHASHSEED"] = "0"
+        else:
+            config.pop("PYTHONHASHSEED", None)
         try:
             process = subprocess.Popen(command, cwd=self.workspace, env=config,
                                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
@@ -351,6 +393,11 @@ class VerificationLauncher:
             if any("alloc.c at line 70" in line and "env" in line for line in lines):
                 diagnostic["code"] = "GLPK_ALLOCATOR_ACCOUNTING_ERROR"
                 message = "GLPK 메모리 관리 오류 (alloc.c:70)"
+            elif message.startswith(("ImportError:", "ModuleNotFoundError:")) and (
+                "_swiglpk" in message or "'swiglpk'" in message
+            ):
+                diagnostic["code"] = "GLPK_LOAD_ERROR"
+                message = "GLPK를 불러올 수 없습니다. " + message.partition(": ")[2]
             unsupported = re.match(
                 r"ValueError: (?:hidden activation |unsupported ONNX operation '|"
                 r"VNNLIB direct verification does not support a removed final activation: )([A-Za-z0-9_]+)",
@@ -377,21 +424,25 @@ class VerificationLauncher:
 
     def _finish_worker(self, code, log, stopped):
         outcome = self._outcome(code, log, stopped=stopped)
-        if outcome["status"] != "cancelled":
+        if outcome["status"] not in {"cancelled", "error"}:
             return outcome
         from visualization.UnifiedRealtimeDashboard import publish_dashboard_status
 
+        status = "CANCELLED" if outcome["status"] == "cancelled" else "ERROR"
         try:
             manifest_path = outcome.get("run_manifest_path")
             if manifest_path:
                 path = Path(manifest_path)
                 manifest = json.loads(path.read_text(encoding="utf-8"))
-                manifest.update(status="CANCELLED", phase="CANCELLED",
+                manifest.update(status=status, phase=status,
                                 finished_at=datetime.now().astimezone().isoformat())
                 write_atomic_text(path, json.dumps(manifest, ensure_ascii=False))
+        except (OSError, ValueError):
+            pass
+        try:
             dashboard = self._worker_state(log).get("dashboard")
             if dashboard:
-                publish_dashboard_status(dashboard, "CANCELLED")
+                publish_dashboard_status(dashboard, status, message=outcome.get("error"))
         except (OSError, ValueError):
             pass
         return outcome
@@ -429,8 +480,11 @@ class VerificationLauncher:
                 saved = True
             if self.current is not None:
                 self._refresh_single_outcome(self.current)
-            model, prop, *_ = entry
-            session_run = self._start_session_run(model.label, prop.label)
+            model, prop, engine, timeout, settings = entry
+            session_run = self._start_session_run(model.label, prop.label, {
+                "benchmark": body["group"], "engine": engine, "timeout_seconds": timeout,
+                "settings": _run_settings(settings),
+            })
             try:
                 process, log = self._launch(*entry)
             except (OSError, ValueError, subprocess.SubprocessError):
@@ -442,10 +496,12 @@ class VerificationLauncher:
             self.current = {"id": job_id, "process": process, "log": log, "session_run": session_run}
             return {"id": job_id, "status": "running", "preferences_saved": saved}
 
-    def _start_session_run(self, model, prop):
+    def _start_session_run(self, model, prop, configuration):
         run = {"number": len(self.session_runs) + 1, "model": model, "property": prop,
                "started_at": datetime.now().astimezone().isoformat(), "started": monotonic(),
                "status": "running", "result": None}
+        run["analysis_run"] = {**configuration, "number": run["number"], "model": model, "property": prop,
+                               "started_at": run["started_at"]}
         self.session_runs.append(run)
         return run
 
@@ -456,12 +512,20 @@ class VerificationLauncher:
         if not isinstance(finished, (int, float)) or not run["started"] <= finished <= observed:
             finished = observed
         solver = (outcome.get("metrics") or {}).get("solver") or {}
-        result = "TIMEOUT" if solver.get("reason") == "TIMEOUT" else outcome.get("verdict")
-        run.update(status=outcome["status"], result=result, finished=finished)
+        result = outcome.get("verification_status") or (
+            "TIMEOUT" if solver.get("reason") == "TIMEOUT" else outcome.get("verdict"))
+        run.update(status=outcome["status"], result=result, finished=finished,
+                   decided_at=outcome.get("decided_at"), verification_seconds=solver.get("elapsed_seconds"))
+        outcome["elapsed_seconds"] = finished - run["started"]
+        run["analysis_run"].update(outcome)
 
     def _finish_single(self, job, code):
         if "outcome" not in job:
             outcome = self._finish_worker(code, job["log"], job.get("stopped", False))
+            if outcome["status"] in ("cancelled", "error"):
+                directory = self._worker_state(job["log"]).get("directory")
+                if directory:
+                    outcome["run_log_directory"] = str(directory)
             self._finish_session_run(job["session_run"], outcome)
             job["outcome"] = outcome
 
@@ -476,9 +540,19 @@ class VerificationLauncher:
             if self.current is not None:
                 self._refresh_single_outcome(self.current)
             now = monotonic()
-            return {"runs": [{**{key: run[key] for key in ("number", "model", "property", "started_at", "status", "result")},
-                              "elapsed_seconds": max(0.0, run.get("finished", now) - run["started"])}
-                             for run in self.session_runs]}
+            active_log = self.batch_log
+            if active_log is None and self.current is not None and "outcome" not in self.current:
+                active_log = self.current["log"]
+            state = self._worker_state(active_log)
+            rows = []
+            for run in self.session_runs:
+                finalizing = run["status"] == "running" and state.get("phase") == "finalizing"
+                seconds = state.get("verification_seconds") if finalizing else run.get("verification_seconds")
+                if seconds is None:
+                    seconds = max(0.0, run.get("finished", now) - run["started"])
+                rows.append({**{key: run[key] for key in ("number", "model", "property", "started_at", "status", "result")},
+                             "elapsed_seconds": seconds, "decided_at": run.get("decided_at"), "finalizing": finalizing})
+            return {"runs": rows}
 
     def job(self, job_id):
         with self.lock:
@@ -651,12 +725,13 @@ class VerificationLauncher:
         prior["status"] = "complete"
         with self.lock:
             self._require_idle()
-            self.analysis_conversation.clear()
             question = prior.get("question")
-            self.analysis_conversation.remember(question if isinstance(question, str) else "", prior["report"])
             self.batch_dashboards.clear()
             self.batch = {"id": secrets.token_hex(12), "status": status, "runs": runs,
                           "analysis": prior, "followup_source": source, "overview": overview}
+            self.archived_conversation = AnalysisConversation()
+            self.archived_conversation_scope = ("report", self.batch["id"])
+            self.archived_conversation.remember(question if isinstance(question, str) else "", prior["report"])
             return {"id": self.batch["id"]}
 
     @staticmethod
@@ -816,7 +891,7 @@ class VerificationLauncher:
                     if batch["status"] == "stopping":
                         break
                     run["status"] = "running"
-                    session_run = self._start_session_run(run["model"], run["property"])
+                    session_run = self._start_session_run(run["model"], run["property"], run)
                     self._save_batch(batch)
                     process, log = self._launch(*entry)
                     self.batch_process = process
@@ -893,17 +968,70 @@ class VerificationLauncher:
     def _has_analysis_evidence(run):
         return any(run.get(key) for key in ("verdict", "metrics", "diagnostic", "solver_checkpoint"))
 
+    def _read_saved_verification(self, root, path):
+        path = path.resolve()
+        if path.name != "result.json" or not path.is_relative_to(root) or not root.is_relative_to(self.workspace):
+            raise ValueError("저장된 검증 실행을 목록에서 선택해 주세요.")
+        with path.open(encoding="utf-8-sig") as stream:
+            result = json.loads(stream.read(1024 * 1024))
+        if not isinstance(result, dict) or not isinstance(result.get("solver"), dict) or not result.get("status"):
+            raise ValueError("완료된 검증 결과를 찾을 수 없습니다.")
+        model, prop = result.get("model") or {}, result.get("vnnlib") or {}
+        visualization = result.get("visualization") or {}
+        solver = result["solver"]
+        model_path = model.get("original_source_path") or model.get("source_path") or model.get("name") or ""
+        run = {
+            "status": "complete", "result_path": str(path), "verdict": result["status"],
+            "model": Path(model_path.replace("\\", "/")).name,
+            "property": prop.get("property_name") or Path(prop.get("path") or "").name,
+            "engine": (solver.get("theory_stats") or {}).get("LP_ENGINE") or (solver.get("reluplex_options") or {}).get("lp_engine"),
+            "started_at": visualization.get("started_at"),
+            "metrics": _batch_metrics(result),
+        }
+        if run["started_at"] and visualization.get("finished_at"):
+            run["elapsed_seconds"] = (datetime.fromisoformat(visualization["finished_at"])
+                                      - datetime.fromisoformat(run["started_at"])).total_seconds()
+        return run
+
+    def saved_verifications(self):
+        root = (self.workspace / "visualization" / "outputs").resolve()
+        if not root.is_relative_to(self.workspace):
+            return {"runs": []}
+        candidates = []
+        for path in root.rglob("result.json"):
+            try:
+                candidates.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+        choices = []
+        for _, path in sorted(candidates, reverse=True):
+            try:
+                run = self._read_saved_verification(root, path)
+            except (OSError, TypeError, ValueError, AttributeError):
+                continue
+            configuration = run["metrics"]["configuration"]
+            label = " · ".join(str(value) for value in (
+                (run["started_at"] or "")[:19].replace("T", " "), run["model"], run["property"],
+                configuration.get("visualization_mode"), run["verdict"],
+            ) if value)
+            choices.append({"id": path.relative_to(root).as_posix(), "label": label or path.parent.name})
+            if len(choices) == 100:
+                break
+        return {"runs": choices}
+
     def _batch_log_limits(self, run, state):
         if run["status"] == "running" and state.get("directory"):
             return capture_log_limits(state["directory"])
-        if run["status"] in ("error", "cancelled"):
+        if run["status"] in ("complete", "error", "cancelled"):
+            output_root = self.workspace / "visualization" / "outputs"
             if run.get("run_log_directory"):
-                directory = Path(run["run_log_directory"]).resolve()
-            elif run.get("run_manifest_path"):
-                directory = Path(run["run_manifest_path"]).resolve().parent
+                directory = Path(run["run_log_directory"])
+            elif source := run.get("result_path") or run.get("run_manifest_path"):
+                directory = resolve_visualization_output(source, output_root).parent
             else:
                 return []
-            root = (self.workspace / "visualization" / "outputs").resolve()
+            root = output_root.resolve()
+            directory = directory.resolve()
             if root.is_relative_to(self.workspace) and directory.is_relative_to(root):
                 return capture_log_limits(directory)
         return []
@@ -914,21 +1042,41 @@ class VerificationLauncher:
         question = body.get("question", "")
         if not isinstance(question, str) or len(question) > 2000:
             raise ValueError("질문은 2000자 이내로 입력해 주세요.")
+        selected = body.get("saved_runs", [])
+        if not isinstance(selected, list) or len(selected) > MAX_BATCH_RUNS or any(
+            not isinstance(value, str) or not 1 <= len(value) <= 1024 for value in selected
+        ):
+            raise ValueError("저장된 검증 실행을 목록에서 선택해 주세요.")
+        root = (self.workspace / "visualization" / "outputs").resolve()
+        selected = tuple(dict.fromkeys(selected))
+        saved_runs = []
+        for number, source in enumerate(selected, 1):
+            try:
+                run = self._read_saved_verification(root, root / source)
+            except (OSError, TypeError, ValueError, AttributeError) as exc:
+                raise ValueError("저장된 검증 실행을 목록에서 다시 선택해 주세요.") from exc
+            saved_runs.append({**run, "number": number})
         with self.lock:
             if self.closing:
                 raise RuntimeError("검증기를 종료하고 있습니다.")
-            batch_id = body.get("id")
-            if batch_id is None and self.batch is None:
-                self._require_idle()
-                self.batch = {"id": secrets.token_hex(12), "status": "complete", "runs": [],
-                              "analysis": {"status": "idle"}, "overview": True}
-            elif batch_id is None and not self.batch.get("overview"):
-                raise ValueError("현재 검증 묶음을 먼저 불러와 주세요.")
-            batch = self._get_batch(batch_id) if batch_id is not None else self.batch
-            if batch["analysis"]["status"] == "running":
+            batch_id = None if saved_runs else body.get("id")
+            batch = self._get_batch(batch_id) if batch_id is not None else (
+                self.batch if self.batch and self.batch.get("session") else None)
+            if batch is not None and batch["analysis"]["status"] == "running":
                 raise RuntimeError("통합 분석이 진행 중입니다.")
-            if batch.get("overview") and self.current is not None and self.current["process"].poll() is None:
-                raise RuntimeError("검증이 끝난 뒤 프로젝트 구조를 질문해 주세요.")
+            if batch is None or (batch.get("session") and selected != self.session_batch_sources):
+                self._require_idle()
+                batch = self.batch = {"id": secrets.token_hex(12), "status": "complete", "runs": [],
+                                      "analysis": {"status": "idle"}, "session": True}
+                if saved_runs:
+                    batch["saved_run_analysis"] = True
+                self.session_batch_sources = selected
+            if batch.get("session"):
+                self._require_idle()
+                if self.current is not None:
+                    self._refresh_single_outcome(self.current)
+                batch["runs"] = saved_runs or [run["analysis_run"] for run in self.session_runs if run["status"] != "running"]
+                batch["overview"] = not batch["runs"]
             state = self._worker_state(self.batch_log)
             limits = [self._batch_log_limits(run, state) for run in batch["runs"]]
             runs = [{key: value for key, value in run.items()
@@ -940,19 +1088,27 @@ class VerificationLauncher:
                         "partial": any(run["status"] != "complete" for run in runs)}
             if batch.get("followup_source"):
                 snapshot["followup_source"] = batch["followup_source"]
+            elif saved_runs:
+                snapshot["run_source"] = "saved_runs"
             if batch.get("overview"):
                 snapshot["overview"] = True
-            conversation = self.analysis_conversation.snapshot()
+            history = self.analysis_conversation
+            if saved_runs or batch.get("followup_source"):
+                scope = ("runs", *selected) if saved_runs else ("report", batch["id"])
+                if self.archived_conversation_scope != scope:
+                    self.archived_conversation = AnalysisConversation()
+                    self.archived_conversation_scope = scope
+                history = self.archived_conversation
             if batch["analysis"]["status"] == "complete":
                 batch["saved_analysis"] = batch["analysis"]
             budget = {"used": 0, "limit": max_calls, "remaining": max_calls}
             batch["analysis"] = {"status": "running", "request_budget": budget, **snapshot}
             Thread(target=self._analyze_batch,
-                   args=(batch, runs, limits, snapshot, question, conversation, client_factory, max_calls),
+                   args=(batch, runs, limits, snapshot, question, history, history.snapshot(), client_factory, max_calls),
                    name="verification-batch-analysis", daemon=True).start()
         return {"id": batch["id"], "status": "running", "request_budget": budget}
 
-    def _analyze_batch(self, batch, runs, limits, snapshot, question, conversation, client_factory, max_calls):
+    def _analyze_batch(self, batch, runs, limits, snapshot, question, history, conversation, client_factory, max_calls):
         from Automation.LogAnalysisIndex import safe_data
 
         def budget(used):
@@ -988,7 +1144,7 @@ class VerificationLauncher:
             if batch["analysis"]["status"] == "running":
                 batch["analysis"] = result
                 if result["status"] == "complete":
-                    self.analysis_conversation.remember(question, result["report"])
+                    history.remember(question, result["report"])
                     batch["saved_analysis"] = result
                 self._save_batch(batch)
 
@@ -1032,6 +1188,7 @@ def _worker(model, prop, engine, timeout, *, settings=None, state_path=None, man
             open_realtime_view=mode.realtime_enabled,
             reluplex_options=solver_settings,
             run_started_callback=run_started,
+            solver_finished_callback=lambda seconds: publish(phase="finalizing", verification_seconds=seconds),
             dashboard_ready_callback=(
                 lambda path: publish(phase="running", dashboard=str(path))
             ) if state_path is not None and mode.realtime_enabled else None,
@@ -1039,6 +1196,7 @@ def _worker(model, prop, engine, timeout, *, settings=None, state_path=None, man
         )
         print("VERIFICATION_RESULT " + json.dumps({
             "verdict": result["status"], "result_path": result.get("result_path"),
+            "decided_at": result.get("decided_at"), "verification_status": result.get("verification_status"),
             "metrics": _batch_metrics(result), "finished_monotonic": monotonic(),
         }, ensure_ascii=True), flush=True)
         return result
@@ -1053,7 +1211,7 @@ def _worker(model, prop, engine, timeout, *, settings=None, state_path=None, man
 
 
 class LauncherPage:
-    batch_max_calls = 1
+    batch_max_calls = 2
     root = None
     active = False
 

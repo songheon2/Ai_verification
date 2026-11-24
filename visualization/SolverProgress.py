@@ -11,7 +11,7 @@ import inspect
 import math
 import threading
 import warnings
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from time import monotonic, sleep, time_ns
@@ -23,6 +23,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 from visualization.RenderLock import render_turn
+from visualization.AppendLogReader import AppendLogReader
 from visualization.RunLabels import network_display_name
 from visualization.RenderProcess import (
     REALTIME_RENDER_INTERVAL_SECONDS,
@@ -41,6 +42,20 @@ def _json_safe(value: Any) -> Any:
         return [_json_safe(item) for item in value]
     return value
 
+def _parse_progress_line(log_path, line_no, line):
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        value = json.loads(line)
+        if isinstance(value, dict) and "event" in value:
+            return value
+    except (TypeError, ValueError):
+        pass
+    warnings.warn(f"{log_path}:{line_no}의 잘못된 progress를 건너뜁니다")
+    return None
+
+
 def read_solver_progress(path: str | Path) -> List[Dict[str, Any]]:
     log_path = Path(path)
     if not log_path.exists():
@@ -48,16 +63,8 @@ def read_solver_progress(path: str | Path) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     with log_path.open("r", encoding="utf-8") as stream:
         for line_no, line in enumerate(stream, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                value = json.loads(line)
-                if not isinstance(value, dict) or "event" not in value:
-                    raise ValueError
+            if (value := _parse_progress_line(log_path, line_no, line)) is not None:
                 events.append(value)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                warnings.warn(f"{log_path}:{line_no}의 잘못된 progress를 건너뜁니다")
     return events
 
 
@@ -484,7 +491,7 @@ class SolverProgressLogger:
             terminal_event,
             call_id=call_id,
             call_number=call_number,
-            **({**metadata, **meta} if self.compact_simplex_calls else meta),
+            **({**metadata, "start_ns": started, **meta} if self.compact_simplex_calls else meta),
             result=result,
             duration_seconds=max(0.0, (time_ns() - started) / 1_000_000_000),
             iterations=iterations,
@@ -513,233 +520,259 @@ class SolverProgressLogger:
             self.close()
 
 
-def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
-    rounds: Dict[int, Dict[str, Any]] = {}
-    calls: Dict[str, Dict[str, Any]] = {}
-    violations: Counter[str] = Counter()
-    entering: Counter[str] = Counter()
-    leaving: Counter[str] = Counter()
-    pivot_rows: Counter[str] = Counter()
-    violation_refs: Counter[tuple[Optional[int], str]] = Counter()
-    observed_refs: Counter[tuple[Optional[int], str]] = Counter()
-    constraint_details: Dict[tuple[str, bool], Dict[str, Any]] = {}
-    slack_references: Dict[tuple[int, str], Dict[str, Any]] = {}
-    theory_links: List[Dict[str, Any]] = []
-    solver_result: Dict[str, Any] = {}
+class _SolverFeedback:
+    def __init__(self):
+        self.rounds: Dict[int, Dict[str, Any]] = {}
+        self.calls: Dict[str, Dict[str, Any]] = {}
+        self.violations: Counter[str] = Counter()
+        self.entering: Counter[str] = Counter()
+        self.leaving: Counter[str] = Counter()
+        self.pivot_rows: Counter[str] = Counter()
+        self.violation_refs: Counter[tuple[Optional[int], str]] = Counter()
+        self.observed_refs: Counter[tuple[Optional[int], str]] = Counter()
+        self.constraint_details: Dict[tuple[str, bool], Dict[str, Any]] = {}
+        self.slack_references: Dict[tuple[int, str], Dict[str, Any]] = {}
+        self.theory_links: List[Dict[str, Any]] = []
+        self.solver_result: Dict[str, Any] = {}
 
-    for raw in events:
-        event = dict(raw)
-        kind = event.get("event")
-        if kind == "run_context":
-            solver_result["witness_context"] = event.get("witness_context", {})
-        elif kind == "round_start":
-            index = int(event["round"])
-            rounds.setdefault(index, {"round": index}).update({"start_time_ns": event.get("time_ns")})
-        elif kind == "round_end":
-            index = int(event["round"])
-            rounds.setdefault(index, {"round": index}).update(
-                {
-                    "result": event.get("result"),
-                    "duration_seconds": float(event.get("duration_seconds", 0.0)),
-                    "simplex_calls": int(event.get("simplex_calls", 0)),
-                }
-            )
-        elif kind == "theory_selection":
-            index = int(event["round"])
-            atoms = list(event.get("atoms", []))
-            rounds.setdefault(index, {"round": index})["theory_atoms"] = atoms
-            for atom in atoms:
-                slack_name = atom.get("slack_name")
-                if slack_name is not None:
-                    slack_references[(index, str(slack_name))] = {
-                        "constraint_id": atom.get(
-                            "constraint_id", atom.get("atom_id")
-                        ),
-                        "atom_id": atom.get("atom_id"),
-                        "polarity": atom.get("polarity"),
-                    }
-        elif kind == "theory_result":
-            index = int(event["round"])
-            result = event.get("result")
-            rounds.setdefault(index, {"round": index})["theory_result"] = result
-            theory_links.append({"round": index, "result": result, **{k: v for k, v in event.items() if k not in {"event", "timestamp", "time_ns", "round", "result"}}})
-        elif kind == "simplex_start":
-            call_id = str(event["call_id"])
-            calls[call_id] = {
-                "call_id": call_id,
-                "call_number": event.get("call_number"),
-                "start_timestamp": event.get("timestamp"),
-                "start_time_ns": event.get("time_ns"),
-                "round": event.get("round"),
-                "depth": event.get("depth"),
-                "origin": event.get("origin"),
-                "selection_id": event.get("selection_id"),
-                "theory_atom_ids": list(event.get("theory_atom_ids", [])),
-                "row_count": event.get("row_count"),
-                "variable_count": event.get("variable_count"),
-                **{key: event[key] for key in METRIC_META if key in event},
-            }
-        elif kind == "simplex_iteration":
-            call_id = str(event.get("call_id"))
-            calls.setdefault(call_id, {"call_id": call_id})["iterations"] = max(
-                int(calls.get(call_id, {}).get("iterations", 0)),
-                int(event.get("iteration", -1)) + 1,
-            )
-            variable = event.get("violated_var")
-            if variable:
-                violations[str(variable)] += 1
-                violation_refs[(calls.get(call_id, {}).get("round"), str(variable))] += 1
-        elif kind == "constraint_detail":
-            constraint_id = event.get("constraint_id", event.get("atom_id"))
-            if constraint_id is not None:
-                constraint_details[(str(constraint_id), bool(event.get("polarity")))] = {
-                    key: value
-                    for key, value in event.items()
-                    if key not in {"event", "timestamp", "time_ns"}
-                }
-        elif kind == "simplex_bound_observation":
-            round_index = event.get("round", calls.get(str(event.get("call_id")), {}).get("round"))
-            for observation in event.get("observations", []):
-                variable = observation.get("variable")
-                if isinstance(variable, str):
-                    observed_refs[(round_index, variable)] += 1
-        elif kind == "simplex_cycle":
-            call = calls.setdefault(str(event["call_id"]), {"call_id": str(event["call_id"])})
-            call["cycles"] = int(call.get("cycles", 0)) + 1
-            if len(call.setdefault("cycle_events", [])) < 32:
-                call["cycle_events"].append({key: event.get(key) for key in ("iteration", "pivot", "random_steps")})
-        elif kind == "simplex_pivot":
-            call_id = str(event.get("call_id"))
-            call = calls.setdefault(call_id, {"call_id": call_id})
-            call["pivots"] = int(call.get("pivots", 0)) + 1
-            entering[str(event.get("entering"))] += 1
-            leaving[str(event.get("leaving"))] += 1
-            pivot_rows[str(event.get("row"))] += 1
-        elif kind in {"simplex_end", "simplex_call"}:
-            call_id = str(event["call_id"])
-            completed = {
-                "result": event.get("result"),
-                "call_number": event.get(
-                    "call_number", calls.get(call_id, {}).get("call_number")
-                ),
-                "end_timestamp": event.get("timestamp"),
-                "duration_seconds": float(event.get("duration_seconds", 0.0)),
-                "iterations": int(event.get("iterations") or 0),
-                "pivots": int(event.get("pivots") or 0),
-                "cycles": int(event.get("cycles", calls.get(call_id, {}).get("cycles", 0)) or 0),
-                **{key: event[key] for key in METRIC_META if key in event},
-            }
-            if kind == "simplex_call":
-                completed.update(
+    def add(self, events: Iterable[Mapping[str, Any]]) -> None:
+        for raw in events:
+            event = dict(raw)
+            kind = event.get("event")
+            if kind == "run_context":
+                self.solver_result["witness_context"] = event.get("witness_context", {})
+            elif kind == "round_start":
+                index = int(event["round"])
+                self.rounds.setdefault(index, {"round": index}).update({"start_time_ns": event.get("time_ns")})
+            elif kind == "round_end":
+                index = int(event["round"])
+                self.rounds.setdefault(index, {"round": index}).update(
                     {
-                        "round": event.get("round"),
-                        "depth": event.get("depth"),
-                        "origin": event.get("origin"),
-                        "selection_id": event.get("selection_id"),
-                        "theory_atom_ids": list(event.get("theory_atom_ids", [])),
-                        "row_count": event.get("row_count"),
-                        "variable_count": event.get("variable_count"),
+                        "result": event.get("result"),
+                        "duration_seconds": float(event.get("duration_seconds", 0.0)),
+                        "simplex_calls": int(event.get("simplex_calls", 0)),
                     }
                 )
-            calls.setdefault(call_id, {"call_id": call_id}).update(completed)
-        elif kind == "solver_end":
-            solver_result = {
-                "status": event.get("status"),
-                "reason": event.get("reason"),
-                "rounds": event.get("rounds"),
-                "model": event.get("model"),
-                "witness_context": event.get("witness_context", {}),
-            }
+            elif kind == "theory_selection":
+                index = int(event["round"])
+                atoms = list(event.get("atoms", []))
+                self.rounds.setdefault(index, {"round": index})["theory_atoms"] = atoms
+                for atom in atoms:
+                    slack_name = atom.get("slack_name")
+                    if slack_name is not None:
+                        self.slack_references[(index, str(slack_name))] = {
+                            "constraint_id": atom.get(
+                                "constraint_id", atom.get("atom_id")
+                            ),
+                            "atom_id": atom.get("atom_id"),
+                            "polarity": atom.get("polarity"),
+                        }
+            elif kind == "theory_result":
+                index = int(event["round"])
+                result = event.get("result")
+                self.rounds.setdefault(index, {"round": index})["theory_result"] = result
+                self.theory_links.append({"round": index, "result": result, **{k: v for k, v in event.items() if k not in {"event", "timestamp", "time_ns", "round", "result"}}})
+            elif kind == "simplex_start":
+                call_id = str(event["call_id"])
+                self.calls[call_id] = {
+                    "call_id": call_id,
+                    "call_number": event.get("call_number"),
+                    "start_timestamp": event.get("timestamp"),
+                    "start_time_ns": event.get("time_ns"),
+                    "round": event.get("round"),
+                    "depth": event.get("depth"),
+                    "origin": event.get("origin"),
+                    "selection_id": event.get("selection_id"),
+                    "theory_atom_ids": list(event.get("theory_atom_ids", [])),
+                    "row_count": event.get("row_count"),
+                    "variable_count": event.get("variable_count"),
+                    **{key: event[key] for key in METRIC_META if key in event},
+                }
+            elif kind == "simplex_iteration":
+                call_id = str(event.get("call_id"))
+                self.calls.setdefault(call_id, {"call_id": call_id})["iterations"] = max(
+                    int(self.calls.get(call_id, {}).get("iterations", 0)),
+                    int(event.get("iteration", -1)) + 1,
+                )
+                variable = event.get("violated_var")
+                if variable:
+                    self.violations[str(variable)] += 1
+                    self.violation_refs[(self.calls.get(call_id, {}).get("round"), str(variable))] += 1
+            elif kind == "constraint_detail":
+                constraint_id = event.get("constraint_id", event.get("atom_id"))
+                if constraint_id is not None:
+                    self.constraint_details[(str(constraint_id), bool(event.get("polarity")))] = {
+                        key: value
+                        for key, value in event.items()
+                        if key not in {"event", "timestamp", "time_ns"}
+                    }
+            elif kind == "simplex_bound_observation":
+                round_index = event.get("round", self.calls.get(str(event.get("call_id")), {}).get("round"))
+                for observation in event.get("observations", []):
+                    variable = observation.get("variable")
+                    if isinstance(variable, str):
+                        self.observed_refs[(round_index, variable)] += 1
+            elif kind == "simplex_cycle":
+                call = self.calls.setdefault(str(event["call_id"]), {"call_id": str(event["call_id"])})
+                call["cycles"] = int(call.get("cycles", 0)) + 1
+                if len(call.setdefault("cycle_events", [])) < 32:
+                    call["cycle_events"].append({key: event.get(key) for key in ("iteration", "pivot", "random_steps")})
+            elif kind == "simplex_pivot":
+                call_id = str(event.get("call_id"))
+                call = self.calls.setdefault(call_id, {"call_id": call_id})
+                call["pivots"] = int(call.get("pivots", 0)) + 1
+                self.entering[str(event.get("entering"))] += 1
+                self.leaving[str(event.get("leaving"))] += 1
+                self.pivot_rows[str(event.get("row"))] += 1
+            elif kind in {"simplex_end", "simplex_call"}:
+                call_id = str(event["call_id"])
+                completed = {
+                    "result": event.get("result"),
+                    "call_number": event.get(
+                        "call_number", self.calls.get(call_id, {}).get("call_number")
+                    ),
+                    "end_timestamp": event.get("timestamp"),
+                    "duration_seconds": float(event.get("duration_seconds", 0.0)),
+                    "iterations": int(event.get("iterations") or 0),
+                    "pivots": int(event.get("pivots") or 0),
+                    "cycles": int(event.get("cycles", self.calls.get(call_id, {}).get("cycles", 0)) or 0),
+                    **{key: event[key] for key in METRIC_META if key in event},
+                }
+                if kind == "simplex_call":
+                    completed.update(
+                        {
+                            "round": event.get("round"),
+                            "depth": event.get("depth"),
+                            "origin": event.get("origin"),
+                            "selection_id": event.get("selection_id"),
+                            "theory_atom_ids": list(event.get("theory_atom_ids", [])),
+                            "row_count": event.get("row_count"),
+                            "variable_count": event.get("variable_count"),
+                        }
+                    )
+                self.calls.setdefault(call_id, {"call_id": call_id}).update(completed)
+            elif kind == "solver_end":
+                self.solver_result = {
+                    "status": event.get("status"),
+                    "reason": event.get("reason"),
+                    "rounds": event.get("rounds"),
+                    "model": event.get("model"),
+                    "witness_context": event.get("witness_context", {}),
+                }
 
-    ordered_rounds = [rounds[index] for index in sorted(rounds)]
-    ordered_calls = list(calls.values())
-    now = time_ns()
-    for round_item in ordered_rounds:
-        if "duration_seconds" not in round_item and round_item.get("start_time_ns"):
-            round_item["duration_seconds"] = max(
-                0.0, (now - int(round_item["start_time_ns"])) / 1_000_000_000
+    def snapshot(self) -> Dict[str, Any]:
+        ordered_rounds = [dict(self.rounds[index]) for index in sorted(self.rounds)]
+        ordered_calls = [dict(call) for call in self.calls.values()]
+        round_call_counts = Counter(call.get("round") for call in ordered_calls)
+        now = time_ns()
+        for round_item in ordered_rounds:
+            if "duration_seconds" not in round_item and round_item.get("start_time_ns"):
+                round_item["duration_seconds"] = max(
+                    0.0, (now - int(round_item["start_time_ns"])) / 1_000_000_000
+                )
+                round_item.setdefault("result", "RUNNING")
+            round_item.setdefault(
+                "simplex_calls",
+                round_call_counts[round_item["round"]],
             )
-            round_item.setdefault("result", "RUNNING")
-        round_item.setdefault(
-            "simplex_calls",
-            sum(call.get("round") == round_item.get("round") for call in ordered_calls),
-        )
-    for call in ordered_calls:
-        if "duration_seconds" not in call and call.get("start_time_ns"):
-            call["duration_seconds"] = max(
-                0.0, (now - int(call["start_time_ns"])) / 1_000_000_000
+        for call in ordered_calls:
+            if "duration_seconds" not in call and call.get("start_time_ns"):
+                call["duration_seconds"] = max(
+                    0.0, (now - int(call["start_time_ns"])) / 1_000_000_000
+                )
+                call.setdefault("result", "RUNNING")
+                call.setdefault("iterations", 0)
+                call.setdefault("pivots", 0)
+        resolved_by_constraint: Dict[tuple[Any, ...], Dict[str, Any]] = {}
+        scoped_refs = [(key, count, "solver_iteration") for key, count in self.violation_refs.items()]
+        scoped_refs.extend((key, count, "call_boundary") for key, count in self.observed_refs.items())
+        for (round_index, slack_name), count, observation_scope in scoped_refs:
+            reference = (
+                self.slack_references.get((int(round_index), slack_name), {})
+                if round_index is not None
+                else {}
             )
-            call.setdefault("result", "RUNNING")
-            call.setdefault("iterations", 0)
-            call.setdefault("pivots", 0)
-    resolved_by_constraint: Dict[tuple[Any, ...], Dict[str, Any]] = {}
-    scoped_refs = [(key, count, "solver_iteration") for key, count in violation_refs.items()]
-    scoped_refs.extend((key, count, "call_boundary") for key, count in observed_refs.items())
-    for (round_index, slack_name), count, observation_scope in scoped_refs:
-        reference = (
-            slack_references.get((int(round_index), slack_name), {})
-            if round_index is not None
-            else {}
-        )
-        constraint_id = reference.get(
-            "constraint_id", f"round-{round_index}:{slack_name}"
-        )
-        polarity = bool(reference.get("polarity"))
-        detail = constraint_details.get((str(constraint_id), polarity), {})
-        key = (constraint_id, polarity, observation_scope)
-        item = resolved_by_constraint.setdefault(
-            key,
-            {
-                "constraint_id": constraint_id,
-                "atom_id": reference.get("atom_id", detail.get("atom_id")),
-                "polarity": reference.get("polarity", detail.get("polarity")),
-                "slack_name": slack_name,
-                "observation_scope": observation_scope,
-                "count": 0,
-                "rounds": [],
-                "occurrences": [],
-                **{
-                    name: detail[name]
-                    for name in ("original", "effective")
-                    if name in detail
+            constraint_id = reference.get(
+                "constraint_id", f"round-{round_index}:{slack_name}"
+            )
+            polarity = bool(reference.get("polarity"))
+            detail = self.constraint_details.get((str(constraint_id), polarity), {})
+            key = (constraint_id, polarity, observation_scope)
+            item = resolved_by_constraint.setdefault(
+                key,
+                {
+                    "constraint_id": constraint_id,
+                    "atom_id": reference.get("atom_id", detail.get("atom_id")),
+                    "polarity": reference.get("polarity", detail.get("polarity")),
+                    "slack_name": slack_name,
+                    "observation_scope": observation_scope,
+                    "count": 0,
+                    "rounds": [],
+                    "occurrences": [],
+                    **{
+                        name: detail[name]
+                        for name in ("original", "effective")
+                        if name in detail
+                    },
                 },
+            )
+            item["count"] += count
+            if round_index not in item["rounds"]:
+                item["rounds"].append(round_index)
+            item["occurrences"].append(
+                {"round": round_index, "slack_name": slack_name, "count": count}
+            )
+        resolved_constraints = sorted(
+            resolved_by_constraint.values(),
+            key=lambda item: (-int(item["count"]), str(item["constraint_id"])),
+        )
+
+        def total(field):
+            measured = [int(call.get(field, 0)) for call in ordered_calls if metric_available(call, field)]
+            return sum(measured) if measured or not ordered_calls else None
+
+        return {
+            "solver": dict(self.solver_result),
+            "rounds": ordered_rounds,
+            "simplex_calls": ordered_calls,
+            "counts": {
+                "rounds": len(ordered_rounds),
+                "simplex_calls": len(ordered_calls),
+                "simplex_iterations": total("iterations"),
+                "simplex_pivots": total("pivots"),
+                "pivot_measured_calls": sum(metric_available(call, "pivots") for call in ordered_calls),
             },
-        )
-        item["count"] += count
-        if round_index not in item["rounds"]:
-            item["rounds"].append(round_index)
-        item["occurrences"].append(
-            {"round": round_index, "slack_name": slack_name, "count": count}
-        )
-    resolved_constraints = sorted(
-        resolved_by_constraint.values(),
-        key=lambda item: (-int(item["count"]), str(item["constraint_id"])),
-    )
+            "top_violated_variables": dict(self.violations.most_common(20)),
+            "top_violated_constraints": [item for item in resolved_constraints if item["observation_scope"] == "solver_iteration"][:20],
+            "top_observed_bound_constraints": [item for item in resolved_constraints if item["observation_scope"] == "call_boundary"][:20],
+            "top_entering_variables": dict(self.entering.most_common(20)),
+            "top_leaving_variables": dict(self.leaving.most_common(20)),
+            "top_pivot_rows": dict(self.pivot_rows.most_common(20)),
+            "theory_links": list(self.theory_links),
+        }
 
-    from Automation.LpTelemetry import metric_available
-    def total(field):
-        measured = [int(call.get(field, 0)) for call in ordered_calls if metric_available(call, field)]
-        return sum(measured) if measured or not ordered_calls else None
 
-    return {
-        "solver": solver_result,
-        "rounds": ordered_rounds,
-        "simplex_calls": ordered_calls,
-        "counts": {
-            "rounds": len(ordered_rounds),
-            "simplex_calls": len(ordered_calls),
-            "simplex_iterations": total("iterations"),
-            "simplex_pivots": total("pivots"),
-            "pivot_measured_calls": sum(metric_available(call, "pivots") for call in ordered_calls),
-        },
-        "top_violated_variables": dict(violations.most_common(20)),
-        "top_violated_constraints": [item for item in resolved_constraints if item["observation_scope"] == "solver_iteration"][:20],
-        "top_observed_bound_constraints": [item for item in resolved_constraints if item["observation_scope"] == "call_boundary"][:20],
-        "top_entering_variables": dict(entering.most_common(20)),
-        "top_leaving_variables": dict(leaving.most_common(20)),
-        "top_pivot_rows": dict(pivot_rows.most_common(20)),
-        "theory_links": theory_links,
-    }
+def build_solver_feedback(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
+    feedback = _SolverFeedback()
+    feedback.add(events)
+    return feedback.snapshot()
+
+
+class SolverProgressReader:
+    """Accumulate the renderer's view of a growing progress log."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._log = AppendLogReader(self.path)
+        self._feedback = _SolverFeedback()
+
+    def read(self) -> Dict[str, Any]:
+        with self._log.read() as (reset, lines):
+            if reset:
+                self._feedback = _SolverFeedback()
+            events = (_parse_progress_line(self.path, number, line) for number, line in lines)
+            self._feedback.add(event for event in events if event is not None)
+        return self._feedback.snapshot()
 
 
 def _result_color(result: Optional[str]) -> str:
@@ -892,6 +925,9 @@ def _compact_theory_flow_lines(
     call_number_by_id = {
         str(call.get("call_id")): index for index, call in enumerate(calls, start=1)
     }
+    calls_by_round = defaultdict(list)
+    for call in calls:
+        calls_by_round[call.get("round")].append(call)
     lines: List[str] = []
     for item in rounds:
         round_index = item.get("round")
@@ -904,7 +940,7 @@ def _compact_theory_flow_lines(
             kind_parts.append(f"+{len(kind_counts) - 3} types")
         atom_summary = ", ".join(kind_parts) or "none"
 
-        round_calls = [call for call in calls if call.get("round") == round_index]
+        round_calls = calls_by_round[round_index]
         call_labels = [
             f"S{call_number_by_id.get(str(call.get('call_id')), '?')}:{call.get('result', 'RUNNING')}"
             for call in round_calls[:4]
@@ -1132,7 +1168,7 @@ def draw_dpll_theory_panel(
                 label.set_verticalalignment("bottom")
                 label.set_position((0, 6))
     from visualization.AnalysisSelection import solver_selection
-    solver_selection(fig, axes, feedback, simplex=False)
+    solver_selection(fig, axes, feedback, simplex=False, flow_lines=link_lines)
     return fig, axes
 
 

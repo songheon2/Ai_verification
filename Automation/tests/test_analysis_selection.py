@@ -124,6 +124,7 @@ try{
                             left, top, right, bottom = region["box"]
                             self.assertTrue(0 <= left < right <= 1)
                             self.assertTrue(0 <= top < bottom <= 1)
+                            self.assertTrue(region["targets"])
                         if renderer == draw_simplex_panel:
                             region = data["regions"][0]
                             item = data["items"][region["items"][11]]
@@ -237,11 +238,22 @@ try{
 const $=id=>document.getElementById(id),assert=(p,m)=>{if(!p)throw Error(m);};
 const wait=async(p,label)=>{for(let i=0;i<200;i++){if(p())return;await new Promise(r=>setTimeout(r,20));}throw Error('timeout '+label);};
 const out=document.createElement('pre');out.id='selection-test';let requests=0;
+let selections=0;window.addEventListener('log-analysis-select',()=>selections++);
 const fetchOriginal=window.fetch;window.fetch=(url,options)=>{if(options?.method==='POST')requests++;return fetchOriginal(url,options);};
 const map=__MAP__,dpllMap=__DPLL_MAP__,reluMap=__RELU_MAP__,points=__POINTS__;
-const hit=(id,region,index)=>{const image=$(id),box=image.getBoundingClientRect(),x=(region.box[0]+region.box[2])/2,y=(region.box[1]+region.box[3])/2;image.dispatchEvent(new MouseEvent('click',{clientX:box.left+box.width*(region.direction==='x'?(region.positions[index]??x):x),clientY:box.top+box.height*(region.direction==='y'?(region.positions[index]??y):y)}));};
+const click=(id,x,y)=>{
+ const image=$(id),box=visualizationImageBox(image);
+ const event=new PointerEvent('click');
+ // The synthetic constructor truncates CSS coordinates, which can miss subpixel strokes.
+ Object.defineProperties(event,{clientX:{value:box.left+box.width*x},clientY:{value:box.top+box.height*y}});
+ image.dispatchEvent(event);
+};
+const hit=(id,region,index,verticalFraction=0.5)=>{
+ const [,,x0,y0,x1,y1]=region.targets.findLast(target=>target[0]===index);
+ click(id,(x0+x1)/2,y0+(y1-y0)*verticalFraction);
+};
 try{
- await wait(()=>$('simplex-dashboard').style.cursor==='pointer','Simplex hit map');
+ await wait(()=>$('simplex-dashboard').dataset.renderVersion,'Simplex hit map');
  $('llm-multi-select').click();
  const selectedText=()=>[...$('llm-selected-items').querySelectorAll('span')].map(span=>span.title).join('\n');
  $('llm-question').value='왜 오래 걸렸나요?';
@@ -249,23 +261,37 @@ try{
  assert($('llm-question').value.includes('왜 오래 걸렸나요?'),'manual question preserved');
  assert(selectedText().includes('12번째')&&selectedText().includes('84'),'correct clicked call metrics');
  assert($('llm-topic').value==='simplex'&&$('llm-call').value==='simplex-112'&&$('llm-round').value==='3','explicit call ID and round, not ordinal');
+ const short=map.regions[0].targets.find(target=>target[0]===0),next=map.regions[0].targets.find(target=>target[0]===1);
+ const work=map.regions[1].box;
+ const selected=selectedText();
+ click('simplex-dashboard',short[2],(map.regions[0].box[1]+short[5])/2);
+ click('simplex-dashboard',(short[2]+next[2])/2,short[3]+(short[5]-short[3])/2);
+ click('simplex-dashboard',(work[0]+work[2])/2,work[1]+0.002);
+ assert(selectedText()===selected&&$('llm-call').value==='simplex-112','white space above and between marks is ignored');
  const once=selectedText();hit('simplex-dashboard',map.regions[0],11);
  assert(selectedText()===once,'repeated click must not duplicate context');
  document.querySelector('.simplex-section').style.width='500px';hit('simplex-dashboard',map.regions[1],12);
  assert($('llm-call').value==='simplex-113'&&selectedText().includes('13번째'),'responsive coordinates');
  assert(!selectedText().includes('12번째'),'old generated context replaced');
  const previous=$('simplex-dashboard'),version=previous.dataset.renderVersion;refreshPanel(panels.find(panel=>panel.id==='simplex-dashboard'),true);
- await wait(()=>previous.dataset.renderVersion!==version&&$('simplex-dashboard').style.cursor==='pointer','refreshed hit map');
+ await wait(()=>previous.dataset.renderVersion!==version,'refreshed hit map');
  assert($('simplex-dashboard')===previous,'refresh keeps the clickable element stable');
  hit('simplex-dashboard',map.regions[0],11);assert($('llm-call').value==='simplex-112','refresh preserves click support');
  hit('simplex-dashboard',map.regions[2],1);assert(selectedText().includes('UNSAT'),'Simplex result bar');
  hit('simplex-dashboard',map.regions[3],0);assert(selectedText().includes('경계 위반 반복'),'repeated bound variable');
- await wait(()=>$('dpll-theory-dashboard').style.cursor==='pointer','DPLL map');
- hit('dpll-theory-dashboard',dpllMap.regions[0],0);assert($('llm-topic').value==='dpll'&&$('llm-round').value==='3','DPLL round');
+ await wait(()=>$('dpll-theory-dashboard').dataset.renderVersion,'DPLL map');
+ hit('dpll-theory-dashboard',dpllMap.regions[0],0,0.15);assert($('llm-topic').value==='dpll'&&$('llm-round').value==='3','DPLL round');
+ const afterBar=selections;
+ const badge=dpllMap.regions[0].targets.find(target=>target[0]===-1);
+ click('dpll-theory-dashboard',(badge[2]+badge[4])/2,(badge[3]+badge[5])/2);
+ assert(selections===afterBar,'white annotation box is ignored');
  hit('dpll-theory-dashboard',dpllMap.regions[3],0);assert(selectedText().includes('selected atoms'),'round theory flow');
- await wait(()=>$('relu-dashboard').style.cursor==='pointer','ReLU history map');
+ await wait(()=>$('relu-dashboard').dataset.renderVersion,'ReLU history map');
  hit('relu-dashboard',reluMap.regions[0],0);assert($('llm-topic').value==='relu'&&$('llm-round').value==='3','ReLU timeline event');
  const relu=$('relu-dashboard'),box=relu.getBoundingClientRect(),point=points[0];
+ const beforePoint=selections;
+ click('relu-dashboard',point.x+point.rx+0.001,point.y);
+ assert(selections===beforePoint,'white space beside a ReLU square is ignored');
  await wait(()=>{relu.dispatchEvent(new MouseEvent('click',{clientX:box.left+box.width*point.x,clientY:box.top+box.height*point.y}));return $('llm-topic').value==='relu';},'ReLU point');
  assert($('llm-layer').value==='1'&&$('llm-neuron').value==='3','neuron selected');
  const frame=$('relu-tree-dashboard');await wait(()=>frame.contentDocument?.querySelector('li summary'),'tree');
@@ -273,6 +299,8 @@ try{
  assert(selectedText().includes('노드 #')&&$('llm-layer').value==='1','tree context');
  const mechanism=$('solver-mechanisms-dashboard');await wait(()=>mechanism.contentDocument?.querySelector('.chart svg'),'mechanisms');
  mechanism.contentDocument.querySelector('.chart svg').dispatchEvent(new MouseEvent('click',{bubbles:true}));
+ await new Promise(r=>setTimeout(r,30));assert($('llm-topic').value==='tree','empty SVG area does not replace the selection');
+ mechanism.contentDocument.querySelector('.chart g[role="button"] line').dispatchEvent(new MouseEvent('click',{bubbles:true}));
  await wait(()=>$('llm-topic').value==='mechanisms','mechanisms prompt');
  assert(document.querySelector('[data-mechanism="bounds"]').getAttribute('aria-checked')==='true'&&$('llm-neuron').value==='3','bound mechanism and neuron');
  assert(selectedText().includes('변경 전')&&selectedText().includes('17'),'selected bound change');
@@ -282,7 +310,8 @@ try{
  mechanism.contentDocument.querySelectorAll('.card')[1].querySelector('[role="button"]').dispatchEvent(new MouseEvent('click',{bubbles:true}));
  await wait(()=>document.querySelector('[data-mechanism="backjump"]').getAttribute('aria-checked')==='true','conflict bar');
  assert(selectedText().includes('2건'),'conflict count');
- mechanism.contentDocument.querySelectorAll('.card')[3].querySelector('.chart').click();
+ mechanism.contentDocument.querySelectorAll('.card')[3].querySelector('.chart g[role="button"] line')
+  .dispatchEvent(new MouseEvent('click',{bubbles:true}));
  await wait(()=>document.querySelector('[data-mechanism="underapprox"]').getAttribute('aria-checked')==='true','underapprox preview');
  assert(selectedText().includes('실제 솔버 적용 결과가 아닙니다'),'preview not execution evidence');
  mechanism.contentDocument.getElementById('occurrenceRecords').querySelector('summary').click();

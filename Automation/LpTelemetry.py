@@ -131,4 +131,6 @@ class ExternalMetrics:
         result.update(metrics_source=source, work_counts_available=(result["pivots"] is not None and
                                                                   result["iterations"] is not None),
                       bound_violation_scope="solver_iteration" if self.native else "call_boundary")
+        if "glpk_profile" in metrics:
+            result["glpk_profile"] = metrics["glpk_profile"]
         return result

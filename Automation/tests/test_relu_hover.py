@@ -1,5 +1,6 @@
 """Verify raster neuron hit maps and responsive file:// hover labels."""
 import json
+from dataclasses import asdict
 from pathlib import Path
 import re
 import subprocess
@@ -7,12 +8,51 @@ import tempfile
 import unittest
 
 from Automation.tests.test_reactive_tree_browser import chromium_path
-from visualization.RealtimeSplitVisualization import SplitLogEvent, draw_realtime_split_dashboard
+from visualization.RealtimeSplitVisualization import RealtimeSplitLog, SplitLogEvent, draw_realtime_split_dashboard
 from visualization.ReluNeuronHover import write_relu_hover_map
 from visualization.UnifiedRealtimeDashboard import UnifiedRealtimeDashboard
 
 
 class ReluHoverTests(unittest.TestCase):
+    def test_incremental_split_history_matches_full_render_after_window_moves(self):
+        from visualization.RenderProcess import _replace_figure
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "events.jsonl"
+            cache = RealtimeSplitLog(path)
+            events = [SplitLogEvent("", 1_000_000_000, "a", 1, 3, "z1_3", "+"),
+                      SplitLogEvent("", 2_000_000_000, "a", 1, 3, "z1_3", "-"),
+                      SplitLogEvent("", 12_000_000_000, "b", 2, 7, "z2_7", "+")]
+            records = [json.dumps(asdict(event)) + "\n" for event in events]
+            path.write_text("".join(records[:2]), encoding="utf-8")
+            cache.read()
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(records[2][:-2])
+            cache.read()
+            self.assertEqual(cache.events, events[:2])
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(records[2][-2:])
+            cache.read()
+            self.assertEqual(cache.events, events)
+
+            starts = [{"round": 1, "time_ns": 0}]
+            self.assertEqual(cache.hover_counts(starts)[(2, 7)][1], 1)
+            starts.append({"round": 2, "time_ns": 10_000_000_000})
+            options = {"round_starts": starts, "window_seconds": 5, "current_time_ns": 15_000_000_000}
+            for name, split_log in (("full", None), ("incremental", cache)):
+                figure, _ = draw_realtime_split_dashboard(path, split_log=split_log, **options)
+                _replace_figure(figure, root / name / "relu.png", 100)
+            for name in ("relu.png", "relu.hover.js", "relu.selection.js"):
+                self.assertEqual((root / "full" / name).read_bytes(), (root / "incremental" / name).read_bytes())
+            self.assertEqual(cache.hover_counts(starts)[(1, 3)][1], 1)
+            self.assertEqual(cache.hover_counts(starts)[(2, 7)][2], 1)
+
+            path.write_text(records[2], encoding="utf-8")
+            cache.read()
+            self.assertEqual(cache.events, events[2:])
+            self.assertEqual(cache.neuron_counts(), ({(2, 7): 1}, {(2, 7): 1}, 0))
+
     @unittest.skipUnless(chromium_path(), 'Chromium is not installed')
     def test_hover_names_survive_resizing_and_image_refresh(self):
         import matplotlib.pyplot as plt

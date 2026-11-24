@@ -767,6 +767,9 @@ def simplex(
         )
 
     def _finish(result: str) -> None:
+        if stats is not None:
+            stats["SIMPLEX_ITERATIONS"] = stats.get("SIMPLEX_ITERATIONS", 0) + iteration_count
+            stats["SIMPLEX_PIVOTS"] = stats.get("SIMPLEX_PIVOTS", 0) + pivot_count
         if mechanism_callback is not None:
             mechanism_callback(**mechanism_counts, result=result,
                                origin=str(context.get("origin", "simplex")))

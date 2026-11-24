@@ -3,7 +3,7 @@
 이 모듈은 `reluplex(row_defs, bounds, relus)`를 제공하며,
 사진의 Algorithm 4(간단화된 Reluplex)의 재귀적 구현을 따릅니다.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from math import isfinite
 from typing import Any, Dict, List, Tuple, Optional
 from Simplex import (
@@ -497,7 +497,10 @@ def reluplex(
             dict(kwargs.get("progress_context") or {}), core.name, owner=core,
             model=tableau.assign, bounds=tableau.bounds,
         ) as outcome:
-            answer = core.simplex(*args, **kwargs)
+            profile_call = getattr(core, "profile_call", None)
+            with (profile_call() if profile_call is not None and progress is not None
+                  and "simplex" in getattr(progress, "enabled_panels", {"simplex"}) else nullcontext()):
+                answer = core.simplex(*args, **kwargs)
             outcome["sat"] = answer[1]
             return answer
 
@@ -1196,6 +1199,7 @@ def reluplex(
 
 
         if branch_x is not None and depth < max_recursion:
+            _bump("RELU_SPLITS")
             neuron_key = None
             if relu_y is not None and relu_metadata is not None:
                 layer_index = relu_metadata.get((branch_x, relu_y))

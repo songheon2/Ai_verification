@@ -161,6 +161,7 @@ class VerificationLauncher:
         self.browser = None
         self.closing = False
         self.batch_thread = None
+        self.batch_analysis_cancel = None
         self.batch_log = None
         self.batch_process = None
         self.batch_worker_stopped = False
@@ -609,9 +610,7 @@ class VerificationLauncher:
             self._stop_single()
             if self.batch is not None:
                 self._stop_batch(self.batch)
-                if self.batch["analysis"]["status"] == "running":
-                    self.batch["analysis"] = {"status": "cancelled"}
-                    self._save_batch(self.batch)
+                self._cancel_batch_analysis(self.batch)
             self.closing = True
             single, batch_thread = self.current, self.batch_thread
 
@@ -679,7 +678,7 @@ class VerificationLauncher:
         try:
             path = self._batch_path(batch_id)
             with path.open(encoding="utf-8") as stream:
-                data = json.loads(stream.read(2 * 1024 * 1024))
+                data = json.load(stream)
             modified = datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat()
         except (OSError, ValueError):
             return None
@@ -737,7 +736,7 @@ class VerificationLauncher:
     @staticmethod
     def _saved_batch_analysis(data, modified):
         result = data.get("saved_analysis") or data.get("analysis")
-        if not isinstance(result, dict) or result.get("status") != "complete" or not isinstance(result.get("report"), str):
+        if not isinstance(result, dict) or result.get("status") not in ("complete", "incomplete") or not isinstance(result.get("report"), str):
             return None
         runs = data.get("runs")
         sources = []
@@ -775,7 +774,7 @@ class VerificationLauncher:
                     or path != root / analysis_id / "analysis.json"):
                 return None
             with path.open(encoding="utf-8") as stream:
-                data = json.loads(stream.read(2 * 1024 * 1024))
+                data = json.load(stream)
             modified = datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat()
         except (OSError, ValueError):
             return None
@@ -1102,13 +1101,33 @@ class VerificationLauncher:
             if batch["analysis"]["status"] == "complete":
                 batch["saved_analysis"] = batch["analysis"]
             budget = {"used": 0, "limit": max_calls, "remaining": max_calls}
-            batch["analysis"] = {"status": "running", "request_budget": budget, **snapshot}
+            analysis_id, cancel = secrets.token_hex(12), Event()
+            self.batch_analysis_cancel = cancel
+            batch["analysis"] = {"id": analysis_id, "status": "running", "request_budget": budget, **snapshot}
             Thread(target=self._analyze_batch,
-                   args=(batch, runs, limits, snapshot, question, history, history.snapshot(), client_factory, max_calls),
+                   args=(batch, runs, limits, snapshot, question, history, history.snapshot(), client_factory, max_calls, cancel),
                    name="verification-batch-analysis", daemon=True).start()
-        return {"id": batch["id"], "status": "running", "request_budget": budget}
+        return {"id": batch["id"], "analysis_id": analysis_id, "status": "running", "request_budget": budget}
 
-    def _analyze_batch(self, batch, runs, limits, snapshot, question, history, conversation, client_factory, max_calls):
+    def _cancel_batch_analysis(self, batch):
+        if batch["analysis"]["status"] == "running":
+            self.batch_analysis_cancel.set()
+            self.batch_analysis_cancel = None
+            batch["analysis"] = {**batch["analysis"], "status": "cancelled"}
+            self._save_batch(batch)
+
+    def stop_batch_analysis(self, body):
+        if not isinstance(body, dict) or not isinstance(body.get("analysis_id"), str):
+            raise ValueError("중단할 분석을 찾을 수 없습니다.")
+        with self.lock:
+            batch = self._get_batch(body.get("id"))
+            if batch["analysis"].get("id") != body["analysis_id"]:
+                raise ValueError("중단할 분석을 찾을 수 없습니다.")
+            self._cancel_batch_analysis(batch)
+            return {"status": batch["analysis"]["status"]}
+
+    def _analyze_batch(self, batch, runs, limits, snapshot, question, history, conversation, client_factory, max_calls, cancel):
+        from Automation.AnalyzeLogs import PartialBatchResponse
         from Automation.LogAnalysisIndex import safe_data
 
         def budget(used):
@@ -1116,14 +1135,18 @@ class VerificationLauncher:
 
         def report_usage(used, _limit):
             with self.lock:
-                if batch["analysis"]["status"] == "running":
+                if self.batch_analysis_cancel is cancel:
                     batch["analysis"] = {**batch["analysis"], "request_budget": budget(used)}
 
         client = None
         try:
             for run, sources in zip(runs, limits):
+                if cancel.is_set():
+                    return
                 if observations := summarize_logs(sources):
                     run["recorded_logs"] = observations
+            if cancel.is_set():
+                return
             if not (snapshot.get("followup_source") or snapshot.get("overview")) and not any(
                 self._has_analysis_evidence(run) or run.get("recorded_logs") for run in runs
             ):
@@ -1131,9 +1154,14 @@ class VerificationLauncher:
             client = client_factory()
             client.max_requests = max_calls
             client.request_progress = report_usage
+            client.cancel_event = cancel
             report = client.summarize_verification_batch(runs, question, snapshot=snapshot, conversation=conversation)
             result = {"status": "complete", "model": client.model, "report": report,
                       "api_calls": client.requests_made, "question": question,
+                      "saved_at": datetime.now().astimezone().isoformat(), **snapshot}
+        except PartialBatchResponse as exc:
+            result = {"status": "incomplete", "model": client.model, "report": exc.report,
+                      "api_calls": client.requests_made, "question": question, "error": safe_data(str(exc)),
                       "saved_at": datetime.now().astimezone().isoformat(), **snapshot}
         except Exception as exc:
             key = getattr(client, "key", None)
@@ -1141,10 +1169,13 @@ class VerificationLauncher:
             result = {"status": "error", "error": safe_data(message[:500])}
         result["request_budget"] = budget(client.requests_made if client is not None else 0)
         with self.lock:
-            if batch["analysis"]["status"] == "running":
+            if self.batch_analysis_cancel is cancel:
+                self.batch_analysis_cancel = None
+                result["id"] = batch["analysis"]["id"]
                 batch["analysis"] = result
-                if result["status"] == "complete":
-                    history.remember(question, result["report"])
+                if result["status"] in ("complete", "incomplete"):
+                    if result["status"] == "complete":
+                        history.remember(question, result["report"])
                     batch["saved_analysis"] = result
                 self._save_batch(batch)
 

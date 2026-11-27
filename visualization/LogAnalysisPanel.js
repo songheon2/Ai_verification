@@ -68,6 +68,7 @@
   consent.checked=false;
   try{consent.checked=sessionStorage.getItem(consentKey)==='1';}catch(_error){}
   let info=null, revision=0, busy=false,analysisText='',baseline=null,infoBusy=false;
+  let analysisJobId=null, analysisStopping=false;
   let infoTimer=null,pendingInfo=null;
   const icons={analyze:['M12 3v4m0 10v4M3 12h4m10 0h4','m5.6 5.6 2.8 2.8m7.2 7.2 2.8 2.8m0-12.8-2.8 2.8m-7.2 7.2-2.8 2.8','m12 8 4 4-4 4-4-4Z'],
     history:['M3 11a9 9 0 1 1 2.6 7.4','M3 4v7h7','M12 7v5l3 2'],
@@ -84,11 +85,44 @@
   const statusLabels={complete:'분석 완료',api_error:'API 오류',incomplete:'일부 응답',budget_exhausted:'호출 상한 도달',no_data:'기록 없음',blocked:'응답 차단'};
   function clearReport(message){
     baseline=null;showSnapshot();
-    analysisText='';$('llm-result').textContent=message;$('llm-copy').disabled=true;
+    analysisText='';$('llm-result').textContent=message;$('llm-copy').disabled=true;$('llm-fullscreen').disabled=true;
     $('llm-result-tag').textContent='대기';delete $('llm-result-tag').dataset.status;
   }
   const topic=$('llm-topic'),round=$('llm-round'),layer=$('llm-layer'),neuron=$('llm-neuron'),call=$('llm-call');
   const topicPanels=[['dpll-theory-dashboard','dpll'],['simplex-dashboard','simplex'],['relu-dashboard','relu'],['relu-tree-dashboard','tree'],['solver-mechanisms-dashboard','mechanisms']];
+  let citationTargets={}, citationRequest=0, pendingCitation=null, citationTimer;
+  function citationDetail(target){
+    const interval=values=>Array.isArray(values)?`[${values[0]??'−∞'}, ${values[1]??'+∞'}]`:'';
+    return [window.formatLogAnalysisCitationLabel(target),
+      target.result,Number.isFinite(target.seconds)?`${Number(target.seconds.toPrecision(4))}초`:'',
+      target.before&&target.after?`${interval(target.before)} → ${interval(target.after)}`:''].filter(Boolean).join(' · ');
+  }
+  panel.addEventListener('click',event=>{
+    const button=event.target.closest('button[data-citation-ref]');
+    if(!button)return;
+    const target=Object.hasOwn(citationTargets,button.dataset.citationRef)
+      && citationTargets[button.dataset.citationRef][Number(button.dataset.citationIndex)];
+    if(!target)return;
+    const frame=$(topicPanels.find(([,topic])=>topic===target.topic)?.[0]);
+    clearTimeout(citationTimer);
+    pendingCitation=null;
+    if(!frame){
+      const footer=button.closest('.llm-references');
+      const detail=footer.querySelector('output')||document.createElement('output');
+      detail.textContent=citationDetail(target);footer.append(detail);
+      return;
+    }
+    button.closest('dialog')?.close();
+    frame.scrollIntoView({block:'start'});
+    $('llm-reference-status').textContent=citationDetail(target);
+    if(frame.tagName!=='IFRAME'||!(target.branchId||target.item))return;
+    const request=++citationRequest;
+    pendingCitation={frame,request,target};
+    frame.contentWindow?.postMessage({type:'log-analysis-reference',request,target},'*');
+    citationTimer=setTimeout(()=>{
+      if(pendingCitation?.request===request)$('llm-reference-status').textContent=citationDetail(target)+' · 해당 위치를 아직 열지 못했습니다.';
+    },10000);
+  });
   const availableTopics=new Set(['all',...topicPanels.filter(([id])=>$(id)).map(([,value])=>value)]);
   for(const option of [...topic.options])if(!availableTopics.has(option.value))option.remove();
   const mechanismTabs=[...panel.querySelectorAll('[data-mechanism]')];
@@ -120,8 +154,12 @@
     topic.value==='mechanisms'?mechanismTabs.find(tab=>tab.dataset.mechanism===mechanism).textContent:'',round.value?`R${round.value}`:'전체 Round',
     neuronScope()&&layer.value!==''?`L${layer.value}${neuron.value!==''?':N'+neuron.value:''}`:'',
     topic.value==='simplex'?window.formatLogAnalysisText(call.value):''].filter(Boolean).join(' · ');
-  const enabled=()=>{$('llm-start').disabled=!info || busy || !$('llm-consent').checked
-    || (info.model_selection && (!modelCatalogLoaded || !$('llm-model').value));};
+  const enabled=()=>{
+    $('llm-start').disabled=!info || busy || !$('llm-consent').checked
+      || (info.model_selection && (!modelCatalogLoaded || !$('llm-model').value));
+    $('llm-stop').hidden=!busy;
+    $('llm-stop').disabled=!analysisJobId||analysisStopping;
+  };
   const options=(element,values,empty)=>{
     const selected=element.value;
     const fromChart=element.selectedOptions[0]?.dataset.visualization==='1';
@@ -133,7 +171,6 @@
     if([...element.options].some(option=>option.value===selected))element.value=selected;
   };
   function renderSelections(){
-    $('llm-selected-count').textContent=selectedItems.length?`${selectedItems.length}개 선택`:'';
     $('llm-clear-selection').disabled=!selectedItems.length;
     $('llm-selected-items').hidden=!selectedItems.length;
     $('llm-selected-items').replaceChildren(...selectedItems.map((item,index)=>{
@@ -192,6 +229,13 @@
   }
   window.addEventListener('log-analysis-select',event=>selectChartItem(event.detail));
   window.addEventListener('message',event=>{
+    if(event.data?.type==='log-analysis-reference-result' && pendingCitation?.frame.contentWindow===event.source
+        && pendingCitation.request===event.data.request){
+      clearTimeout(citationTimer);
+      $('llm-reference-status').textContent=citationDetail(pendingCitation.target)+(event.data.found?'':' · 화면에 해당 기록이 없습니다.');
+      pendingCitation=null;
+      return;
+    }
     if(event.data?.type!=='log-analysis-select')return;
     const source=topicPanels.find(([id])=>$(id)?.tagName==='IFRAME' && $(id).contentWindow===event.source);
     if(!source || source[1]!==event.data.scope?.topic)return;
@@ -208,7 +252,9 @@
     const response=await fetch(new URL(path,endpoint),{cache:'no-store',
       signal:AbortSignal.timeout(20000),
       ...(body?{method:'POST',headers:{'Content-Type':'application/json','X-Analysis-Token':info.csrf},body:JSON.stringify(body)}:{})});
-    const value=await response.json();if(!response.ok)throw Error(value.error||`HTTP ${response.status}`);return value;
+    const value=await response.json();
+    if(!response.ok)throw Object.assign(Error(value.error||`HTTP ${response.status}`),{status:response.status});
+    return value;
   }
   window.bindAnalysisQuotaLink($('llm-quota-link'), () => {
     if(!info?.csrf)throw Error('분석 화면 연결이 준비되면 다시 눌러 주세요.');
@@ -249,12 +295,15 @@
     if(result){
       baseline=result.snapshot||null;showSnapshot();
       analysisText=String(result.analysis||'');
-      window.renderLogAnalysisMarkdown($('llm-result'),analysisText);
+      citationTargets=result.citation_targets||{};
+      window.renderLogAnalysisMarkdown($('llm-result'),analysisText,citationTargets);
       $('llm-copy').disabled=!analysisText;
+      $('llm-fullscreen').disabled=!analysisText;
       $('llm-result-tag').textContent=statusLabels[result.status]||result.status;
       $('llm-result-tag').dataset.status=result.status;
     }else clearReport('선택 항목의 저장된 분석이 없습니다.');
-    if(result)$('llm-progress').textContent=[statusLabels[result.status]||result.status,result.model].filter(Boolean).join(' · ');
+    if(result)$('llm-progress').textContent=[statusLabels[result.status]||result.status,result.model,
+      result.finish_reason==='MAX_TOKENS'?'모델 출력 한도':''].filter(Boolean).join(' · ');
   }
   function showSnapshot(){
     const state=info?.state;
@@ -268,8 +317,10 @@
     $('llm-new-records').textContent=added===null?'이전 세션 또는 다른 수집 범위의 분석입니다. 현재까지 분석을 다시 요청할 수 있습니다.':`분석 이후 새 기록 +${added.toLocaleString()}건 (전체 로그 기준)${state.source_bytes>baseline.source_bytes && added===0?' · 추가 데이터 미수집':''}`;
   }
   let resultRequest=null;
+  const savedPanel=$('llm-saved-results'), savedSelect=$('llm-saved-result'), savedStatus=$('llm-saved-status');
+  let savedRequest=0;
   async function loadResult(){
-    if(!info)return;
+    if(!info||!savedPanel.hidden)return;
     const version=revision;
     if(resultRequest)resultRequest.abort();
     const controller=new AbortController();resultRequest=controller;
@@ -280,7 +331,54 @@
     }catch(error){if(error.name!=='AbortError'&&version===revision)$('llm-progress').textContent=error.message;}
     finally{if(resultRequest===controller)resultRequest=null;}
   }
+  function closeSavedResults(){
+    savedRequest++;
+    savedPanel.hidden=true;
+    $('llm-reload').setAttribute('aria-expanded','false');
+    queuedReport=null;
+  }
+  function savedLabel(entry){
+    const date=entry.created_at?new Date(entry.created_at).toLocaleString():'';
+    const scopes=entry.scope.selections||[entry.scope];
+    const labels=scopes.map(({topic:value,round:roundId,layer:layerId,neuron:neuronId,call_id:callId,mechanism:kind})=>{
+      const name=[...topic.options].find(option=>option.value===value)?.textContent||value;
+      const technique=mechanismTabs.find(tab=>tab.dataset.mechanism===kind)?.textContent;
+      return [name,kind&&kind!=='all'?technique:'',roundId?`R${roundId}`:'',
+        layerId!=null?`L${layerId}${neuronId!=null?':N'+neuronId:''}`:'',callId?window.formatLogAnalysisText(callId):''].filter(Boolean).join(' ');
+    });
+    return [date,[...new Set(labels)].join(' / '),entry.question||'기본 분석',entry.status==='incomplete'?'일부 응답':''].filter(Boolean).join(' · ');
+  }
+  async function showSavedResult(){
+    if(!savedSelect.value)return;
+    const request=++savedRequest;
+    savedStatus.textContent='저장 답변을 여는 중입니다.';
+    try{
+      const {result}=await api('saved-result?id='+encodeURIComponent(savedSelect.value));
+      if(request!==savedRequest)return;
+      display(result);
+      savedStatus.textContent='';
+    }catch(error){if(request===savedRequest)savedStatus.textContent=error.message;}
+  }
+  async function openSavedResults(){
+    if(!info){$('llm-progress').textContent='로컬 분석 서버에 연결된 화면에서 저장 답변을 볼 수 있습니다.';return;}
+    resultRequest?.abort();queuedReport=null;
+    savedPanel.hidden=false;
+    $('llm-reload').setAttribute('aria-expanded','true');
+    savedSelect.disabled=true;savedSelect.replaceChildren();
+    savedStatus.textContent='저장 답변을 찾는 중입니다.';
+    const request=++savedRequest;
+    try{
+      const {entries}=await api('saved-results?scope='+encodeURIComponent(JSON.stringify(scope())));
+      if(request!==savedRequest)return;
+      if(!entries.length){savedStatus.textContent='이 실행에 저장된 답변이 없습니다.';return;}
+      savedSelect.replaceChildren(...entries.map(entry=>new Option(savedLabel(entry),entry.id)));
+      savedSelect.value=(entries.find(entry=>entry.matching_scope)||entries[0]).id;
+      savedSelect.disabled=false;
+      await showSavedResult();
+    }catch(error){if(request===savedRequest)savedStatus.textContent=error.message;}
+  }
   function changed({keepSelections=false}={}){
+    if(!savedPanel.hidden)closeSavedResults();
     if(!keepSelections&&!multiSelect.checked&&selectedItems.length){selectedItems=[];renderSelections();}
     revision++; $('llm-selection').textContent=caption();
     $('llm-call-label').hidden=topic.value!=='simplex';
@@ -322,14 +420,38 @@
     try{if(consent.checked)sessionStorage.setItem(consentKey,'1');else sessionStorage.removeItem(consentKey);}catch(_error){}
     enabled();
   });
-  $('llm-reload').addEventListener('click',loadResult);
+  $('llm-reload').addEventListener('click',openSavedResults);
+  savedSelect.addEventListener('change',showSavedResult);
+  $('llm-close-saved').addEventListener('click',()=>{
+    closeSavedResults();loadResult();$('llm-reload').focus();
+  });
+  window.bindAnalysisFullscreen($('llm-fullscreen'),$('llm-result'));
   $('llm-copy').addEventListener('click',async()=>{
     try{await navigator.clipboard.writeText(analysisText);buttonLabel($('llm-copy'),'복사됨','copy');}
     catch(_error){buttonLabel($('llm-copy'),'복사 실패','copy');}
     setTimeout(()=>{buttonLabel($('llm-copy'),'원문 복사','copy');},1500);
   });
+  function showCancelledAnalysis(){
+    analysisJobId=null;analysisStopping=false;busy=false;enabled();
+    if(savedPanel.hidden){
+      clearReport('분석을 중단했습니다.');
+      $('llm-result-tag').textContent='중단됨';
+      $('llm-progress').textContent='분석을 중단했습니다.';
+    }
+  }
+  $('llm-stop').addEventListener('click',async()=>{
+    if(!analysisJobId||analysisStopping)return;
+    const id=analysisJobId;
+    analysisStopping=true;enabled();
+    try{
+      const state=await api('analyze-stop',{id});
+      if(analysisJobId===id&&state.status==='cancelled')showCancelledAnalysis();
+    }catch(error){if(analysisJobId===id)$('llm-progress').textContent=error.message;}
+    finally{if(analysisJobId===id){analysisStopping=false;enabled();}}
+  });
   $('llm-start').addEventListener('click',async()=>{
     if($('llm-start').disabled)return;
+    if(!savedPanel.hidden)closeSavedResults();
     if(callInputTimer!==null){clearTimeout(callInputTimer);callInputTimer=null;changed();}
     if(selectedItems.length&&info.selection_context!==true){
       $('llm-progress').textContent='선택 정보 전달을 지원하도록 시각화 연결을 종료한 뒤 다시 실행해 주세요.';return;
@@ -341,17 +463,27 @@
     try{
       const job=await api('analyze',{scope:selection,question:$('llm-question').value,selected_items,
         model:modelSelect.value||info.model,thinking_level:effortSelect.value,consent:$('llm-consent').checked});
+      analysisJobId=job.id;enabled();
       if(version===revision){baseline=job.snapshot;showSnapshot();}
       const poll=async()=>{
+        if(analysisJobId!==job.id)return;
         try{
           const state=await api('job?id='+encodeURIComponent(job.id));
-          if(version===revision){baseline=state.snapshot||baseline;showSnapshot();}
+          if(analysisJobId!==job.id)return;
+          if(version===revision&&savedPanel.hidden){baseline=state.snapshot||baseline;showSnapshot();}
           if(state.status==='running'){setTimeout(poll,1000);return;}
+          if(state.status==='cancelled'){showCancelledAnalysis();return;}
+          analysisJobId=null;analysisStopping=false;
           busy=false;enabled();
           // A result for the previous selection must never overwrite the current item.
-          if(version===revision){if(state.result)display(state.result);else $('llm-progress').textContent=state.error||state.status;}
-          else loadResult();
-        }catch(error){busy=false;enabled();if(version===revision)$('llm-progress').textContent=error.message;}
+          if(version!==revision)loadResult();
+          else if(savedPanel.hidden){if(state.result)display(state.result);else $('llm-progress').textContent=state.error||state.status;}
+        }catch(error){
+          if(analysisJobId!==job.id)return;
+          if(version===revision)$('llm-progress').textContent=error.message;
+          if(error.status===404||error.status===403){analysisJobId=null;analysisStopping=false;busy=false;enabled();}
+          else setTimeout(poll,1000);
+        }
       };poll();
     }catch(error){busy=false;enabled();if(version===revision)$('llm-progress').textContent=error.message;}
   });
@@ -396,7 +528,6 @@
         options(neuron,info.options.neurons[layer.value]||[],'전체 Neuron');
         $('llm-call-list').replaceChildren(...info.options.calls.map(value=>new Option(value,value)));
       }
-      $('verify-picker').hidden=!info.verification_launcher;
       $('llm-model-label').hidden=!info.model_selection;
       $('llm-effort-label').hidden=false;
       if(first || reset)updateEffortOptions();

@@ -68,7 +68,10 @@ class LogAnalysisTests(unittest.TestCase):
             call.args[0]["systemInstruction"]["parts"][0]["text"] for call in send.call_args_list
         ]
         for instruction in (individual, batch, overview):
+            self.assertIn("맨 위에 마크다운 제목 `## 결과 요약`", instruction)
             self.assertIn("첫 문장에 질문의 결론", instruction)
+            self.assertIn("핵심 결과를 1~3문장", instruction)
+            self.assertIn("질문에 답하거나 관찰을 해석하는 데 꼭 필요한 경우에만 언급", instruction)
             self.assertIn("문장마다 한 문단", instruction)
             self.assertIn("소수점, 수식, 표 구조", instruction)
             self.assertIn("내부 식별자", instruction)
@@ -77,11 +80,15 @@ class LogAnalysisTests(unittest.TestCase):
         for instruction in (individual, batch):
             self.assertIn("GLPK", instruction)
             self.assertIn("누락 항목은 미확인", instruction)
+            self.assertIn("LP 호출 횟수 증가, 호출당 작업량 증가", instruction)
+            self.assertIn("분기 기록만으로 그 뉴런의 수정 시도나 실패", instruction)
+            self.assertIn("마지막 관련 라운드의 이론 결과와 다음 Boolean 결과", instruction)
         for name in ("Theory Solver Result", "Repeated bound violations", "STABLE 확정 뉴런"):
             self.assertIn(name, individual)
         self.assertIn("기록된 순번", individual)
         self.assertIn("시각화 켬·끔", batch)
         self.assertIn("구조와 흐름", overview)
+        self.assertIn("검증기에 계측 기능이 없다고 판단하지 마세요", overview)
 
     def test_last_api_call_asks_for_final_answer_without_repeating_format_rules(self):
         client = FakeClient(answer([{"text": "현재 기록만으로는 원인을 확정할 수 없습니다."}]))
@@ -95,12 +102,13 @@ class LogAnalysisTests(unittest.TestCase):
     def test_batch_retries_token_cutoff_and_preserves_the_configured_thinking_level(self):
         client = GeminiClient("offline-test-key", thinking_level="medium")
         client.max_requests = 2
-        cutoff = answer([{"text": "internal", "thought": True}], "MAX_TOKENS")
-        with patch.object(client, "_post_generation", side_effect=[cutoff, answer([{"text": "비교 결과"}])]) as send:
+        cutoff = answer([{"text": "internal", "thought": True}, {"text": "비교"}], "MAX_TOKENS")
+        with patch.object(client, "_post_generation", side_effect=[cutoff, answer([{"text": " 결과"}])]) as send:
             self.assertEqual(client.summarize_verification_batch([{"status": "complete"}] * 10, "비교"), "비교 결과")
         configs = [call.args[0]["generationConfig"] for call in send.call_args_list]
-        self.assertEqual([config["maxOutputTokens"] for config in configs], [16384, 32768])
+        self.assertTrue(all("maxOutputTokens" not in config for config in configs))
         self.assertEqual(configs[0]["thinkingConfig"], configs[1]["thinkingConfig"])
+        self.assertTrue(send.call_args.args[0]["contents"][-1]["parts"][0]["text"].endswith("비교"))
 
     def test_batch_explains_missing_answer_and_respects_request_budget(self):
         client = GeminiClient("offline-test-key")
@@ -270,8 +278,20 @@ class LogAnalysisTests(unittest.TestCase):
         self.assertEqual(len(result["queries"]), 1)
 
     def test_token_limit_is_incomplete_not_success(self):
-        result = analyze({"run": self.index()}, FakeClient(answer([{"text": "partial"}], "MAX_TOKENS")), "분석")
+        result = analyze({"run": self.index()}, FakeClient(answer([{"text": "partial"}], "MAX_TOKENS")), "분석", 1)
         self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["analysis"], "partial")
+        self.assertEqual(result["finish_reason"], "MAX_TOKENS")
+
+    def test_individual_continuation_preserves_both_parts_with_tools_disabled(self):
+        client = FakeClient(answer([{"text": "일부 답변"}], "MAX_TOKENS"), answer([{"text": "의 마지막입니다."}]))
+        result = analyze({"run": self.index()}, client, "자세히 분석", 3)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["analysis"], "일부 답변의 마지막입니다.")
+        self.assertEqual(result["api_calls"], 2)
+        contents, final = client.requests[-1]
+        self.assertTrue(final)
+        self.assertTrue(contents[-1]["parts"][0]["text"].endswith("일부 답변"))
 
     def test_redaction_and_response_budget(self):
         clean = safe_data({"api_key": "private", "path": "C:\\user\\file.onnx", "value": float("inf"),
@@ -426,7 +446,7 @@ class LogAnalysisTests(unittest.TestCase):
             index.assert_not_called()
 
     def test_thinking_configuration_respects_model_version_and_explicit_default(self):
-        self.assertEqual(GeminiClient("key", thinking_level="default").generation_config(), {"maxOutputTokens": 4096})
+        self.assertEqual(GeminiClient("key", thinking_level="default").generation_config(), {})
         self.assertEqual(GeminiClient("key", model="gemini-2.5-flash").generation_config()["thinkingConfig"], {"thinkingBudget": 512})
         self.assertEqual(GeminiClient("key", thinking_level="high").generation_config()["thinkingConfig"], {"thinkingLevel": "HIGH"})
         self.assertEqual(GeminiClient("key", model="gemini-4-hydrogen", thinking_level="xhigh").generation_config()["thinkingConfig"], {"thinkingLevel": "xhigh"})

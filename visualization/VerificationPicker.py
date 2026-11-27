@@ -1,4 +1,4 @@
-"""ONNX/VNNLIB selector shared by the realtime dashboard and launcher page."""
+"""ONNX/VNNLIB selector for the verification launcher page."""
 
 from pathlib import Path
 
@@ -31,11 +31,12 @@ def _catalog_combobox(name, label):
 
 def picker_markup(*, standalone=False):
     attributes = 'open data-standalone="true"' if standalone else 'hidden'
+    controls = Path(__file__).with_name("LogAnalysisControls.js").read_text(encoding="utf-8")
     standalone_assets = ""
     if standalone:
         markdown = Path(__file__).with_name("LogAnalysisMarkdown.js").read_text(encoding="utf-8")
         standalone_assets = analysis_styles() + "<script>" + markdown + "</script>"
-    return (standalone_assets + r'''
+    return (standalone_assets + "<script>" + controls + "</script>" + r'''
 <details id="verify-picker" ATTRIBUTES>
 <summary>새 검증 실행</summary>
 <style>
@@ -198,6 +199,7 @@ def picker_markup(*, standalone=False):
         <div class="llm-action-row">
           <label class="llm-consent"><input type="checkbox">질문·답변과 분석에 필요한 자료를 Google에 전송하는 데 동의합니다</label>
           <button class="llm-button llm-primary" type="button" data-analyze disabled>질문하기</button>
+          <button class="llm-button" type="button" data-analysis-stop hidden disabled>분석 중단</button>
         </div>
       </fieldset>
       <div class="llm-state" data-analysis-status aria-live="polite"></div>
@@ -220,6 +222,7 @@ def picker_markup(*, standalone=False):
         <span class="llm-report-title">분석 결과</span>
         <span class="llm-result-tag" data-analysis-tag aria-live="polite">대기</span>
         <button class="llm-button llm-copy" type="button" data-copy disabled>원문 복사</button>
+        <button class="llm-button llm-expand" type="button" data-fullscreen aria-haspopup="dialog" disabled>전체 화면 보기</button>
       </div>
       <article class="llm-result" data-report data-empty="true" aria-label="통합 분석 보고서">답변이 여기에 표시됩니다.</article>
     </div>
@@ -228,34 +231,6 @@ def picker_markup(*, standalone=False):
 </form>
 </details>
 <script>
-window.setAnalysisEffortOptions = (select, levels) => {
-  const previous = select.value;
-  const labels = {default:'모델 기본값', minimal:'최소', low:'낮음', medium:'보통', high:'높음', xhigh:'매우 높음'};
-  levels ||= ['default'];
-  select.replaceChildren(...levels.map(level => new Option(labels[level], level)));
-  select.value = levels.includes(previous) ? previous : levels.includes('low') ? 'low' : levels[0];
-};
-window.bindAnalysisQuotaLink = (link, openQuota) => {
-  if (!link || location.protocol === 'file:') return;
-  const status = link.parentElement.querySelector('[data-quota-status]');
-  let opening = false;
-  const open = async event => {
-    event.preventDefault();
-    if (opening) return;
-    opening = true;
-    status.textContent = '';
-    try {
-      await openQuota();
-      status.textContent = '기본 브라우저에서 열었습니다.';
-    } catch (error) {
-      status.textContent = error.message;
-    } finally {
-      opening = false;
-    }
-  };
-  link.addEventListener('click', open);
-  link.addEventListener('auxclick', event => { if (event.button === 1) open(event); });
-};
 (() => {
   const panel = document.getElementById('verify-picker');
   if (!panel || location.protocol === 'file:') return;
@@ -287,6 +262,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
   const savedStatus = analysis.querySelector('[data-saved-status]');
   const savedTitle = analysis.querySelector('[data-saved-title]');
   const analyzeButton = analysis.querySelector('[data-analyze]');
+  const analysisStopButton = analysis.querySelector('[data-analysis-stop]');
   const analysisQuestion = analysis.querySelector('textarea');
   const savedRunsPicker = analysis.querySelector('[data-saved-runs-picker]');
   const savedRuns = savedRunsPicker.querySelector('[data-saved-runs]');
@@ -298,6 +274,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
   const analysisTag = analysis.querySelector('[data-analysis-tag]');
   const report = analysis.querySelector('[data-report]');
   const copyButton = analysis.querySelector('[data-copy]');
+  const fullscreenButton = analysis.querySelector('[data-fullscreen]');
   const panelChecks = [...form.querySelectorAll('[data-panel]')];
   const featureChecks = [...form.querySelectorAll('[data-feature]')];
   const numberSettings = ['simplex_max_iter', 'max_rounds', 'max_recursion'];
@@ -319,6 +296,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
   let batchId = null, batchComplete = false, analysisRunning = false, analysisAvailable = false;
   let overviewMode = true;
   let analysisReady = false, analysisSubmitting = false, analysisRevision = 0;
+  let analysisJobId = null, analysisStopping = false;
   let batchPollTimer = null, pollingBatch = null;
   let reportSource = '';
   let modelLoading = false, modelLoaded = false, savedLoading = false;
@@ -363,9 +341,12 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
       || !consent.checked || !batchModel.value;
     analyzeButton.textContent = !followupSource.hidden ? '이어서 질문하기' : overviewMode ? '질문하기'
       : batchComplete ? '전체 실행 분석' : '현재까지 분석';
+    analysisStopButton.hidden = !analysisRunning;
+    analysisStopButton.disabled = !analysisJobId || analysisSubmitting || analysisStopping;
     viewSaved.disabled = savedLoading || !savedSelect.value;
     if (followupButton) followupButton.disabled = !csrf || !savedSelect.value || running || analysisRunning || followupPending;
     copyButton.disabled = !reportSource || activeAnalysisTab === 0 && analysisRunning;
+    fullscreenButton.disabled = copyButton.disabled;
   };
   function clearSavedRuns() {
     selectedSavedRuns = [];
@@ -398,7 +379,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     }
   });
   function setAnalysisTag(state) {
-    const labels = {idle:'대기', running:'분석 중', complete:'완료', incomplete:'일부 답변', error:'오류'};
+    const labels = {idle:'대기', running:'분석 중', complete:'완료', incomplete:'일부 답변', error:'오류', cancelled:'중단됨'};
     analysisTag.dataset.status = state;
     analysisTag.textContent = labels[state] || labels.idle;
   }
@@ -417,7 +398,8 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     if (activeAnalysisTab === 1) {
       renderAnalysis(savedAnalysis || {status:'idle'}, '저장된 LLM 답변을 선택하세요.');
     } else {
-      renderAnalysis(currentAnalysis, overviewMode ? '답변이 여기에 표시됩니다.'
+      renderAnalysis(currentAnalysis, currentAnalysis.status === 'cancelled' ? '분석을 중단했습니다.'
+        : overviewMode ? '답변이 여기에 표시됩니다.'
         : analysisReady ? '분석 버튼을 눌러 기록을 비교하세요.'
         : '분석 결과가 여기에 표시됩니다.');
     }
@@ -907,7 +889,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     clearTimeout(batchPollTimer);
     pollingBatch = id;
     const revisionAtRequest = analysisRevision;
-    const updatingAnalysis = !analysisSubmitting;
+    const updatingAnalysis = !analysisSubmitting && !analysisStopping;
     let retry = false;
     try {
       const state = await api('verify-batch?id=' + encodeURIComponent(id));
@@ -950,14 +932,16 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
           : state.status === 'cancelled' ? '연속 검증 중단' : '연속 검증 종료')
           + ' · ' + state.runs.length + '건' + (state.save_error ? ' · ' + state.save_error : '');
       if (analysisReady && !overviewMode) loadModels();
-      if (updatingAnalysis && !analysisSubmitting && revisionAtRequest === analysisRevision) {
+      if (updatingAnalysis && !analysisSubmitting && !analysisStopping && revisionAtRequest === analysisRevision) {
         analysisRunning = state.analysis.status === 'running';
+        analysisJobId = analysisRunning ? state.analysis.id : null;
         currentAnalysis = state.analysis;
         if (!state.followup_source && state.status === 'cancelled' && state.analysis.question && !analysisQuestion.value) {
           analysisQuestion.value = state.analysis.question;
         }
         analysisStatus.textContent = !analysisAvailable ? 'Gemini API 키를 설정하고 이 화면을 다시 열어 주세요.'
           : analysisRunning ? (overviewMode ? '' : '요청 시점까지의 기록을 분석하고 있습니다.')
+          : state.analysis.status === 'cancelled' ? '분석을 중단했습니다.'
           : state.analysis.error || [
             state.analysis.model, state.analysis.partial && state.analysis.snapshot_at
               ? '부분 기록 · ' + savedDate({saved_at:state.analysis.snapshot_at}) : '',
@@ -979,11 +963,35 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
     enabled();
     if (retry) batchPollTimer = setTimeout(() => pollBatch(id), 1500);
   }
+  analysisStopButton.addEventListener('click', async () => {
+    if (analysisStopButton.disabled) return;
+    const id = batchId, analysisId = analysisJobId;
+    analysisStopping = true;
+    analysisRevision++;
+    enabled();
+    try {
+      const state = await api('verify-batch-analysis-stop', {id, analysis_id:analysisId});
+      if (batchId === id && analysisJobId === analysisId && state.status === 'cancelled') {
+        analysisRunning = false;
+        analysisJobId = null;
+        currentAnalysis = {status:'cancelled'};
+        analysisStatus.textContent = '분석을 중단했습니다.';
+        if (activeAnalysisTab === 0) renderAnalysisTab();
+      }
+    } catch (error) {
+      if (batchId === id) analysisStatus.textContent = error.message;
+    } finally {
+      analysisStopping = false;
+      enabled();
+      if (batchId === id && (running || analysisRunning)) pollBatch(id);
+    }
+  });
   analyzeButton.addEventListener('click', async () => {
     if (analyzeButton.disabled) return;
     analysisSubmitting = true;
     analysisRevision++;
     analysisRunning = true;
+    analysisJobId = null;
     currentAnalysis = {status:'running'};
     enabled();
     renderAnalysisTab();
@@ -994,6 +1002,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
         question:analysisQuestion.value, model, thinking_level:batchEffort.value,
         saved_runs:savedRunsPicker.open ? selectedSavedRuns : []});
       batchId = job.id;
+      analysisJobId = job.analysis_id;
     } catch (error) {
       currentAnalysis = {status:'error'};
       if (activeAnalysisTab === 0) renderAnalysisTab();
@@ -1005,6 +1014,7 @@ window.bindAnalysisQuotaLink = (link, openQuota) => {
       if (analysisRunning) pollBatch(batchId);
     }
   });
+  window.bindAnalysisFullscreen(fullscreenButton, report);
   copyButton.addEventListener('click', async () => {
     if (!reportSource) return;
     try {

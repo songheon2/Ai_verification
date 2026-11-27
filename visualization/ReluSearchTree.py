@@ -496,9 +496,10 @@ def branch_log_path(split_log_path: str | Path) -> Path:
     return path.with_name(f"{path.stem}_branches.jsonl")
 
 
-def _bound_change(event, change, change_id, node_id):
+def _bound_change(event, change, change_id, node_id, source_item):
     return {**change, "id": change_id, "round_index": event.meta.get("round_index"),
-            "depth": event.depth or 0, "nodeId": node_id}
+            "depth": event.depth or 0, "nodeId": node_id,
+            "sourceLine": event.meta.get("source_line"), "sourceItem": source_item}
 
 
 def build_mechanism_report(trace: SolveTrace, nodes: List[Dict[str, Any]], *,
@@ -516,8 +517,8 @@ def build_mechanism_report(trace: SolveTrace, nodes: List[Dict[str, Any]], *,
         if event.meta.get("kind") == "bound_updates":
             if include_bound_history:
                 node_id = locate(event)
-                for change in event.meta.get("changes", []):
-                    bound_history.append(_bound_change(event, change, len(bound_history) + 1, node_id))
+                for item, change in enumerate(event.meta.get("changes", []), 1):
+                    bound_history.append(_bound_change(event, change, len(bound_history) + 1, node_id, item))
             continue
         record = dict(event.meta)
         if event.component == "reluplex_stable":
@@ -545,10 +546,11 @@ def build_mechanism_report(trace: SolveTrace, nodes: List[Dict[str, Any]], *,
             record["targetNodeId"] = next((parent["id"] for parent in ancestors
                                           if parent["depth"] == record.get("target_depth")), None)
         if record.get("kind") == "stable":
-            for neuron in record.get("records", []):
+            for item, neuron in enumerate(record.get("records", []), 1):
                 events.append({**neuron, "kind": "stable", "source": record.get("source"),
                                "round_index": record.get("round_index"), "depth": record["depth"],
-                               "nodeId": record["nodeId"], "sequence": len(events) + 1})
+                               "nodeId": record["nodeId"], "sequence": len(events) + 1,
+                               "sourceLine": record.get("source_line"), "sourceItem": item})
             continue
         record["sequence"] = len(events) + 1
         events.append(record)
@@ -603,6 +605,7 @@ class BranchLogReader:
         self.trace = SolveTrace()
         self.open_events: Dict[str, TraceEvent] = {}
         self.offset = 0
+        self.line_number = 0
         self.revision = 0
         self._identity = None
         self._anchor = b""
@@ -623,6 +626,7 @@ class BranchLogReader:
                 self.trace = SolveTrace()
                 self.open_events.clear()
                 self.offset = 0
+                self.line_number = 0
                 self.revision += 1
             self._identity = identity
             stream.seek(self.offset)
@@ -631,6 +635,7 @@ class BranchLogReader:
                 if not line or (not include_partial and not line.endswith(b"\n")):
                     break
                 self.offset = stream.tell()
+                self.line_number += 1
                 try:
                     record = json.loads(line.decode("utf-8"))
                     if self._consume(record):
@@ -660,6 +665,7 @@ class BranchLogReader:
             depth = int(record.get("depth", 0))
             meta = {key: value for key, value in record.items()
                     if key not in {"event", "timestamp", "time_ns", "monotonic_ns", "depth"}}
+            meta["source_line"] = self.line_number
             if "branch_id" not in meta:
                 # Older JSONL still identifies open branches by ID and append order.
                 meta["branch_id"] = self._open_branch_id(depth, meta.get("round_index"))
@@ -744,9 +750,9 @@ class LiveBoundHistory:
         for event in trace.events[self.cursor:]:
             if event.component == "reluplex_mechanism" and event.meta.get("kind") == "bound_updates":
                 node_id = locate(event)
-                for change in event.meta.get("changes", []):
+                for item, change in enumerate(event.meta.get("changes", []), 1):
                     count += 1
-                    pending.append(_bound_change(event, change, count, node_id))
+                    pending.append(_bound_change(event, change, count, node_id, item))
                     if len(pending) == 4096:
                         write_chunk()
         if pending:

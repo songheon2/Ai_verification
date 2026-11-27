@@ -64,9 +64,13 @@ class VerificationLauncherTests(unittest.TestCase):
         saved_run.parent.mkdir(parents=True)
         saved_run.write_text(json.dumps({"status": "COUNTEREXAMPLE", "model": {"name": "xor_network.bin"},
                                          "solver": {"status": "SAT"}}), encoding="utf-8")
+        cancelled_started, release_cancelled = Event(), Event()
 
         def answer(request):
             data = json.loads(request["contents"][0]["parts"][0]["text"])
+            if data["question"] == "중단할 질문":
+                cancelled_started.set()
+                release_cancelled.wait(15)
             return {"candidates": [{"content": {"parts": [{"text": "답변 " + data["question"]}]}}]}
 
         harness = r'''<script>(async()=>{
@@ -75,6 +79,7 @@ async function wait(test){for(let i=0;i<200;i++){if(test())return;await new Prom
 try{
  const panel=document.getElementById('verify-batch-analysis');
  const model=panel.querySelector('[data-batch-model]'), analyze=panel.querySelector('[data-analyze]');
+ const stop=panel.querySelector('[data-analysis-stop]');
  const report=panel.querySelector('[data-report]'), question=panel.querySelector('textarea');
  const picker=panel.querySelector('[data-saved-runs-picker]'), savedRuns=picker.querySelector('select');
  await wait(()=>!panel.hidden&&!model.disabled);
@@ -82,6 +87,11 @@ try{
  await wait(()=>model.value);
  const consent=panel.querySelector('input[type=checkbox]');
  consent.checked=true;consent.dispatchEvent(new Event('change',{bubbles:true}));
+ await wait(()=>!analyze.disabled);
+ question.value='중단할 질문';analyze.click();
+ await wait(()=>!stop.hidden&&!stop.disabled);
+ stop.click();
+ await wait(()=>stop.hidden&&!analyze.disabled&&report.textContent.includes('분석을 중단했습니다'));
  async function ask(text){
   await wait(()=>!analyze.disabled);
   question.value=text;analyze.click();
@@ -95,6 +105,10 @@ try{
  await ask('이 저장 실행을 설명해 주세요.');
  picker.open=false;
  await ask('그럼 GLPK의 역할은?');
+ panel.querySelector('[data-fullscreen]').click();
+ const fullscreen=panel.querySelector('dialog.llm-fullscreen[open]');
+ if(!fullscreen?.querySelector('article').textContent.includes('그럼 GLPK의 역할은?'))throw Error('full-screen report');
+ fullscreen.querySelector('button').click();
  if(!document.querySelector('[data-runs]').hidden)throw Error('fake run appeared');
  out.textContent='PASS';
 }catch(error){out.textContent='FAIL '+error.message;}document.body.append(out);
@@ -105,17 +119,22 @@ try{
                 patch.object(client, "list_models", return_value={"analysis_models": [DEFAULT_MODEL]}), \
                 patch.object(client, "_post_generation", side_effect=answer) as generate, \
                 patch.object(self.app.verification, "_launch") as launch:
-            browser = subprocess.run([
-                chromium_path(), "--headless", "--no-sandbox", "--disable-gpu", "--no-first-run",
-                f"--user-data-dir={self.workspace / 'overview-profile'}", "--virtual-time-budget=18000",
-                "--dump-dom", f"http://127.0.0.1:{self.server.server_port}/s/{self.app.token}/",
-            ], capture_output=True, timeout=30)
+            try:
+                browser = subprocess.run([
+                    chromium_path(), "--headless", "--no-sandbox", "--disable-gpu", "--no-first-run",
+                    f"--user-data-dir={self.workspace / 'overview-profile'}", "--virtual-time-budget=18000",
+                    "--dump-dom", f"http://127.0.0.1:{self.server.server_port}/s/{self.app.token}/",
+                ], capture_output=True, timeout=30)
+            finally:
+                release_cancelled.set()
             launch.assert_not_called()
         dom = browser.stdout.decode("utf-8", errors="replace")
         match = re.search(r'<pre id="overview-test">([^<]+)</pre>', dom)
         self.assertIsNotNone(match, dom[-1000:])
         self.assertEqual(match[1], "PASS")
         sent = [json.loads(call.args[0]["contents"][0]["parts"][0]["text"]) for call in generate.call_args_list]
+        self.assertTrue(cancelled_started.is_set())
+        sent = [request for request in sent if request["question"] != "중단할 질문"]
         self.assertEqual(sent[0]["runs"], [])
         self.assertEqual(sent[1]["runs"][0]["model"], "xor_network.bin")
         self.assertEqual(sent[1]["snapshot"]["run_source"], "saved_runs")

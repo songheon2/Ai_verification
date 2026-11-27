@@ -19,6 +19,28 @@
 :is(#llm-analysis-panel,#verify-batch-analysis) .llm-result-tag[data-status="complete"]{background:#dcfce7;color:#166534}
 :is(#llm-analysis-panel,#verify-batch-analysis) .llm-result-tag[data-status="api_error"],:is(#llm-analysis-panel,#verify-batch-analysis) .llm-result-tag[data-status="error"]{background:#fee2e2;color:#991b1b}
 #llm-analysis-panel #llm-copy,#verify-batch-analysis .llm-copy{margin-left:auto;min-height:30px;font-size:12px;padding:5px 11px}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-expand{min-height:30px;font-size:12px;padding:5px 11px;width:auto}
+.llm-fullscreen[open]{--report-side-padding:15vw;display:grid;grid-template-rows:auto minmax(0,1fr);position:fixed;inset:0;width:100vw;height:100dvh;max-width:none;max-height:none;box-sizing:border-box;margin:0;padding:0;border:0;overflow:hidden;background:#fff;color:#172033}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-fullscreen[open]>.llm-report-header{justify-content:space-between;padding-inline:var(--report-side-padding)}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-fullscreen-close{width:auto;min-height:30px;padding:5px 12px}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-fullscreen>.llm-result{
+  min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;box-sizing:border-box;width:100%;
+  padding:clamp(24px,4vh,44px) var(--report-side-padding);font-size:clamp(15px,1.2vw,18px);line-height:1.9;word-break:keep-all;
+}
+:is(#llm-analysis-panel,#verify-batch-analysis) .llm-fullscreen .llm-result :is(h1,h2,h3){line-height:1.4;margin:1.6em 0 .55em}
+.llm-fullscreen .llm-result h1{font-size:1.6em}
+.llm-fullscreen .llm-result h2{font-size:1.35em}
+.llm-fullscreen .llm-result h3{font-size:1.15em}
+.llm-fullscreen .llm-result p{margin:.8em 0 1.1em}
+.llm-fullscreen .llm-result table{font-size:.9em;font-variant-numeric:tabular-nums}
+.llm-fullscreen .llm-result code{font-size:.88em}
+.llm-fullscreen .llm-references{margin-top:8px;gap:7px}
+.llm-fullscreen .llm-references .llm-citation{padding:3px 8px;font-size:12px;text-align:left;white-space:normal}
+.llm-math{font-family:"Cambria Math","STIX Two Math",serif;white-space:pre-wrap}
+.llm-math-display{margin:12px 0;text-align:center}
+.llm-references{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin-top:5px;color:#64748b;font-size:12px;font-weight:500}
+.llm-references button.llm-citation{border:1px solid #b9def2;cursor:pointer}
+.llm-references button.llm-citation:hover,.llm-references button.llm-citation:focus-visible{background:#c9e8fc}
 :is(#llm-analysis-panel,#verify-batch-analysis) .llm-result{padding:24px 28px;white-space:normal;overflow-wrap:anywhere;font:15px/1.8 "Noto Sans KR",sans-serif;min-height:100px;line-height:1.8}
 :is(#llm-analysis-panel,#verify-batch-analysis) .llm-result>:first-child{margin-top:0}:is(#llm-analysis-panel,#verify-batch-analysis) .llm-result>:last-child{margin-bottom:0}
 .llm-result h1,.llm-result h2,.llm-result h3,.llm-result h4,.llm-result h5,.llm-result h6{color:#0f172a;line-height:1.45;font-weight:750;margin:26px 0 12px;letter-spacing:-.02em}

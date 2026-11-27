@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import re
 import secrets
 import threading
 import time
@@ -16,6 +17,7 @@ import webbrowser
 from Automation.AnalyzeLogs import (DEFAULT_MODEL, GeminiClient, analysis_model_options, analyze, is_analysis_model,
                                     load_gemini_api_key, model_thinking_levels, validate_thinking_level)
 from Automation.AnalysisConversation import AnalysisConversation
+from Automation.LogAnalysisCitations import navigation_targets, restore_tree_citations
 from Automation.LogAnalysisIndex import safe_data
 from Automation.LiveLogAnalysis import LiveRunIndex
 from Automation.LogAnalysisScope import ScopedIndex, normalize_scope, scope_key
@@ -63,21 +65,66 @@ class AnalysisApp:
         self.conversation = AnalysisConversation()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="log-analysis")
         self.active = None
+        self.active_cancel = None
         self.last_activity = time.monotonic()
         self.shutdown_requested = threading.Event()
-        compatible = {self.fingerprint}
+        self._legacy_fingerprint = None
         legacy_result = self.root / "result.json"
         if legacy_result.is_file() and legacy_result.resolve().parent == self.root and legacy_result.stat().st_size <= 1024 * 1024:
-            compatible.add(hashlib.sha256(str(self.root).encode() + legacy_result.read_bytes()).hexdigest())
+            if self.index.manifest_id is None:
+                self._legacy_fingerprint = hashlib.sha256(str(self.root).encode() + legacy_result.read_bytes()).hexdigest()
         for path in sorted(self.output_dir.glob("*/analysis.json"), reverse=True)[:100]:
-            try:
-                if path.stat().st_size > 2 * 1024 * 1024:
-                    continue
-                result = json.loads(path.read_text(encoding="utf-8"))
-                if result.get("run_fingerprint") in compatible and "scope" in result:
-                    self.results.setdefault(scope_key(result["scope"]), result)
-            except (OSError, ValueError, TypeError):
-                continue
+            saved = self._read_saved_answer(path, self._saved_fingerprints())
+            if saved is not None:
+                key = scope_key(saved["scope"])
+                if key not in self.results:
+                    restore_tree_citations(saved)
+                    self.results[key] = saved
+
+    def _saved_fingerprints(self):
+        return (self.fingerprint, self._legacy_fingerprint) if self._legacy_fingerprint else (self.fingerprint,)
+
+    def _read_saved_answer(self, path, fingerprints):
+        if not re.fullmatch(r"\d{8}_\d{6}_[a-f0-9]{8}", path.parent.name):
+            return None
+        try:
+            if path.resolve() != self.output_dir.resolve() / path.parent.name / "analysis.json":
+                return None
+            result = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(result, dict) or result.get("run_fingerprint") not in fingerprints
+                    or result.get("status") not in ("complete", "incomplete")
+                    or not isinstance(result.get("analysis"), str) or not result["analysis"].strip()):
+                return None
+            normalize_scope(result.get("scope"))
+            return result
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def saved_results(self, scope):
+        key = scope_key(scope)
+        with self.lock:
+            fingerprints = self._saved_fingerprints()
+        entries = []
+        for path in sorted(self.output_dir.glob("*/analysis.json"), reverse=True):
+            result = self._read_saved_answer(path, fingerprints)
+            if result is not None:
+                entries.append({"id": path.parent.name, "scope": result["scope"],
+                                "matching_scope": scope_key(result["scope"]) == key,
+                                "created_at": result.get("created_at"), "status": result["status"],
+                                "question": str(result.get("question") or "")[:140]})
+        return {"entries": entries}
+
+    def saved_result(self, analysis_id):
+        if not re.fullmatch(r"\d{8}_\d{6}_[a-f0-9]{8}", analysis_id):
+            return None
+        with self.lock:
+            fingerprints = self._saved_fingerprints()
+        result = self._read_saved_answer(self.output_dir / analysis_id / "analysis.json", fingerprints)
+        with self.lock:
+            if result is None or result["run_fingerprint"] not in self._saved_fingerprints():
+                return None
+        restore_tree_citations(result)
+        return result
 
     def info(self):
         with self.lock:
@@ -107,6 +154,7 @@ class AnalysisApp:
         if self.identity != self.index.identity:
             self.results.clear()
             self.conversation.clear()
+            self._legacy_fingerprint = None
             self.identity, self.fingerprint = self.index.identity, self.index.fingerprint
 
     def _analysis_model(self, request):
@@ -164,40 +212,75 @@ class AnalysisApp:
         if len(json.dumps(selected_items, ensure_ascii=False).encode("utf-8")) > 32000:
             raise ValueError("선택 정보가 너무 큽니다. 일부 항목을 해제해 주세요.")
         with self.lock:
+            if self.shutdown_requested.is_set():
+                raise RuntimeError("분석 화면을 종료하고 있습니다.")
             if self.active:
                 raise RuntimeError("다른 분석이 실행 중입니다. 완료 후 다시 요청해 주세요.")
             # Freeze before acknowledging the button press, not after a queued worker starts.
             index = self.index.freeze()
             self._sync_identity()
             job_id = secrets.token_hex(12)
+            cancel = threading.Event()
             self.active = job_id
+            self.active_cancel = cancel
             fingerprint = self.fingerprint
             conversation = self.conversation.snapshot()
             budget = self.request_budget()
             self.jobs[job_id] = {"id": job_id, "scope": scope, "model": model, "status": "running",
                                  "snapshot": index.snapshot, "request_budget": budget,
                                  "progress": "선택 항목의 고정된 로그를 정리 중입니다."}
-        self.executor.submit(self._work, job_id, scope, question, selected_items, index, fingerprint, model, conversation, thinking_level)
+            self.executor.submit(self._work, job_id, scope, question, selected_items, index, fingerprint, model,
+                                 conversation, thinking_level, cancel)
         return {"id": job_id, "snapshot": index.snapshot, "request_budget": budget, "model": model}
 
-    def _work(self, job_id, scope, question, selected_items, index, fingerprint, model, conversation, thinking_level):
+    def _cancel_active(self):
+        if self.active is not None:
+            job = self.jobs[self.active]
+            if job["status"] == "running":
+                self.active_cancel.set()
+                job.update(status="cancelled", progress="분석을 중단했습니다.")
+            self.active = self.active_cancel = None
+
+    def stop_analysis(self, body):
+        job_id = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(job_id, str):
+            raise ValueError("중단할 분석을 찾을 수 없습니다.")
+        with self.lock:
+            if job_id not in self.jobs:
+                raise ValueError("중단할 분석을 찾을 수 없습니다.")
+            if self.active == job_id:
+                self._cancel_active()
+            return {"status": self.jobs[job_id]["status"]}
+
+    def _work(self, job_id, scope, question, selected_items, index, fingerprint, model, conversation, thinking_level, cancel):
         def progress(message):
             with self.lock:
-                self.jobs[job_id]["progress"] = message
+                if self.active == job_id:
+                    self.jobs[job_id]["progress"] = message
         def request_progress(used, _limit):
             with self.lock:
-                self.jobs[job_id]["request_budget"] = self.request_budget(used)
+                if self.active == job_id:
+                    self.jobs[job_id]["request_budget"] = self.request_budget(used)
         try:
+            if cancel.is_set():
+                return
+            index.db.set_progress_handler(cancel.is_set, 1000)
             selected = ScopedIndex(index, scope)
             summary = selected.summary()
             prompt = (f"{question.strip() or '선택 항목의 병목 원인과 근거를 분석해 주세요.'}\n"
                       f"분석 범위 {json.dumps(scope, ensure_ascii=False)}")
             if "selections" in scope:
                 prompt += "\n선택한 항목을 함께 분석해 주세요."
+            if cancel.is_set():
+                return
             client = self._job_client(model, progress, thinking_level)
             client.request_progress = request_progress
+            client.cancel_event = cancel
             result = analyze({"run": selected}, client, prompt, self.max_calls, selected_items=selected_items,
                              conversation=conversation)
+            if cancel.is_set():
+                return
+            result["citation_targets"] = navigation_targets(index, result.pop("cited_records", []))
             result.update(scope=scope, question=question, selected_items=selected_items, model=model, runs=[summary],
                           run_fingerprint=fingerprint, snapshot=index.snapshot,
                           request_budget=self.request_budget(result.get("api_calls", 0)),
@@ -206,8 +289,10 @@ class AnalysisApp:
             if thinking_level is not None:
                 result["thinking_level"] = thinking_level
             result = safe_data(result)
-            self._save(result)
             with self.lock:
+                if cancel.is_set():
+                    return
+                self._save(result)
                 if self.identity == index.snapshot["identity"]:
                     self.results[scope_key(scope)] = result
                     if result["status"] in ("complete", "incomplete"):
@@ -218,12 +303,14 @@ class AnalysisApp:
                                          request_budget=result["request_budget"])
         except Exception as exc:
             with self.lock:
-                self.jobs[job_id].update(status="error", error=f"분석을 완료하지 못했습니다: {type(exc).__name__}: {safe_data(str(exc))}")
+                if not cancel.is_set():
+                    self.jobs[job_id].update(status="error", error=f"분석을 완료하지 못했습니다: {type(exc).__name__}: {safe_data(str(exc))}")
         finally:
             if index is not None:
                 index.close()
             with self.lock:
-                self.active = None
+                if self.active == job_id:
+                    self.active = self.active_cancel = None
                 while len(self.jobs) > 20:
                     self.jobs.pop(next(iter(self.jobs)))
 
@@ -245,7 +332,10 @@ class AnalysisApp:
         return document.encode("utf-8")
 
     def close(self):
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        with self.lock:
+            self.shutdown_requested.set()
+            self._cancel_active()
+        self.executor.shutdown(wait=True)
         with self.lock:
             self.index.close()
 
@@ -315,6 +405,11 @@ def make_server(app, port=0):
                     key = scope_key(json.loads(query.get("scope", ["{}"]) [0]))
                     with app.lock:
                         self.send({"result": app.results.get(key)})
+                elif path == "api/saved-results" and isinstance(app, AnalysisApp):
+                    self.send(app.saved_results(json.loads(query.get("scope", ["{}"]) [0])))
+                elif path == "api/saved-result" and isinstance(app, AnalysisApp):
+                    result = app.saved_result(query.get("id", [""])[0])
+                    self.send({"result": result} if result else {"error": "저장 결과를 찾지 못했습니다."}, 200 if result else 404)
                 elif path == "api/job" and isinstance(app, AnalysisApp):
                     with app.lock:
                         job = app.jobs.get(query.get("id", [""])[0])
@@ -375,11 +470,12 @@ def make_server(app, port=0):
             try:
                 path, _ = self.route()
                 if not (path == "api/open-ai-studio-quota"
-                        or (isinstance(app, AnalysisApp) and path in ("api/analyze", "api/close"))
+                        or (isinstance(app, AnalysisApp) and path in ("api/analyze", "api/analyze-stop", "api/close"))
                         or (path == "api/verify-shutdown" and hasattr(app, "shutdown_launcher"))
                         or (path == "api/verify-followup" and hasattr(app, "shutdown_launcher"))
                         or (path in ("api/verify-start", "api/verify-preferences", "api/verify-batch",
-                                     "api/verify-batch-analysis", "api/verify-open-dashboard", "api/verify-stop")
+                                     "api/verify-batch-analysis", "api/verify-batch-analysis-stop",
+                                     "api/verify-open-dashboard", "api/verify-stop")
                             and app.verification is not None)):
                     self.send({"error": "Not found"}, 404)
                     return
@@ -415,6 +511,10 @@ def make_server(app, port=0):
                     self.send(app.verification.start_batch(body), 202)
                 elif path == "api/verify-batch-analysis":
                     self.send(app.start_batch_analysis(body), 202)
+                elif path == "api/verify-batch-analysis-stop":
+                    self.send(app.verification.stop_batch_analysis(body))
+                elif path == "api/analyze-stop":
+                    self.send(app.stop_analysis(body))
                 elif path == "api/verify-open-dashboard":
                     self.send(app.verification.open_dashboard(body))
                 elif path == "api/verify-stop":

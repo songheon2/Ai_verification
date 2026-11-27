@@ -46,7 +46,7 @@ class ExternalLpProgressTests(unittest.TestCase):
         cases = (
             ("native", "", "Pivots per call", "Repeated bound violations", "피벗 횟수: 7"),
             ("simplex", "python-simplex-callbacks", "Pivots per call", "Repeated bound violations", "피벗 횟수: 7"),
-            ("glpk", "glpk-iteration-counter", "GLPK iterations per call", "Bound violations at LP call entry", "GLPK 내부 반복 횟수: 12"),
+            ("glpk", "glpk-iteration-counter", "Internal steps counted during each call", "Bound violations at LP call entry", "LP 풀이 단계 수: 12"),
             ("z3", "z3-arithmetic-pivot-counter", "Z3 arithmetic pivots per call", "Bound violations at LP call entry", "Z3 산술 피벗 횟수: 7"),
             ("z3", "unavailable", "Z3 arithmetic pivots per call", "Bound violations at LP call entry", "LP 엔진: Z3"),
         )
@@ -65,7 +65,9 @@ class ExternalLpProgressTests(unittest.TestCase):
                     self.assertIn(tooltip, target)
                     if engine == "glpk":
                         self.assertNotIn("피벗 횟수", target)
-                        self.assertIn("GLPK iterations: 12", fig.texts[-1].get_text())
+                        self.assertEqual(axes[0, 1].get_ylabel(), "LP solve steps")
+                        self.assertIn("LP solve steps: 12", fig.texts[-1].get_text())
+                        self.assertNotIn(work_title, [label.get_text() for label in axes[0, 1].texts])
                     if source == "unavailable":
                         self.assertIn("No counts reported", [label.get_text() for label in axes[0, 1].texts])
                         self.assertEqual(fig.texts[-1].get_text(), "Calls: 1")

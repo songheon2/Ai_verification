@@ -177,7 +177,7 @@ def _simplex_call_entry(number, call_id, call_label_id, round_index, engine, fie
     if engine_label := LP_ENGINE_LABELS.get(engine, engine):
         lines.append(f"LP 엔진: {engine_label}")
     if engine == "glpk" and has_iter_count:
-        lines.append("반복 횟수는 LP 호출 전후 GLPK 내부 카운터의 차이입니다.")
+        lines.append("LP 풀이 단계 수는 호출 전후 GLPK 내부 반복 카운터의 차이입니다.")
     if engine == "z3" and has_pivot_count:
         lines.append("산술 피벗 횟수는 Z3 솔버 통계에서 가져옵니다.")
     if bounds_at_entry:
@@ -199,7 +199,7 @@ def solver_selection(figure, axes, feedback, *, simplex, flow_lines=None):
             engine = call.get("lp_engine") or panel_engine
             available = {field: metric_available(call, field) for field in ("pivots", "iterations")}
             pivot_label = "Z3 산술 피벗 횟수" if engine == "z3" else "피벗 횟수"
-            iteration_label = "GLPK 내부 반복 횟수" if engine == "glpk" else "반복 횟수"
+            iteration_label = "LP 풀이 단계 수" if engine == "glpk" else "반복 횟수"
             fields = []
             for key, label in (("round", "DPLL Round"), ("result", "결과"),
                                ("duration_seconds", "소요 시간(초)"), ("pivots", pivot_label),

@@ -1,11 +1,12 @@
 """The dashboard's item-scoped LLM panel (API keys never enter the page)."""
 from pathlib import Path
 import json
-from visualization.VerificationPicker import analysis_styles, analysis_usage_markup, picker_markup
+from visualization.VerificationPicker import analysis_styles, analysis_usage_markup
 
 
 def panel_markup():
     script = Path(__file__).with_suffix(".js").read_text(encoding="utf-8")
+    controls = Path(__file__).with_name("LogAnalysisControls.js").read_text(encoding="utf-8")
     selection = Path(__file__).with_name("AnalysisSelection.js").read_text(encoding="utf-8")
     markdown = Path(__file__).with_name("LogAnalysisMarkdown.js").read_text(encoding="utf-8")
     vocabulary = json.loads(Path(__file__).with_name("LogAnalysisTerms.json").read_text(encoding="utf-8"))
@@ -67,7 +68,7 @@ main.dashboard-layout>#llm-analysis-panel{min-width:0;scroll-margin-top:var(--an
 </style>
 <h2>항목별 LLM 분석</h2>
 <div id="llm-connection" class="llm-state"></div>
-''' + picker_markup() + r'''
+<div id="llm-reference-status" class="llm-state" role="status"></div>
 <div class="llm-controls">
 <label id="llm-model-label" hidden>모델<select id="llm-model"></select></label>
 <label id="llm-effort-label" hidden>추론 강도<select id="llm-effort"><option value="low">낮음</option></select></label>
@@ -84,19 +85,24 @@ main.dashboard-layout>#llm-analysis-panel{min-width:0;scroll-margin-top:var(--an
 <label id="llm-layer-label" hidden>Layer<select id="llm-layer"><option value="">전체 Layer</option></select></label>
 <label id="llm-neuron-label" hidden>Neuron<select id="llm-neuron"><option value="">전체 Neuron</option></select></label>
 </div>
-<div class="llm-selection-options"><label class="llm-consent"><input type="checkbox" id="llm-multi-select">중복 선택</label><span id="llm-selected-count" class="llm-state"></span><button id="llm-clear-selection" class="llm-button" type="button" disabled>선택 비우기</button></div>
+<div class="llm-selection-options"><label class="llm-consent"><input type="checkbox" id="llm-multi-select">중복 선택</label><button id="llm-clear-selection" class="llm-button" type="button" disabled>선택 비우기</button></div>
 <div id="llm-selected-items" role="list" aria-label="선택한 분석 항목" hidden></div>
 <label>질문<textarea id="llm-question" maxlength="2000" placeholder="비워두면 선택 항목의 반복·병목 패턴을 분석합니다."></textarea></label>
 <div class="llm-controls llm-action-row"><label class="llm-consent"><input type="checkbox" id="llm-consent">선택 항목의 요약·로그 일부와 이번 세션의 질문·답변을 Google에 전송하는 데 동의합니다</label>
-<div class="llm-buttons"><button id="llm-start" class="llm-button llm-primary" type="button" disabled>현재까지 분석</button><button id="llm-reload" class="llm-button" type="button">저장 결과 보기</button></div></div>
+<div class="llm-buttons"><button id="llm-start" class="llm-button llm-primary" type="button" disabled>현재까지 분석</button><button id="llm-stop" class="llm-button" type="button" hidden disabled>분석 중단</button><button id="llm-reload" class="llm-button" type="button" aria-expanded="false" aria-controls="llm-saved-results">저장 결과 보기</button></div></div>
+<div id="llm-saved-results" class="llm-controls" hidden>
+  <label>이 실행의 저장 답변<select id="llm-saved-result" disabled></select></label>
+  <button id="llm-close-saved" class="llm-button" type="button">닫기</button>
+  <div id="llm-saved-status" class="llm-state" role="status"></div>
+</div>
 <details class="llm-status-details"><summary>실행·분석 정보</summary>
 ''' + analysis_usage_markup("llm") + r'''
 <div id="llm-selection" class="llm-state"></div><div id="llm-live" class="llm-state"></div>
 <div id="llm-snapshot" class="llm-state"></div><div id="llm-new-records" class="llm-state"></div>
 </details>
 <div id="llm-progress" role="status" class="llm-state"></div>
-<div class="llm-report"><div class="llm-report-header"><span class="llm-report-title">분석 결과</span><span id="llm-result-tag" class="llm-result-tag">대기</span><button id="llm-copy" class="llm-button llm-copy" type="button" disabled>원문 복사</button></div><article id="llm-result" class="llm-result" aria-label="Markdown 분석 보고서">분석할 항목을 선택하세요.</article></div>
-</section><script>''' + vocabulary_script + markdown + "\n" + selection + "\n" + script + "</script><!-- LLM_ANALYSIS_PANEL_END -->"
+<div class="llm-report"><div class="llm-report-header"><span class="llm-report-title">분석 결과</span><span id="llm-result-tag" class="llm-result-tag">대기</span><button id="llm-copy" class="llm-button llm-copy" type="button" disabled>원문 복사</button><button id="llm-fullscreen" class="llm-button llm-expand" type="button" aria-haspopup="dialog" disabled>전체 화면 보기</button></div><article id="llm-result" class="llm-result" aria-label="Markdown 분석 보고서">분석할 항목을 선택하세요.</article></div>
+</section><script>''' + vocabulary_script + markdown + "\n" + selection + "\n" + controls + "\n" + script + "</script><!-- LLM_ANALYSIS_PANEL_END -->"
 
 
 def install_panel(document):

@@ -77,6 +77,8 @@
   const reportCaches=new WeakMap();
   let boundFileState={first:null,loaded:0,records:[],pending:false,failed:null};
   let boundFilesDirty=false;
+  let pendingReference=null;
+  let referenceChange=null;
   function reportCache(report){
     if(!reportCaches.has(report))reportCaches.set(report,{});
     return reportCaches.get(report);
@@ -104,7 +106,7 @@
       reportCaches.delete(current);
       if(inputBusy){boundFilesDirty=true;return;}
       prepareBoundFiles(current);
-      if(!state.pending)render();
+      if(openBoundReference(current)||!state.pending)render();
     };
     script.onerror=()=>{
       script.remove();state.pending=false;state.failed=file;
@@ -193,11 +195,41 @@
       ...record,id:record.sequence,role:'z',neuron:record.variable,
     }));
   }
+  function openBoundReference(report){
+    if(!pendingReference)return;
+    const {target,request}=pendingReference;
+    const history=displayBoundHistory(report);
+    if(pendingReference.history!==history){pendingReference.history=history;pendingReference.offset=0;}
+    let index=-1;
+    for(let i=pendingReference.offset;i<history.length;i++){
+      const change=history[i];
+      if(change.sourceLine===target.line && change.sourceItem===target.item){index=i;break;}
+    }
+    pendingReference.offset=history.length;
+    const loading=!target.stable && boundFileState.loaded<(report.boundHistoryFiles?.length||0);
+    if(index<0&&!loading&&history[0]?.sourceLine==null&&target.observedAt!=null){
+      const matches=[];
+      for(let i=0;i<history.length;i++){
+        const change=history[i];
+        if(change.sourceLine==null && change.observed_at===target.observedAt && change.variable===target.variable
+            && JSON.stringify(change.before)===JSON.stringify(target.before) && JSON.stringify(change.after)===JSON.stringify(target.after))matches.push(i);
+      }
+      if(matches.length===1)index=matches[0];
+    }
+    if(index<0&&!boundFileState.failed&&(loading||data.deferredData||data.status==='RUNNING'))return;
+    pendingReference=null;
+    if(index>=0){
+      pauseBounds();boundFollow=false;referenceChange=history[index];
+      requestAnimationFrame(()=>$('#boundsValue').closest('.card').scrollIntoView({block:'nearest'}));
+    }
+    window.parent.postMessage({type:'log-analysis-reference-result',request,found:index>=0},'*');
+    return true;
+  }
   function selectedRanges(report) {
     const rounds=boundRounds(report), history=displayBoundHistory(report);
     options('#boundRound',rounds.map((item,index)=>[String(index),`R${item.round_index ?? '?'}`]),saved.round);
-    const change=history[Math.max(0,Math.min(boundIndex,history.length-1))];
-    if(boundFollow && change){const index=rounds.findIndex(item=>item.round_index===change.round_index);if(index>=0)$('#boundRound').value=String(index);}
+    const change=referenceChange||(boundFollow?history[Math.max(0,Math.min(boundIndex,history.length-1))]:null);
+    if(change){const index=rounds.findIndex(item=>item.round_index===change.round_index);if(index>=0)$('#boundRound').value=String(index);}
     const cache=reportCache(report);
     const ranges=rounds[Number($('#boundRound').value)]?.ranges || (cache.emptyRanges ||= []);
     const round=rounds[Number($('#boundRound').value)]?.round_index;
@@ -207,7 +239,8 @@
       cache.neuronParts ||= new Map();
       if(cache.neuronParts.has(item.variable))return cache.neuronParts.get(item.variable);
       const match=String(item.variable).match(/^([zh])(\d+)_(\d+)(?:_|$)/);
-      const value=match?{layer:Number(match[2]),index:Number(match[3]),role:match[1]}:null;
+      const value=match?{layer:Number(match[2]),index:Number(match[3]),role:match[1]}:
+        Number.isInteger(item.layer)&&Number.isInteger(item.index)?{layer:item.layer,index:item.index,role:item.role==='h'?'h':'z'}:null;
       cache.neuronParts.set(item.variable,value);return value;
     };
     if(!cache.catalogs.has(catalogKey)){
@@ -219,7 +252,7 @@
     }
     const {records,byLayer,layers}=cache.catalogs.get(catalogKey);
     boundLayerChoices=layers.map(layer=>[String(layer),`Layer ${layer}`]);
-    if(boundFollow && change){
+    if(change){
       const current=parts(change);
       if(current){$('#boundLayerSearch').value=String(current.layer);$('#boundNeuronSearch').value=`${current.index} (${current.role})`;}
     }
@@ -230,7 +263,7 @@
     boundNeuronChoices=[...new Map(boundNeuronChoices.map(entry=>[entry[0],entry])).values()].sort((a,b)=>parseInt(a[0])-parseInt(b[0])||a[0].localeCompare(b[0]));
     const entries=(boundFollow?records:candidates).map(item=>[item.variable,neuronLabel(item)]);
     options('#boundNeuron',entries,saved.neuron);
-    if(boundFollow && change)$('#boundNeuron').value=change.variable;
+    if(change)$('#boundNeuron').value=change.variable;
     else {
       const query=$('#boundNeuronSearch').value.trim().match(/^(\d+)(?:\s*\(([zh])\))?$/);
       if(query){const selected=candidates.find(item=>parts(item).index===Number(query[1])&&(!query[2]||parts(item).role===query[2]));$('#boundNeuron').value=selected?.variable || '';}
@@ -238,6 +271,12 @@
         const selected=candidates.find(item=>item.variable===$('#boundNeuron').value);
         if(selected)$('#boundNeuronSearch').value=`${parts(selected).index} (${parts(selected).role})`;
       }
+    }
+    if(referenceChange){
+      const {key,records:matches}=searchBoundHistory(report);
+      const step=matches.indexOf(referenceChange);
+      if(step>=0)searchSteps[key]=step;
+      referenceChange=null;
     }
     for(const picker of searchPickers)picker.render();
     options('#underNeuron',ranges.map(item=>[item.variable,neuronLabel(item)]),saved.underNeuron);
@@ -512,6 +551,7 @@
   function render() {
     boundFilesDirty=false;
     prepareBoundFiles(data.report || {});
+    openBoundReference(data.report || {});
     document.body.setAttribute('aria-busy',String(Boolean(data.deferredData)));
     const report=data.report || {}, totals=report.totals || {}, ranges=selectedRanges(report);
     const states={active:0,inactive:0,unstable:0};ranges.forEach(item=>{if(item.state in states)states[item.state]++;});
@@ -554,6 +594,14 @@
     const pageY=window.scrollY;data=payload;render();window.scrollTo(window.scrollX,pageY);save();
   }
   window.addEventListener('message',event=>{
+    if(event.source===window.parent && event.data?.type==='log-analysis-reference' && Number.isSafeInteger(event.data.target?.item)){
+      if(!enabled.has('bounds')){
+        window.parent.postMessage({type:'log-analysis-reference-result',request:event.data.request,found:false},'*');return;
+      }
+      pendingReference=event.data;
+      $('#boundScope').value=event.data.target.stable?'stable':'all';
+      pauseBounds();render();save();return;
+    }
     if(event.source===window.parent&&event.data?.type==='visualization-input-activity'){
       inputBusy=event.data.active===true;
       if(!inputBusy){

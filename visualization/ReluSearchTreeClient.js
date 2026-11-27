@@ -744,6 +744,21 @@
     if (window.parent !== window) window.parent.postMessage({type: 'relu-search-tree-status', status: DATA.status}, '*');
     if (DATA.status !== 'RUNNING' && standaloneTimer !== null) { clearInterval(standaloneTimer); standaloneTimer = null; }
   }
+  let pendingReference=null;
+  function openBranchReference(){
+    if(!pendingReference)return;
+    const {request,target}=pendingReference;
+    const node=ALL.find(node=>node.branchId===target.branchId);
+    if(!node&&(DATA.deferredData||DATA.status==='RUNNING'))return;
+    pendingReference=null;
+    if(node){
+      trackLatestPath=false;renderTrackingButton();
+      if(!scopeIds.has(node.id))changeScope(null);
+      if(!scopeIds.has(node.id))changeScope(node.id,true);
+      revealNodePath(node);
+    }
+    window.parent.postMessage({type:'log-analysis-reference-result',request,found:Boolean(node)},'*');
+  }
   function applySnapshot(data, allowFollow = true) {
     if (!data || !Array.isArray(data.roots)) return;
     if (data.snapshotVersion != null && data.snapshotVersion === DATA.snapshotVersion) return;
@@ -764,7 +779,7 @@
     window.scrollTo(scrollX, scrollY);
     restorePanelScroll('timeline', timelineScroll);
     restorePanelScroll('stable', stableScroll);
-    saveState(); announceStatus();
+    saveState(); announceStatus();openBranchReference();
   }
   function finishSnapshotRequest(){
     if(snapshotTimeout!==null){clearTimeout(snapshotTimeout);snapshotTimeout=null;}
@@ -802,6 +817,9 @@
   }
   window.addEventListener('message', event => {
     const message = event.data || {};
+    if(event.source===window.parent && message.type==='log-analysis-reference' && typeof message.target?.branchId==='string'){
+      pendingReference=message;openBranchReference();return;
+    }
     if(event.source===window.parent&&message.type==='visualization-input-activity'){
       inputBusy=message.active===true;
       if(!inputBusy){

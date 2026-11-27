@@ -1,6 +1,7 @@
 """Scoped data isolation and loopback dashboard tests; no real Gemini calls."""
 import hashlib
 from http.client import HTTPConnection
+from io import BytesIO
 import json
 from pathlib import Path
 import re
@@ -314,7 +315,203 @@ class ScopedLogTests(ScopeFixture):
 
 class AnalysisServerTests(ScopeFixture):
     @unittest.skipUnless(chromium_path(), "Chromium is not installed")
-    def test_browser_selects_model_and_starts_verification_from_dropdowns(self):
+    def test_browser_cancels_analysis_and_starts_another_before_gemini_returns(self):
+        from Automation.AnalyzeLogs import GeminiClient
+
+        release, waiting = threading.Event(), threading.Event()
+
+        def open_response(request, **_):
+            if "중단할 질문" in request.data.decode("utf-8"):
+                waiting.set()
+                release.wait(15)
+                text = "늦게 도착한 답변"
+            else:
+                text = "새 분석 답변"
+            return BytesIO(json.dumps(answer([{"text": text}])).encode())
+
+        def client_factory(progress):
+            client = GeminiClient("offline-test-key", progress=progress)
+            client.opener.open = open_response
+            return client
+
+        self.app.client_factory = client_factory
+        harness = r'''<script>(async()=>{
+const $=id=>document.getElementById(id), out=document.createElement('pre');out.id='cancel-test';
+const wait=async(test,label)=>{for(let i=0;i<180;i++){if(test())return;await fetch('api/info');await new Promise(r=>setTimeout(r,25));}throw Error(label);};
+const fetchStatus=window.fetch.bind(window);
+let used=0;
+window.fetch=async(...args)=>{
+ const response=await fetchStatus(...args);
+ if(String(args[0]).includes('api/job?'))used=Math.max(used,(await response.clone().json()).request_budget?.used||0);
+ return response;
+};
+try{
+ const stop=$('llm-stop'), start=$('llm-start');
+ if(!stop.hidden)throw Error('idle stop button');
+ $('llm-consent').click();await wait(()=>!start.disabled,'start');
+ $('llm-question').value='중단할 질문';start.click();
+ await wait(()=>!stop.hidden&&!stop.disabled&&used===1,'request in flight');
+ stop.click();await wait(()=>stop.hidden&&!start.disabled&&$('llm-result-tag').textContent==='중단됨','cancelled');
+ $('llm-question').value='새 질문';start.click();
+ await wait(()=>$('llm-result').textContent.includes('새 분석 답변'),'next answer');
+ out.textContent='PASS';
+}catch(error){out.textContent='FAIL '+error.message;}document.body.append(out);
+})();</script>'''
+        (self.run / "relu_realtime.html").write_text('<!doctype html><meta charset="utf-8"><main></main>' + harness, encoding="utf-8")
+        try:
+            browser = subprocess.run([
+                chromium_path(), "--headless", "--no-sandbox", "--disable-gpu", "--no-first-run",
+                f"--user-data-dir={self.root / 'cancel-profile'}", "--virtual-time-budget=18000", "--dump-dom",
+                f"http://127.0.0.1:{self.server.server_port}{self.base}",
+            ], capture_output=True, timeout=35)
+            dom = browser.stdout.decode("utf-8", errors="replace")
+            match = re.search(r'<pre id="cancel-test">([^<]+)</pre>', dom)
+            self.assertIsNotNone(match, dom[-1200:])
+            self.assertEqual(match[1], "PASS")
+            self.assertTrue(waiting.is_set())
+            self.assertEqual([job["status"] for job in self.app.jobs.values()], ["cancelled", "done"])
+            self.assertEqual(len(list(self.output.glob("*/analysis.json"))), 1)
+            self.assertEqual(self.app.conversation.snapshot(), [{"question": "새 질문", "answer": "새 분석 답변"}])
+        finally:
+            release.set()
+
+    @unittest.skipUnless(chromium_path(), "Chromium is not installed")
+    def test_browser_opens_saved_answers_from_same_run_outside_current_scope(self):
+        def save(analysis_id, scope, text, fingerprint):
+            directory = self.output / analysis_id
+            directory.mkdir(parents=True)
+            (directory / "analysis.json").write_text(json.dumps({
+                "run_fingerprint": fingerprint, "scope": scope, "status": "complete",
+                "analysis": text, "question": text, "created_at": "2026-11-25T12:00:00+09:00",
+            }), encoding="utf-8")
+
+        fingerprint = self.app.fingerprint
+        first = "20261125_120000_00000001"
+        other = "20261125_120200_00000003"
+        saved_scope = {"topic": "relu", "layer": 2, "neuron": 3}
+        save(first, {"selections": [saved_scope]}, "이 뉴런의 이전 분석 답변", fingerprint)
+        save("20261125_120100_00000002", {"topic": "simplex"}, "같은 실행의 최신 LP 답변", fingerprint)
+        save(other, {"topic": "all"}, "다른 실행의 답변", "unrelated")
+        self.assertEqual(self.app.saved_results(saved_scope)["entries"][1]["id"], first)
+        self.assertTrue(self.app.saved_results(saved_scope)["entries"][1]["matching_scope"])
+        self.assertEqual(self.request(self.base + "api/saved-result?id=" + other)[0], 404)
+        harness = r'''<script>(async()=>{
+const $=id=>document.getElementById(id);
+const out=document.createElement('pre');out.id='saved-test';
+const wait=async(test,label)=>{for(let i=0;i<150;i++){if(test())return;await fetch('api/info');await new Promise(r=>setTimeout(r,20));}throw Error(label);};
+try{
+ await wait(()=>$('llm-connection').textContent.includes('gemini-'),'loaded');
+ $('llm-reload').click();
+ const menu=$('llm-saved-result'), report=$('llm-result');
+ await wait(()=>report.textContent.includes('같은 실행의 최신 LP 답변'),'latest report');
+ if(menu.options.length!==2||$('llm-topic').value!=='all'||$('llm-consent').checked)throw Error('history scope or consent');
+ menu.selectedIndex=1;menu.dispatchEvent(new Event('change'));
+ await wait(()=>report.textContent.includes('이 뉴런의 이전 분석 답변'),'older report');
+ $('llm-close-saved').click();
+ await wait(()=>report.textContent.includes('저장된 분석이 없습니다'),'return to current selection');
+ if(!$('llm-saved-results').hidden)throw Error('history not closed');
+ out.textContent='PASS';
+}catch(error){out.textContent='FAIL '+error.message;}document.body.append(out);
+})();</script>'''
+        (self.run / "relu_realtime.html").write_text('<!doctype html><meta charset="utf-8"><main></main>' + harness, encoding="utf-8")
+        process = subprocess.run([
+            chromium_path(), "--headless", "--no-sandbox", "--disable-gpu", "--no-first-run",
+            f"--user-data-dir={self.root / 'saved-profile'}", "--virtual-time-budget=18000", "--dump-dom",
+            f"http://127.0.0.1:{self.server.server_port}{self.base}",
+        ], capture_output=True, timeout=35)
+        dom = process.stdout.decode("utf-8", errors="replace")
+        match = re.search(r'<pre id="saved-test">([^<]+)</pre>', dom)
+        self.assertIsNotNone(match, dom[-1200:])
+        self.assertEqual(match[1], "PASS")
+        self.assertFalse(self.clients)
+
+    @unittest.skipUnless(chromium_path(), "Chromium is not installed")
+    def test_report_references_open_exact_tree_branch_and_bound_change(self):
+        from visualization.ReluSearchTree import BranchLogReader, LiveBoundHistory, write_relu_search_tree_html
+        from visualization.SolverMechanisms import mechanism_report_path
+
+        name = "relu_events_branches.jsonl"
+        node = {"event": "branch_start", "round_index": 1, "depth": 1, "layer": 1, "index": 0,
+                "variable": "z1_0", "phase": "+"}
+        change = {"variable": "z6_17", "layer": 6, "index": 17, "role": "z"}
+        self.write(name, [
+            dict(node, branch_id="first", split_number=18, time_ns=1),
+            {"event": "branch_end", "branch_id": "first", "result": "UNSAT", "time_ns": 2},
+            dict(node, branch_id="second", split_number=109, time_ns=3),
+            {"event": "relu_mechanism", "kind": "bound_updates", "round_index": 1, "time_ns": 4,
+             "branch_id": "second", "depth": 1, "source": "search", "changes": [
+                dict(change, before=[-2, 3], after=[-1, 3]), dict(change, before=[-1, 3], after=[0, 2]),
+                dict(change, variable="h6_17", role="h", before=[0, 3], after=[0, 2])]},
+            {"event": "branch_end", "branch_id": "second", "result": "UNSAT", "time_ns": 5},
+            {"event": "relu_mechanism", "kind": "settings", "round_index": 1, "time_ns": 6},
+            dict(node, branch_id="sibling", split_number=109, phase="-", time_ns=7),
+            {"event": "branch_end", "branch_id": "sibling", "result": "UNSAT", "time_ns": 8},
+        ])
+        reader = BranchLogReader(self.run / name)
+        reader.read()
+        tree = self.run / "tree.html"
+        write_relu_search_tree_html(reader.trace, tree, overall_status="UNSAT",
+                                    mechanism_panels=("bounds",), live_bound_history=LiveBoundHistory(tree))
+        self.app.client_factory = lambda _progress: FakeClient(
+            answer([{"functionCall": {"name": "query_events", "args": {"file": name, "limit": 8}}}]),
+            answer([{"text": f"트리 분기입니다. [run:{name}:3] [run:{name}:8] [run:{name}:2]\n\n"
+                             f"두 번째 경계 변경입니다. [run:{name}:4#2] [run:{name}:4#2]\n\n"
+                             f"중복 분기와 변경입니다. [run:{name}:5] [run:{name}:4#2]\n\n"
+                             f"첫 번째 경계 변경입니다. [run:{name}:4#1]\n\n"
+                             f"출력 경계 변경입니다. [run:{name}:4#3]\n\n"
+                             f"위치가 없는 기법과 모호한 기록입니다. [run:{name}:6] [run:{name}:4] [run:{name}:999]"}]),
+        )
+        page = self.run / "relu_realtime.html"
+        harness = r'''<script>(async()=>{
+const out=document.createElement('pre');out.id='reference-test';
+const $=id=>document.getElementById(id);
+const wait=async(test,label)=>{for(let i=0;i<160;i++){if(test())return;await fetch('api/info');await new Promise(r=>setTimeout(r,20));}throw Error(label+' '+$('llm-reference-status').textContent);};
+try{
+ const tree=$('relu-tree-dashboard'), bounds=$('solver-mechanisms-dashboard');
+ await wait(()=>tree.contentDocument?.querySelectorAll('#tree summary').length===3&&bounds.contentDocument?.getElementById('boundsValue'),'frames');
+ $('llm-consent').click();await wait(()=>!$('llm-start').disabled,'analysis button');$('llm-start').click();
+ const report=$('llm-result');
+ await wait(()=>report.querySelectorAll('p .llm-references button').length===6,'unique verified links');
+ const labels=[...report.querySelectorAll('p:first-child .llm-references > button')].map(button=>button.textContent);
+ if(labels.length!==3||!labels[0].endsWith('Split #109 · 활성')||!labels[1].endsWith('Split #109 · 비활성')||
+    !labels[2].endsWith('Split #18 · 활성'))throw Error('separate reference buttons identify exact branches');
+ if(report.querySelectorAll('.llm-references').length!==4||report.textContent.includes('검증 기법 · R1'))throw Error('ambiguous or duplicate citation');
+ const inputLink=report.querySelector('p:nth-child(2) .llm-citation'), outputLink=report.querySelector('p:nth-child(5) .llm-citation');
+ if(inputLink.textContent!=='R1의 L6 N17 경계 유도 · z (입력)'||outputLink.textContent!=='R1의 L6 N17 경계 유도 · h (출력)')throw Error('distinct input and output labels');
+ if(!window.formatLogAnalysisCitationLabel({topic:'mechanisms',label:'경계 유도',variable:'h6_17'}).endsWith('h (출력)'))throw Error('saved reference label');
+ const branch=report.querySelector('p .llm-references button');
+ branch.click();
+ await wait(()=>tree.contentDocument.activeElement?.closest('details')?.dataset.id==='2','exact branch');
+ $('llm-fullscreen').click();
+ document.querySelector('dialog[open] p:nth-child(2) .llm-references button').click();
+ await wait(()=>bounds.contentDocument.getElementById('boundsValue').textContent.includes('변경 #2'),'exact bound change');
+ const field=id=>bounds.contentDocument.getElementById(id);
+ if(field('boundSearchControls').hidden||field('boundRound').selectedOptions[0].textContent!=='R1'||
+    field('boundLayerSearch').value!=='6'||field('boundNeuronSearch').value!=='17 (z)'||field('boundSearchStep').value!=='2')throw Error('exact search state');
+ if(document.querySelector('dialog[open]'))throw Error('full screen did not close');
+ if(bounds.contentDocument.getElementById('boundPlay').textContent==='일시정지')throw Error('bound playback still active');
+ outputLink.click();
+ await wait(()=>field('boundsValue').textContent.includes('변경 #3'),'exact output bound change');
+ if(field('boundNeuronSearch').value!=='17 (h)')throw Error('output variable search');
+ out.textContent='PASS';
+}catch(error){out.textContent='FAIL '+error.message;}document.body.append(out);
+})();</script>'''
+        page.write_text('<!doctype html><meta charset="utf-8"><main>' + panel_markup() +
+                        f'<iframe id="relu-tree-dashboard" src="{tree.name}"></iframe>'
+                        f'<iframe id="solver-mechanisms-dashboard" src="{mechanism_report_path(tree).name}"></iframe>' +
+                        '</main>' + harness, encoding="utf-8")
+        process = subprocess.run([
+            chromium_path(), "--headless", "--no-sandbox", "--disable-gpu", "--no-first-run",
+            f"--user-data-dir={self.root / 'reference-profile'}", "--virtual-time-budget=18000", "--dump-dom",
+            f"http://127.0.0.1:{self.server.server_port}{self.base}",
+        ], capture_output=True, timeout=35)
+        dom = process.stdout.decode("utf-8", errors="replace")
+        match = re.search(r'<pre id="reference-test">([^<]+)</pre>', dom)
+        self.assertIsNotNone(match, dom[-1600:])
+        self.assertEqual(match[1], "PASS")
+
+    @unittest.skipUnless(chromium_path(), "Chromium is not installed")
+    def test_browser_selects_analysis_model_without_verification_picker(self):
         from unittest.mock import Mock
 
         self.app.model_catalog = lambda: {"analysis_models": [self.app.model, "gemini-3.8-flash"]}
@@ -324,11 +521,6 @@ class AnalysisServerTests(ScopeFixture):
             return FakeClient(answer([{"text": "분석 결과"}]))
         self.app.model_client_factory = client_for_model
         self.app.verification = Mock()
-        self.app.verification.catalog.side_effect = lambda group: (
-            {"groups": [{"id": "acas", "label": "ACAS"}], "engines": ["glpk"]} if group is None else
-            {"models": [{"id": "net", "label": "2_9"}], "properties": [{"id": "prop", "label": "Prop 3"}]})
-        self.app.verification.start.return_value = {"id": "test-verification"}
-        self.app.verification.job.return_value = {"status": "complete", "verdict": "VERIFIED"}
         path = self.run / "relu_realtime.html"
         path.write_text('<!doctype html><html><meta charset="utf-8"><body><main>' + panel_markup() + r'''
 <script>(async()=>{
@@ -339,21 +531,14 @@ const wait=async (ready,label)=>{
  throw Error('timeout '+label);
 };
 try{
- const picker=$('verify-picker'), model=$('llm-model');
- await wait(()=>!picker.hidden&&model.options.length===2,'catalog');
+ const model=$('llm-model');
+ await wait(()=>model.options.length===2,'model catalog');
+ if($('verify-picker'))throw Error('verification picker appeared');
  model.value='gemini-3.8-flash';
  $('llm-consent').click();
  await wait(()=>!$('llm-start').disabled,'analysis button');
  $('llm-start').click();
  await wait(()=>$('llm-progress').textContent.includes('gemini-3.8-flash'),'selected model result');
- picker.open=true;
- const form=picker.querySelector('form'), field=form.elements;
- await wait(()=>field.group.options.length>1,'benchmark menu');
- field.group.value='acas';field.group.dispatchEvent(new Event('change',{bubbles:true}));
- await wait(()=>!field.model.disabled&&!field.property.disabled,'model and property');
- field.model.value='net';field.property.value='prop';form.dispatchEvent(new Event('change'));
- form.querySelector('[type=submit]').click();
- await wait(()=>form.querySelector('[role="status"]').textContent.includes('VERIFIED'),'verification job');
  out.textContent='PASS';
 }catch(error){out.textContent='FAIL '+error.message;}document.body.append(out);
 })();</script></main></body></html>''', encoding="utf-8")
@@ -367,8 +552,8 @@ try{
         self.assertIsNotNone(match, dom[-1000:])
         self.assertEqual(match[1], "PASS")
         self.assertEqual(used, ["gemini-3.8-flash"])
-        self.app.verification.start.assert_called_once_with(
-            {"group": "acas", "model": "net", "property": "prop", "engine": "glpk", "timeout": 600})
+        self.app.verification.catalog.assert_not_called()
+        self.app.verification.start.assert_not_called()
 
     def test_selected_gemini_model_is_frozen_for_the_analysis_job(self):
         chosen = "gemini-3.8-flash"
@@ -423,7 +608,10 @@ try{
         super().setUp()
         self.clients = []
         def client_factory(progress):
-            client = FakeClient(answer([{"text": "## 선택 항목 분석\n\n**관찰**: 호출 기록입니다. [run:solver_progress.jsonl:3]"}]))
+            client = FakeClient(answer([{"text": "## 선택 항목 분석\n\n**관찰**: 호출 기록입니다. [run:solver_progress.jsonl:3]\n\n"
+                                               r"&#x20;$z > 0$이면 $h = \max(0, z)$입니다." "\n\n"
+                                               "$$\n" r"h_2 \le z^{10}" "\n$$\n\n"
+                                               r"기존 범위 -0.13877 \sim -0.00740과 수식 $x \sim y$."}]))
             self.clients.append(client)
             return client
         self.output = self.root / "analyses"
@@ -881,7 +1069,39 @@ try{
  await wait(()=>$('llm-result').textContent.includes('선택 항목 분석'),'analysis');
  assert($('llm-result').querySelector('h2')?.textContent==='선택 항목 분석','rendered Markdown heading');
  assert($('llm-result').querySelector('strong')?.textContent==='관찰','rendered emphasis');
- assert($('llm-result').querySelector('.llm-citation')?.textContent==='솔버 진행 · 기록 3','human-readable evidence chip');
+ assert($('llm-result').querySelector('.llm-references button.llm-citation')?.textContent.startsWith('Simplex · LP'),'human-readable evidence link below paragraph');
+ assert($('llm-result').textContent.includes('z > 0이면 h = max(0, z)입니다.'),'readable inline math');
+ assert($('llm-result').textContent.includes('-0.13877 ∼ -0.00740')&&$('llm-result').textContent.includes('x ∼ y'),'readable range and similarity symbols');
+ const longReport=document.createElement('article');
+ window.renderLogAnalysisMarkdown(longReport,'가'.repeat(200001)+'\n\n**마지막 문단**');
+ assert(longReport.querySelector('strong')?.textContent==='마지막 문단','report renders past the former character limit');
+ assert(!$('llm-result').textContent.includes('&#x20;'),'escaped spacing');
+ const formula=$('llm-result').querySelector('.llm-math-display');
+ assert(formula?.querySelector('sub')?.textContent==='2'&&formula.querySelector('sup')?.textContent==='10','display math scripts');
+ const original=$('llm-result');
+ original.style.cssText='max-height:150px;overflow-y:auto';
+ for(let i=0;i<6;i++){
+   const paragraph=document.createElement('p');paragraph.dataset.reading=String(i);
+   paragraph.textContent=('긴 분석 결과 '+i+'입니다. ').repeat(80);original.append(paragraph);
+ }
+ const align=(report,index)=>{const paragraph=report.querySelector(`[data-reading="${index}"]`);
+   report.scrollTop+=paragraph.getBoundingClientRect().top-report.getBoundingClientRect().top+4;};
+ const nearTop=(report,index)=>Math.abs(report.querySelector(`[data-reading="${index}"]`).getBoundingClientRect().top-report.getBoundingClientRect().top)<20;
+ align(original,1);
+ $('llm-fullscreen').click();
+ const fullscreen=document.querySelector('dialog.llm-fullscreen[open]');
+ assert(fullscreen?.querySelector('h2')?.textContent==='선택 항목 분석','full-screen report');
+ assert(fullscreen.getBoundingClientRect().height===innerHeight,'full viewport');
+ const body=fullscreen.querySelector('article'), style=getComputedStyle(body);
+ assert(body.getBoundingClientRect().width===innerWidth&&style.paddingLeft===style.paddingRight&&Math.abs(parseFloat(style.paddingLeft)-innerWidth*.15)<1,'fifteen percent side padding');
+ assert(getComputedStyle(fullscreen.querySelector('header')).paddingLeft===style.paddingLeft&&parseFloat(style.lineHeight)/parseFloat(style.fontSize)>1.85,'aligned header and readable line height');
+ assert(document.activeElement===body,'report receives keyboard scroll focus');
+ assert(body.scrollHeight>body.clientHeight&&style.overflowY==='auto','long report has its own scroll area');
+ assert(nearTop(body,1),'full screen starts at the same paragraph');
+ align(body,4);
+ assert(body.scrollTop>0&&fullscreen.scrollTop===0,'scroll the report while keeping the title fixed');
+ fullscreen.querySelector('button').click();
+ assert(!fullscreen.open&&nearTop(original,4),'closing restores the paragraph to the normal report');
  assert($('llm-result-tag').textContent==='분석 완료','completion badge');
  assert(!$('llm-budget') && !$('llm-budget-meter') && !$('llm-progress').textContent.includes('API 1회'),'internal call count must not be displayed');
  assert($('llm-quota-link').href==='https://aistudio.google.com/rate-limit','provider quota link');

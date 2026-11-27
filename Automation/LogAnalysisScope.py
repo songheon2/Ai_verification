@@ -76,7 +76,11 @@ def normalize_scope(value):
 
 
 def scope_key(scope):
-    return json.dumps(normalize_scope(scope), sort_keys=True, separators=(",", ":"))
+    normalized = normalize_scope(scope)
+    selections = normalized.get("selections", ())
+    if len(selections) == 1:
+        normalized = selections[0]
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
 
 
 def neuron_of(record):
@@ -220,7 +224,8 @@ class ScopedIndex:
                     collections = [key for key in ("records", "ranges", "changes") if isinstance(record.get(key), list)]
                     if collections:
                         for key in collections:
-                            record[key] = [v for v in record[key] if isinstance(v, dict) and matches(v)]
+                            record[key] = [{**v, "source_item": i} for i, v in enumerate(record[key], 1)
+                                           if isinstance(v, dict) and matches(v)]
                         keep = any(record[key] for key in collections)
                         # These counts describe the original full batch, not the projected neuron.
                         for key in ("changed", "fixed", "conflict"):

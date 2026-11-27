@@ -1209,7 +1209,7 @@ def _simplex_panel_engine(feedback):
 
 def _simplex_work_labels(engine, calls):
     if engine == "glpk":
-        return "iterations", "GLPK iterations per call", "GLPK iterations", "Internal steps counted during each call"
+        return "iterations", "Internal steps counted during each call", "LP solve steps", ""
     if engine == "z3":
         return "pivots", "Z3 arithmetic pivots per call", "Arithmetic pivots", "From Z3 solver statistics"
     if engine == "mixed":
